@@ -28,12 +28,15 @@
 偏置造成的位移也跟着转 90°；若错写成场地系偏置，这个位移纹丝不动，
 而位移正是 Task 4/10/11/12 唯一在意的输出。
 """
+import warnings
+
 import cv2
 import numpy as np
 import pytest
 
 from vision_core import calib_store
 from vision_core.field import (
+    COPLANAR_TOL_MM,
     FieldFrame,
     body_pose_in_field,
     build_field_frame,
@@ -63,6 +66,18 @@ NOMINAL = {
 TOL_MM = 20.0
 
 _POSES: dict[int, MarkerPose] | None = None
+
+# **占位数字，不是 A1 的测量结果。** 它抄自计划 Task 1 的测试夹具，只是为了让本文件
+# 里的偏置用例有一个具体数值。真实偏置由 Task 4 的人工步骤 A1 量，写进
+# `视觉测量/结果/car_calib.json` —— 那个文件目前**不存在**，
+# `calib_store.load_calib()["bias"]` 三项都还是 0.0。
+# A1 做完之后，本占位数就该被真实值取代（或者整条用例改成读标定文件）。
+PLACEHOLDER_DY_MM = 55.0
+
+
+def _bias(dy_mm: float = 0.0, dx_mm: float = 0.0, dtheta_deg: float = 0.0) -> dict:
+    """bias 字面量。dx/dy 沿**码的规范轴**（+X = 角点0→角点1，+Y = 角点3→角点0）。"""
+    return {"dx_mm": dx_mm, "dy_mm": dy_mm, "dtheta_deg": dtheta_deg}
 
 
 def _poses() -> dict[int, MarkerPose]:
@@ -154,11 +169,19 @@ def test_build_field_frame_rejects_empty_and_malformed_input():
         build_field_frame({i: object() for i in calib_store.BOUNDARY_IDS})
 
 
-def test_build_field_frame_rejects_degenerate_geometry():
-    """四个码挤成一点 → 法向无定义，必须抛而不是返回一个垃圾场地系。"""
-    poses = {i: _pose([0.0, 0.0, 500.0], np.eye(3), marker_id=i)
-             for i in calib_store.BOUNDARY_IDS}
-    with pytest.raises(ValueError, match="退化"):
+@pytest.mark.parametrize("half_span_mm", [0.0, 0.5], ids=["挤成一点", "只有0.5mm宽"])
+def test_build_field_frame_rejects_degenerate_geometry(half_span_mm):
+    """四个码挤成一团 → 场地平面无定义，必须抛而不是返回一个垃圾场地系。
+
+    `match` 钉的是**跨度守卫**自己的话（"4 个边界码退化"），不是 `_unit()` 那句
+    泛泛的"向量退化"：0.5 mm 的场在删掉跨度守卫后会一路走到 ID23 的 y 轴检查，
+    报出"ID23 落在 ID20→ID21 直线上，场地 +Y 无定义" —— 方向完全误导（真实病因是
+    四个码挤成一团），所以这条用例必须因此变红。
+    """
+    h = half_span_mm / 2.0
+    corners = {20: (-h, -h), 21: (+h, -h), 22: (+h, +h), 23: (-h, +h)}
+    poses = {i: _pose([x, y, 500.0], np.eye(3), marker_id=i) for i, (x, y) in corners.items()}
+    with pytest.raises(ValueError, match="4 个边界码退化"):
         build_field_frame(poses)
 
 
@@ -246,12 +269,58 @@ def test_field_axes_are_right_handed_and_z_points_into_the_table():
 
 
 def test_plane_normal_points_toward_the_camera():
-    """R33：法向 n 指向相机，对俯视相机必须是**负**相机 Z 分量。"""
+    """R33：法向 n 指向相机。本机近乎正俯视，所以等价于**负**相机 Z 分量。
+
+    注意这一条里 `normal_cam[2] < 0` 是**本机的性质**，不是规则本身；规则是
+    `n · origin_cam < 0`（法向背朝被摄点、朝向相机中心），对装了歪的相机照样成立
+    —— 见下面那条合成用例。
+    """
     ff = build_field_frame(_poses())
     assert ff.normal_cam[2] < 0.0, ff.normal_cam
     # 与相机光轴方向相反：n 朝相机中心（相机中心在相机系原点）。
     assert float(ff.normal_cam @ ff.origin_cam) < 0.0
     assert float(np.linalg.norm(ff.normal_cam)) == pytest.approx(1.0, abs=1e-12)
+
+
+def _tilted_field_poses():
+    """合成一个近乎**侧视**的场地：真法向与光轴夹 82°，`normal_cam[2] > 0`。
+
+    相机装歪到 82° 时，"指向相机"的法向 z 分量**是正的**，于是本机那种
+    "n[2] > 0 就翻号"的朴素规则会把它翻反。四个码都在相机前方（z 250~750 mm），
+    是真实相机拍得到的构型。
+    """
+    n_true = np.float64([0.99, 0.0, 0.14])
+    n_true /= np.linalg.norm(n_true)
+    centre = np.float64([-100.0, 0.0, 500.0])          # n_true · centre = -29 < 0
+    e_x = np.float64([0.0, 0.0, 1.0])
+    e_x -= n_true * float(e_x @ n_true)                # 场地 +X 方向（平面内）
+    e_x /= np.linalg.norm(e_x)
+    e_y = np.cross(n_true, e_x)
+    corners = {
+        TL_ID: centre - 252.0 * e_x - 126.0 * e_y,
+        TR_ID: centre + 252.0 * e_x - 126.0 * e_y,
+        BR_ID: centre + 252.0 * e_x + 126.0 * e_y,
+        BL_ID: centre - 252.0 * e_x + 126.0 * e_y,
+    }
+    poses = {mid: _pose(p, np.eye(3), marker_id=mid) for mid, p in corners.items()}
+    return poses, n_true
+
+
+def test_plane_normal_sign_survives_a_tilted_camera():
+    """M3：法向符号规则是 `n · origin_cam < 0`，**不是** `n[2] < 0`。
+
+    本机近乎正俯视，两条规则结果完全一样，所以真实照片上的任何测试都分不开它们。
+    这里用一个法向与光轴夹 82° 的合成场地（真法向 z 分量 **+0.14**）把它们分开：
+    朴素规则给出的法向 `n · origin = +29`，正对着桌子外侧 —— 即背对相机。
+    """
+    poses, n_true = _tilted_field_poses()
+    ff = build_field_frame(poses)
+
+    assert float(ff.normal_cam @ n_true) == pytest.approx(1.0, abs=1e-9), (
+        f"法向翻反了：{ff.normal_cam} vs 真值 {n_true}")
+    assert float(ff.normal_cam @ ff.origin_cam) < 0.0
+    # 这条构型里"指向相机"的法向 z 分量确实为正，所以它分得开两条规则。
+    assert float(ff.normal_cam[2]) > 0.1, ff.normal_cam
 
 
 def test_to_field_z_is_negative_above_the_table():
@@ -284,13 +353,35 @@ def test_marker_px_holds_boundary_corner_centroids():
         assert 0.0 <= px[0] <= 1920.0 and 0.0 <= px[1] <= 1080.0
 
 
-def test_build_field_frame_warns_when_boundary_markers_are_not_coplanar():
-    """某个码被撞得离桌面几十毫米 → 平面拟合歪掉，必须喊出来。"""
+@pytest.mark.parametrize("lift_mm", [20.0, 60.0])
+def test_build_field_frame_warns_when_boundary_markers_are_not_coplanar(lift_mm):
+    """某个码被撞得离桌面几十毫米 → 平面拟合歪掉，必须喊出来。
+
+    抬起量到离面残差是**次线性**的：四角矩形的最小二乘平面会把一个角抬起的量
+    摊到四个角上（实测抬起 4.5/15/25/40/60 mm → 残差 1.99/4.70/7.27/11.09/16.09 mm），
+    5 mm 阈值对应的抬起量约 17 mm，所以阈值两侧各留一条用例。
+
+    别去断言"消息里点名哪个码"：抬起一个角之后四角残差只差 0.01 mm
+    （抬起 25 mm 时 ID20 7.261 vs ID23 7.270），点谁的名是浮点噪声。
+    """
     poses = _poses()
-    tl = poses[TL_ID].tvec.reshape(3) + np.float64([0.0, 0.0, 60.0])
+    tl = poses[TL_ID].tvec.reshape(3) + np.float64([0.0, 0.0, lift_mm])
     poses[TL_ID] = MarkerPose(TL_ID, poses[TL_ID].rvec, tl.reshape(3, 1),
                               poses[TL_ID].reproj_rms_px, poses[TL_ID].corners_px)
-    with pytest.warns(RuntimeWarning, match="共面"):
+    with pytest.warns(RuntimeWarning, match="不共面") as caught:
+        build_field_frame(poses)
+    assert f"> {COPLANAR_TOL_MM} mm" in str(caught[0].message), caught[0].message
+
+
+def test_build_field_frame_stays_quiet_just_below_the_coplanar_tolerance():
+    """阈值另一侧：离面残差 < `COPLANAR_TOL_MM` 时不该喊（否则就是狼来了）。"""
+    poses = _poses()
+    lift = 4.5                                  # → 残差 1.99 mm，低于 5.0
+    tl = poses[TL_ID].tvec.reshape(3) + np.float64([0.0, 0.0, lift])
+    poses[TL_ID] = MarkerPose(TL_ID, poses[TL_ID].rvec, tl.reshape(3, 1),
+                              poses[TL_ID].reproj_rms_px, poses[TL_ID].corners_px)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         build_field_frame(poses)
 
 
@@ -356,9 +447,16 @@ def test_heading_is_equivariant_under_field_plane_rotation_on_the_real_photo():
         assert heading_deg(turned, ff) == pytest.approx(_wrap180(base - alpha), abs=1e-9)
 
 
-def test_heading_rejects_non_orthonormal_input():
+def test_heading_rejects_malformed_rotation_matrices():
+    """`heading_deg` 校验的是**形状与有限性**，不是正交性 —— 名字要跟着改。
+
+    旧名 `..._rejects_non_orthonormal_input` 名不副实：`2*np.eye(3)` 这种非正交矩阵
+    是能算的（返回 −90°），函数并不拒绝它，测它只会逼出一句"我没打算拦这个"。
+    `R_cam2marker` 永远来自 `cv2.Rodrigues`，本来就正交；真要拦非正交矩阵是一项
+    行为变更（会拒绝某些合法的带尺度矩阵），不该由一条校验测试顺手定下来。
+    """
     ff = _identity_ff()
-    for bad in (np.zeros((3, 3)), np.eye(2), [[np.nan] * 3] * 3):
+    for bad in (np.zeros((3, 3)), np.eye(2), [[np.nan] * 3] * 3, np.zeros((3, 3, 1))):
         with pytest.raises(ValueError):
             heading_deg(bad, ff)
 
@@ -375,7 +473,10 @@ def test_heading_rejects_up_axis_perpendicular_to_the_field_plane():
 
 
 def test_body_bias_shifts_origin_by_its_own_magnitude():
-    """ID29 在左甲板：dy=55 的偏置必须把车体原点挪掉约 55 mm。
+    """ID29 装在左甲板：dy=55 的偏置必须把车体原点挪掉约 55 mm。
+
+    `PLACEHOLDER_DY_MM` 是**占位数字**（抄自计划 Task 1 的测试夹具），不是 A1 的
+    测量结果 —— `视觉测量/结果/car_calib.json` 至今不存在，真实偏置还没量。
 
     **为什么断言位移模长而不是 y 分量**：计划写的 `abs(y − my) > 5` 在这张照片上
     恒假（实测只动 0.47 mm）。原因是 ID29 贴出来时转了约 90°（R25：它的规范 +X
@@ -385,36 +486,37 @@ def test_body_bias_shifts_origin_by_its_own_magnitude():
     """
     poses = _poses()
     ff = build_field_frame(poses)
-    d = _shift(ff, poses[VEHICLE_ID],
-               {"dx_mm": 0.0, "dy_mm": 0.0, "dtheta_deg": 0.0},
-               {"dx_mm": 0.0, "dy_mm": 55.0, "dtheta_deg": 0.0})
-    assert float(np.hypot(d[0], d[1])) == pytest.approx(55.0, abs=1.0), d
+    d = _shift(ff, poses[VEHICLE_ID], _bias(0.0), _bias(PLACEHOLDER_DY_MM))
+    assert float(np.hypot(d[0], d[1])) == pytest.approx(PLACEHOLDER_DY_MM, abs=1.0), d
     # ID29 的上轴几乎躺在场地平面内（|Δz| = 2.1 mm < 偏置的 4%），z 不该带走一大截。
     assert abs(float(d[2])) < 1e-9, "纯平移偏置不该动航向"
 
-    dx_only = _shift(ff, poses[VEHICLE_ID],
-                     {"dx_mm": 0.0, "dy_mm": 0.0, "dtheta_deg": 0.0},
-                     {"dx_mm": -12.0, "dy_mm": 0.0, "dtheta_deg": 0.0})
+    dx_only = _shift(ff, poses[VEHICLE_ID], _bias(0.0), _bias(0.0, dx_mm=-12.0))
     assert float(np.hypot(dx_only[0], dx_only[1])) == pytest.approx(12.0, abs=0.5), dx_only
 
 
 def test_body_bias_is_expressed_in_the_marker_frame():
-    """偏置在**码/车体系**里，不是场地系：车转 90°，位移跟着转 90°。
+    """bias 的参考系是**码的规范轴**，不是车体轴、更不是场地轴：车转 90°，位移跟着转 90°。
 
     错写成场地系偏置（`p_field − [dx, dy]`）时，位移方向与车头朝向脱钩，
     每条实验的位移都会带上一个和朝向有关的系统偏差 —— 而且车头朝 +X 时正好为零，
     抽查最容易漏过去。
+
+    这条同时是 **I1 的人肉防线**：A1 的人若用卷尺量到"车体中心在码的左边 55 mm"，
+    却按车体系填成 `dy_mm = 55`，代码会把它当前后偏置转 90° 用掉 —— 每条实验的
+    x 和 y 都带 ~55 mm 的系统偏差且无人报错。本车当前贴法下（ID29 规范 +Y →
+    图像左、规范 +X → 图像上）正确的填法是 `dx_mm ≈ ±b, dy_mm ≈ 0, dtheta_deg ≈ ±90°`。
     """
     ff = _identity_ff()
     t_cam = np.float64([10.0, -20.0, 500.0])
-    zero = {"dx_mm": 0.0, "dy_mm": 0.0, "dtheta_deg": 0.0}
-    dy = {"dx_mm": 0.0, "dy_mm": 55.0, "dtheta_deg": 0.0}
+    zero = _bias(0.0)
+    dy = _bias(PLACEHOLDER_DY_MM)
 
     d0 = _shift(ff, _pose(t_cam, _marker_R(0.0)), zero, dy)
     d90 = _shift(ff, _pose(t_cam, _marker_R(90.0)), zero, dy)
 
-    assert d0[:2] == pytest.approx([-55.0, 0.0], abs=1e-9)
-    assert d90[:2] == pytest.approx([0.0, 55.0], abs=1e-9)   # 跟着转了 90°
+    assert d0[:2] == pytest.approx([-PLACEHOLDER_DY_MM, 0.0], abs=1e-9)
+    assert d90[:2] == pytest.approx([0.0, PLACEHOLDER_DY_MM], abs=1e-9)   # 跟着转了 90°
 
 
 def test_body_pose_yaw_equals_marker_yaw_when_dtheta_zero():
@@ -450,3 +552,36 @@ def test_body_pose_requires_all_three_bias_keys():
     with pytest.raises(ValueError):
         body_pose_in_field(ff, poses[VEHICLE_ID],
                            {"dx_mm": float("nan"), "dy_mm": 0.0, "dtheta_deg": 0.0})
+
+
+def test_body_pose_warns_when_given_a_boundary_marker():
+    """M4：传边界码的位姿进来会算出一个**看起来正常**、实则差几百毫米的车体原点。
+
+    bias 是按 ID29 的贴法标定的；边界码在场地角点上，用它算等于把 ±252/±126 mm
+    的场地系原点搬到车体外。不拦（换个 id 就能绕开），但必须喊。
+    """
+    poses = _poses()
+    ff = build_field_frame(poses)
+    with pytest.warns(RuntimeWarning, match=f"ID{TL_ID}"):
+        x, y, yaw = body_pose_in_field(ff, poses[TL_ID], _bias(0.0))
+    assert abs(x) < 1e6 and abs(y) < 1e6 and -180.0 < yaw <= 180.0   # 算得出，但不可信
+
+
+def test_to_field_and_heading_reject_malformed_field_frames():
+    """M5：`FieldFrame` 没有 `__post_init__`，形状/有限性错误要在**使用点**上炸掉。
+
+    校验的是形状与有限性，与 `heading_deg` 对 `R_cam2marker` 的口径一致；
+    正交性不查（真要查就是一项行为变更，见上一条用例的说明）。
+    `origin_cam` 的 `(3,1)`（OpenCV 的列向量形状）**是合法输入**，不算坏数据。
+    """
+    for bad_R, bad_origin in [(np.zeros((3, 2)), np.zeros(3)),
+                              (np.full((3, 3), np.nan), np.zeros(3)),
+                              (np.eye(3), np.zeros((3, 2))),
+                              (np.eye(3), np.zeros(2)),
+                              (np.eye(3), [0.0, 0.0, float("nan")])]:
+        ff = FieldFrame(R_cam2field=bad_R, origin_cam=bad_origin,
+                        marker_px={}, normal_cam=np.float64([0.0, 0.0, -1.0]))
+        with pytest.raises(ValueError):
+            to_field(ff, [1.0, 2.0, 3.0])
+        with pytest.raises(ValueError):
+            heading_deg(np.eye(3), ff)
