@@ -28,6 +28,26 @@
 只有 ID20 的 `corners[0]` 恰好落在图像左上角，ID21/ID29 在左下、ID22/ID23 在右上。
 所以 `corners_px` 不能按图像方位解释。
 
+## 已知坑：`SOLVEPNP_IPPE_SQUARE` 在"恰好轴对齐"处有奇异点
+
+码**完全正对相机**（投影出来是正轴对齐的方块，即叠加倾角恰好 0°）时，
+IPPE_SQUARE 解出来的是**完全错误的位姿**，而且错法随位置剧烈变化：
+
+| t (mm)            | best RMS (px) | 打印面法向        | ‖R−R_gt‖ |
+|-------------------|---------------|-------------------|-----------|
+| (0, 0, 400)       | 109.557       | `[0, 0, +1]` 背面 | 2.8284    |
+| (0, −400, 400)    | 2.059         | `[0, +1, 0]` 侧向 | 2.0000    |
+| (200, 150, 300)   | 3.605         | `[−0.79, −0.59, −0.18]` | 1.8107 |
+| (−300, −200, 600) | 0.807         | `[0.74, 0.49, −0.47]`   | 1.4569 |
+| (−40, −60, 430)   | 0.580         | `[0.18, 0.27, −0.95]`  | 0.4678    |
+
+**每一行都是错的**（不只是"偏一点"），best RMS 从 0.58 到 109.6 px 都有。
+加 **0.001°** 倾斜就恢复正常（best RMS = 0.00000）。对照 `SOLVEPNP_ITERATIVE`
+在同一批角点上恒为 0.00000 px。
+
+实图碰不到这个点：角点细化必然把方块扭歪，测度为零。但**用精确数学角点做合成
+回归时会正中它** —— 写这类测试要么加一点倾斜，要么改用 `SOLVEPNP_ITERATIVE`。
+
 ## 绝不抛异常
 
 掉码、曝光炸掉、标定没加载，结果只能是"这一帧无解"（返回空 dict / 缺键）。
@@ -35,6 +55,8 @@
 
 `solve_marker_pose` 本身**会**抛（它对外是个数学函数，退化输入应当显式失败）；
 保证不抛的是 `detect_markers`，它把每一条都吞掉、发 warning、并返回已解出的那一部分。
+唯一例外是 `MemoryError`（内存耗尽时返回半帧结果，下游会拿半个场地系继续算，
+比明确崩掉更糟）。
 """
 from __future__ import annotations
 
@@ -240,9 +262,9 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
     """把非 uint8 的数组变成可检测的 uint8。范围判不了就抛 _BadImage。
 
     浮点图有两种常见约定：[0,1] 的缩放图，和 [0,255] 直接存的值。两者必须分开：
-    盲乘 `convertScaleAbs(alpha=255)` 会把 [0,255] 的图压成全白（实测均值 250.6，
-    一个码都检不出）。而"图坏了检不出"和"画面里本来就没有码"长得一模一样 ——
-    那会**静默废掉一整轮实验**，比抛异常糟得多。
+    盲乘 `convertScaleAbs(alpha=255)` 会把 [0,255] 的图压成全白（实测灰度均值
+    252.0、五个码一个都检不出），而"图坏了检不出"和"画面里本来就没有码"长得
+    一模一样 —— 那会**静默废掉一整轮实验**，比抛异常糟得多。
 
     已知歧义：一张 max<=1.0 的 [0,255] 图会被当成 [0,1]。但那种图已经黑到没有
     任何码，不构成实际风险。
@@ -260,16 +282,16 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
 def _to_gray(img_bgr) -> np.ndarray | None:
     """转灰度。None / 维度不对 → None；范围判不了 → 抛 _BadImage。
 
-    接受 BGR / BGRA / 单通道灰度 / 非 uint8。
+    接受 BGR / BGRA / 单通道灰度 / `(H,W,1)` 单通道视图 / 非 uint8。
     """
     if img_bgr is None:
         return None
     arr = np.asarray(img_bgr)
     if arr.ndim == 2:
         gray = arr
-    elif arr.ndim == 3 and arr.shape[2] in (1, 3, 4):
-        if arr.shape[2] == 1:
-            arr = arr[:, :, 0]
+    elif arr.ndim == 3 and arr.shape[2] == 1:
+        gray = arr[:, :, 0]      # 单通道视图：就地返回，别再去索引 shape[2]
+    elif arr.ndim == 3 and arr.shape[2] in (3, 4):
         if arr.dtype != np.uint8:
             arr = _to_uint8(arr)
         code = cv2.COLOR_BGR2GRAY if arr.shape[2] == 3 else cv2.COLOR_BGRA2GRAY
@@ -283,12 +305,14 @@ def detect_markers(img_bgr, calib: dict) -> dict[int, MarkerPose]:
     """检出一帧图里的全部场地码并解位姿。
 
     返回 {marker_id: MarkerPose}。**检不出的码就不会出现在返回值里**（缺键或空
-    dict），**任何情况下都不抛异常** —— 掉码、坏图、坏标定一律等于"这一帧无解"，
-    并各发一条 RuntimeWarning 说明原因。字典外的 id（不是 20~23、也不是 29）
-    静默跳过。
+    dict）。掉码、坏图、坏标定一律等于"这一帧无解"，并各发一条 RuntimeWarning
+    说明原因。字典外的 id（不是 20~23、也不是 29）静默跳过。
 
-    允许 img_bgr 是 BGR / BGRA / 灰度 / 浮点图（[0,1] 或 [0,255] 都认）；
-    None 和维度不对的图返回 {}。
+    **唯一会抛出去的是 `MemoryError`**：内存耗尽时返回一个半帧结果，会让下游拿
+    半个场地系继续算，比明确崩掉更糟。
+
+    允许 img_bgr 是 BGR / BGRA / 灰度 / `(H,W,1)` 视图 / 浮点图（[0,1] 或
+    [0,255] 都认）；None 和维度不对的图返回 {}。
     """
     poses: dict[int, MarkerPose] = {}
     try:
@@ -314,8 +338,14 @@ def detect_markers(img_bgr, calib: dict) -> dict[int, MarkerPose]:
             try:
                 pts = np.asarray(quad, dtype=np.float64).reshape(4, 2)
                 rvec, tvec, rms = solve_marker_pose(pts, side, cam_mtx, coeffs)
-            except (cv2.error, ValueError):
-                continue  # 这一个码解不出来，不影响其它码
+            except (cv2.error, ValueError) as exc:
+                # R29：检出却解不出来，必须喊。静默丢掉一个边界码 = 这一帧的场地系
+                # 缺一块，而下游拿它当完整场地系继续算，没人报错过。
+                warnings.warn(
+                    f"detect_markers: 检出了 ID{marker_id} 但位姿求解失败，已从本帧排除"
+                    f"（{type(exc).__name__}: {exc}）；本帧场地系将缺这个码。",
+                    RuntimeWarning, stacklevel=2)
+                continue
             poses[marker_id] = MarkerPose(
                 marker_id=marker_id,
                 rvec=rvec,

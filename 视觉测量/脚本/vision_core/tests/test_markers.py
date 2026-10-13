@@ -11,7 +11,11 @@
 2. **"面向相机"= 法向 −Z。** 相机 +Z 指向被摄物，面向相机的物体外法向必然
    指回相机，即相机系 −Z。正对相机的码解出 `rvec=[π,0,0]`、法向 `[0,0,−1]`。
 3. **绝不抛异常**：掉码 / 曝光炸掉 / 标定没加载，都必须是"这一帧无解"，
-   不能让实车采图循环整个挂掉。见 test_detect_markers_never_raises。
+   不能让实车采图循环整个挂掉。由 `test_detect_markers_never_raises_on_unusable_input`
+   （不抛）和 `test_detect_markers_warns_loudly_on_malformed_input` /
+   `test_detect_markers_stays_silent_when_image_is_merely_empty`
+   （"格式非法要喊、合法但没码不喊"）共同守住。
+   唯一例外 `MemoryError`，它反而**要**抛出去。
 """
 import cv2
 import numpy as np
@@ -430,6 +434,41 @@ def test_detect_markers_rejects_out_of_range_float_loudly():
 
 
 def test_detect_markers_accepts_grayscale():
-    poses = detect_markers(cv2.cvtColor(_load_photo(), cv2.COLOR_BGR2GRAY),
-                           calib_store.load_calib())
-    assert set(poses) == {20, 21, 22, 23, 29}
+    photo = _load_photo()
+    good = {20, 21, 22, 23, 29}
+    # 这些视图都是解码器常见的产物，必须真的检出五个码 —— 只断言"返回了 dict"
+    # 是个空断言：上一轮就因为只断言 dict，把 (H,W,1) 全程抛 IndexError 的
+    # 回归放过去了（那一帧明明有五个码，却静悄悄返回空）。
+    for label, img in [
+        ("(H,W) 灰度", cv2.cvtColor(photo, cv2.COLOR_BGR2GRAY)),
+        ("(H,W,1) 单通道视图", photo[:, :, 0:1]),
+        ("(H,W,4) BGRA", cv2.cvtColor(photo, cv2.COLOR_BGR2BGRA)),
+        ("(H,W,3) BGR", photo),
+    ]:
+        poses = detect_markers(img, calib_store.load_calib())
+        assert set(poses) == good, f"{label} 只解出 {sorted(poses)}"
+
+
+def test_detect_markers_warns_when_a_detected_marker_fails_to_solve(monkeypatch):
+    """R29：检出却解不出来的码，必须发 warning 再排除，不能静悄悄丢。
+
+    静默丢掉一个边界码 = 这一帧的场地系缺一块，而下游会拿它当**完整**场地系
+    继续算，后面所有测量都错，且没有任何一处报错。
+    """
+    from vision_core import markers as M
+
+    real = M.solve_marker_pose
+    state = {"n": 0}
+
+    def flaky(corners, side_mm, K, dist):
+        state["n"] += 1
+        if state["n"] == 2:                      # 让第 2 个码解不出来
+            raise ValueError("故意注入的求解失败")
+        return real(corners, side_mm, K, dist)
+
+    monkeypatch.setattr(M, "solve_marker_pose", flaky)
+    with pytest.warns(RuntimeWarning, match="位姿求解失败"):
+        poses = M.detect_markers(_load_photo(), calib_store.load_calib())
+
+    assert len(poses) == 4, "其余四个码仍应正常解出"
+    assert all(p.reproj_rms_px < 2.0 for p in poses.values())
