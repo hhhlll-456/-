@@ -4,3 +4,5 @@ __pycache__/
 实验/原始日志/*.jpg
 视觉测量/照片/calib_chess_v3/
 .pio/
+.codegraph/
+.pytest_cache/
