@@ -1,0 +1,22 @@
+{
+  "source": "chessboard 9x7 (8x6 inner corners, 20 mm squares), hand-held, 15 poses",
+  "tool": "cv2.findChessboardCornersSB(8,6) + cornerSubPix + cv2.calibrateCameraExtended",
+  "date": "2026-10-13",
+  "image_wh": [1920, 1080],
+  "model": "pinhole (zero distortion), fx=fy",
+  "K": [[1460.76, 0.0, 1019.44], [0.0, 1460.76, 592.77], [0.0, 0.0, 1.0]],
+  "dist": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "rms_px": 1.3244,
+  "nviews": 15,
+  "hfov_deg": 66.63,
+  "vfov_deg": 40.58,
+  "focal_px": 1460.76,
+  "focal_uncertainty": {
+    "statistical_std_px": 11.2,
+    "systematic_range_px": [1417.2, 1515.8],
+    "note": "系统不确定度来自焦距<->主点强耦合(平面标定、倾斜不大): fx 随主点约束从 1417(主点钉在中心) 变到 1516(主点自由+全畸变). CV 选出的最简模型为针孔, 取 fx=fy=1461."
+  },
+  "principal_point_note": "cx≈1019, cy≈593 (比画面中心偏右 ~59px, 偏下 ~53px); 棋盘始终在画面中部, 主点弱可辨, 与焦距强耦合. 针孔模型下 dist=0, 主点不影响去畸变(恒等).",
+  "distortion_note": "棋盘始终位于画面中部, 未覆盖边角, 故高阶畸变不可辨识; 留一交叉验证显示加畸变项几乎不改善(1.18 vs 针孔 1.27 px), 与基于真实场地的独立估计(~0.3%)一致 => 取零畸变(针孔).",
+  "previous_nominal_fx": 1400.0
+}

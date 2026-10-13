@@ -1,0 +1,18 @@
+{
+  "dictionary": "DICT_4X4_50",
+  "created": "2026-10-12",
+  "source_photo": "photo5_final.jpg",
+  "camera": "/dev/video0 (GP_Flip_Mirror 8M USB camera), MJPG 1920x1080@30",
+  "field_frame": {
+    "convention": "homography from 4 boundary markers; (0,0)=TL, (1,0)=TR, (1,1)=BR, (0,1)=BL",
+    "note": "normalized coords = fraction of field width/height"
+  },
+  "markers": {
+    "20": {"role": "boundary", "corner": "TL", "desc": "场地边界·左上角", "ref_center_px": [363, 105], "ref_side_px": 73},
+    "21": {"role": "boundary", "corner": "TR", "desc": "场地边界·右上角", "ref_center_px": [1841, 110], "ref_side_px": 76},
+    "22": {"role": "boundary", "corner": "BR", "desc": "场地边界·右下角", "ref_center_px": [1826, 839], "ref_side_px": 74},
+    "23": {"role": "boundary", "corner": "BL", "desc": "场地边界·左下角", "ref_center_px": [351, 766], "ref_side_px": 73},
+    "29": {"role": "vehicle", "desc": "麦轮小车上的码(比边界码大)", "ref_center_px": [1227, 425], "ref_side_px": 105}
+  },
+  "ref_car_position_normalized": [0.612, 0.452]
+}
