@@ -120,10 +120,13 @@ def _run_headless(monkeypatch, frames, argv_extra=(), drop_after=None,
     # 冷却在下面单独有用例覆盖；这里关掉，好把"变化才打"的规则单独验清楚。
     monkeypatch.setattr(live_field, "TERMINAL_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(live_field, "_has_display", lambda: True)
-    # **GUI 全 stub**（含 namedWindow）：否则在操作者的桌面上真会弹出一个窗口，
-    # 而且 destroyAllWindows 被 stub 掉之后它会一直留在屏幕上。
+    # **GUI 全 stub**（含 namedWindow/imshow/waitKey）：否则在操作者的桌面上真会弹出一个
+    # 窗口，而且 destroyAllWindows 被 stub 掉之后它会一直留在屏幕上。本夹具的
+    # argv_extra 为空时走的是**窗口主循环**，所以这几个必须都盖住。
     for name in ("namedWindow", "resizeWindow", "moveWindow", "destroyAllWindows"):
         monkeypatch.setattr(cv2, name, lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "imshow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "waitKey", lambda *a, **k: -1)   # -1 = 没有按键
     if raiser is not None:
         def boom(*_a, **_k):
             raise cv2.error(raiser)
@@ -883,6 +886,73 @@ def test_run_window_snapshots_a_frame_that_solve_image_can_still_read(monkeypatc
     assert sorted(detect_markers(img, calib)) == [20, 21, 22, 23, 29]
 
 
+def test_window_mode_exits_one_when_not_a_single_frame_was_ever_solved(monkeypatch, capsys):
+    """整场一帧都没解出来 → `EXIT_PHOTO_FAILED`，与文档、与 `run_headless` 的口径都不冲突。
+
+    之前的 bug：窗口模式无条件返回 `EXIT_OK`，而退出码表写着"0 = 每帧都 READY" ——
+    同样一屏 `boundary_moved`，`--frames 2` 给 1、窗口模式给 0，按 `$?` 判断的脚本
+    在窗口模式下拿到假通过。
+    """
+    bad = _cover(_fixture_image(), COVER_BOX[20])
+    rc, _shown, _cap = _drive_window(monkeypatch, [bad, bad, bad], keys=[0, 0, ord("q")])
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_PHOTO_FAILED == 1
+    assert "boundary_moved" in out
+
+    # 对照组：无窗口模式同样内容也是 1（那边是"任何一帧没解出来就算失败"）
+    rc_headless, _cap = _run_headless(monkeypatch, [bad, bad], ["--frames", "2"])
+    assert rc_headless == rc
+
+
+def test_window_mode_exits_zero_once_any_frame_was_solved(monkeypatch, capsys):
+    """只要有过一帧 READY，整场就算成功 —— 调取景途中掉几帧是常态。
+
+    这条与上一条是一对：上一条钉住"整场零解算不能算通过"，这一条钉住
+    "**不能**反过来把任何掉帧都当成失败"（否则每次挪一下相机都吃一个非 0 退出码）。
+    """
+    good = _fixture_image()
+    bad = _cover(good.copy(), COVER_BOX[20])
+    # 前 3 帧按 0（"没有按键"）让它继续跑，第 4 次 waitKey 才按 q 退出 ——
+    # 于是这轮真的处理了 bad/bad/good 三帧，其中有一帧 READY。
+    rc, _shown, _cap = _drive_window(monkeypatch, [bad, bad, good, good],
+                                     keys=[0, 0, 0, ord("q")])
+    capsys.readouterr()
+    assert rc == live_field.EXIT_OK == 0
+
+    # 全程解得出来也一样是 0
+    rc, _shown, _cap = _drive_window(monkeypatch, [good, good], keys=[0, ord("q")])
+    capsys.readouterr()
+    assert rc == live_field.EXIT_OK
+
+
+def test_the_exit_code_table_in_the_docs_matches_what_the_code_does():
+    """退出码表的每一行都要能被代码兑现 —— 上一轮的 bug 正是"文档说 1、代码给 0"。"""
+    text = live_field.build_parser().format_help()
+    assert "至少有一帧 READY" in text and "整场一帧都没解出来" in text
+    assert "标定文件读不出来" in text and "连不上显示服务器" in text
+    # 模块 docstring 里那张表也要跟着改（两份不能各说各话）
+    doc = live_field.__doc__
+    assert "整场一帧都没解出来" in doc and "标定文件读不出来" in doc
+
+
+def test_a_calib_file_that_cannot_be_read_returns_one(monkeypatch, capsys, tmp_path):
+    """标定文件损坏 → 一行提示 + 1（与 `verify_vision.py` 同一口径：同一类输入错误，同一返回码）。"""
+    broken = tmp_path / "car_calib.json"
+    broken.write_text("{ 这不是 JSON", encoding="utf-8")
+    rc = live_field.main(["--once", "--calib", str(broken)])
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_PHOTO_FAILED == 1
+    assert "标定文件读不出来" in out and "Traceback" not in out
+
+
+def test_a_read_failure_returns_one_and_never_two(monkeypatch, capsys):
+    """中途读帧失败是 1（没产出解），不是 2（用法错）—— 两种"失败"不许混。"""
+    rc, _cap = _run_headless(monkeypatch, [_fixture_image()], ["--frames", "3"], drop_after=1)
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_PHOTO_FAILED == 1
+    assert "读帧失败" in out
+
+
 def test_run_window_never_mutates_the_frame_it_solves_and_saves(monkeypatch, tmp_path, capsys):
     """`s` 连按两次 + 网格开关跑一轮：原帧必须始终干净，快照逐张可解。"""
     img = _fixture_image()
@@ -926,12 +996,14 @@ def test_headless_modes_do_not_need_a_display(monkeypatch, capsys):
     assert "READY" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("raiser_name", ["namedWindow", "imshow"])
-def test_a_window_call_that_raises_is_one_line_not_a_traceback(monkeypatch, capsys, raiser_name):
-    """`cv2.namedWindow`/`imshow` 抛 `cv2.error` 时不能穿出 `main()`（远端 shell 最常见的坑）。
+@pytest.mark.parametrize("raiser_name", ["namedWindow", "resizeWindow", "moveWindow",
+                                           "imshow", "waitKey"])
+def test_every_window_call_that_raises_is_one_line_not_a_traceback(monkeypatch, capsys, raiser_name):
+    """**五个**窗口调用逐个注入 `cv2.error`：都必须变成一行提示 + 退出码 2，不许 traceback。
 
-    两个点都参数化：`namedWindow` 是"开不起来"，`imshow` 是"开起来了但显示这一帧失败"，
-    两者都还没有任何码被解算过，所以都该走显示提示。
+    五个都参数化，是因为它们全都得走 `_window_call` —— 只要有一个漏掉（直接写
+    `cv2.xxx(...)`），那条 `cv2.error` 就会穿出 `main()` 在远端 shell 里糊一屏红字，
+    而只参数化 `namedWindow`/`imshow` 是**测不出**这种漏掉的。
     """
     monkeypatch.setenv("DISPLAY", ":0")           # 过了环境检查，逼出 cv2.error 那条路
     rc, _cap = _run_headless(
@@ -941,8 +1013,44 @@ def test_a_window_call_that_raises_is_one_line_not_a_traceback(monkeypatch, caps
     captured = capsys.readouterr()
 
     assert rc == live_field.EXIT_USAGE != 0
-    assert "--once" in captured.out and "--frames" in captured.out
+    assert "窗口" in captured.out and "--once" in captured.out
     assert "Traceback" not in captured.out and "Traceback" not in captured.err
+
+
+def test_the_display_message_does_not_claim_no_display_when_a_display_is_set(monkeypatch):
+    """`DISPLAY` 有值却开不了窗口时，不许说"当前没有显示环境" —— 那句话是假的。
+
+    兜底层收窄到 `_window_call` 之后，这条路径在 `DISPLAY` **有值**时也会走到
+    （Qt 连接断了、`imshow` 收到畸形图都会）。那时候给出的补救要是只有
+    "加 `--once`"，恰好废掉这个工具存在的理由 —— 它就是给要看画面的人用的。
+    """
+    monkeypatch.setattr(live_field.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    text = live_field._display_problem("boom")
+    assert text.splitlines()[0].startswith("连不上图形窗口")
+    assert "当前没有显示环境" not in text.splitlines()[0]      # 首行不许说假话
+    assert ":0" in text.splitlines()[0]                     # 带上具体是哪个 DISPLAY
+    assert "X 转发" in text or "ssh -X" in text
+
+    monkeypatch.delenv("DISPLAY", raising=False)
+    cold = live_field._display_problem("")
+    assert cold.splitlines()[0].startswith("当前没有显示环境")
+    assert "连不上图形窗口" not in cold
+    assert "export DISPLAY=:0" in cold or "ssh -X" in cold    # 上一轮遗留的提示一起做掉
+    assert not cold.endswith("\n  ") and "\n\n" not in cold
+
+
+@pytest.mark.parametrize("exc_factory", [lambda: cv2.error(""), lambda: OSError("")])
+def test_an_exception_with_an_empty_message_does_not_raise_inside_except(exc_factory):
+    """`cv2.error("")` / `OSError("")` 的 `str()` 是空串，`splitlines()[0]` 会在 **except 里**
+    抛 `IndexError`，把真正的错误盖掉 —— 报错的地方正在报错。"""
+    assert live_field._first_line(exc_factory()) == ""
+    assert live_field._first_line(cv2.error("第一行\n第二行")) == "第一行"
+    # 窗口调用那一层（`_window_call` 只转换 `cv2.error`）也要拿到空串而不是 IndexError
+    with pytest.raises(live_field._DisplayUnavailable) as caught:
+        live_field._window_call(lambda: (_ for _ in ()).throw(cv2.error("")))
+    assert str(caught.value) == ""
 
 
 def test_a_snapshot_failure_is_not_disguised_as_a_display_problem(monkeypatch, capsys):
