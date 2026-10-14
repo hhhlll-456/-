@@ -24,6 +24,7 @@
 """
 import importlib.util
 import json
+import math
 import re
 import sys
 
@@ -106,18 +107,49 @@ def _calib_path(tmp_path) -> str:
     return str(tmp_path / "car_calib.json")
 
 
-def _exact_pose(tmp_path) -> tuple[float, float, float]:
+def _exact_pose(tmp_path, photo: str = PHOTO) -> tuple[float, float, float]:
     """参考照片的精确解算结果。
 
     直接调 `solve_image` 而不是去解析打印行：打印只到 0.1，残差是 mm 量级的差，
     0.05 的取整误差会污染断言。打印行本身能不能被解析，由只读那两条用例验。
     """
-    img, res = verify_vision.load_image(PHOTO)
+    img, res = verify_vision.load_image(photo)
     assert img is not None and res.ok
     solved = verify_vision.solve_image(img, calib_store.load_calib(_calib_path(tmp_path)),
                                        res.label, res.origin)
-    assert solved.ok
+    assert solved.ok, f"{photo} 解不出来：{solved.detail}"
     return (solved.x_mm, solved.y_mm, solved.yaw_deg)
+
+
+# 仓库里现成的、**五码都能检出**的三张照片 = 三个不同现场。A2 判据按"不同位置"算，
+# 所以凡是"3 个样本应该通过"的用例都必须给三张**真**不同的照片；拿同一张重复三遍
+# 现在会被判据挡住（那正是 Important 3 要防的事）。
+SCENES = [PHOTO, "视觉测量/照片/photo5_final.jpg", "视觉测量/照片/photoA_calib.jpg"]
+
+
+def _scenes() -> list[str]:
+    for photo in SCENES:
+        assert calib_store.resolve_path(photo).is_file(), f"测试要用的现场照片没了：{photo}"
+    return list(SCENES)
+
+
+def _truth_values_for(photos, tmp_path, dx: float = 0.0, dy: float = 0.0,
+                      dyaw: float = 0.0) -> list[str]:
+    """给每张照片造一个"残差恰好已知"的真值串 `X,Y,YAW`（**不带** `--truth=` 前缀）。
+
+    真值 = 该照片自己的解算结果 + 偏移，于是残差恰好是 `(dx, dy)` 与 `dyaw` ——
+    RMS 可以精确断言，与"这张照片实际拍到哪"无关。
+    """
+    out = []
+    for photo in photos:
+        x, y, yaw = _exact_pose(tmp_path, photo)
+        out.append(f"{x + dx:.6f},{y + dy:.6f},{yaw + dyaw:.6f}")
+    return out
+
+
+def _truths_for(photos, tmp_path, dx: float = 0.0, dy: float = 0.0, dyaw: float = 0.0) -> list[str]:
+    """同 `_truth_values_for`，但带 `--truth=` 前缀，可以直接展开进 argv。"""
+    return [f"--truth={v}" for v in _truth_values_for(photos, tmp_path, dx, dy, dyaw)]
 
 
 # --- 只读模式 -------------------------------------------------------------------
@@ -224,23 +256,23 @@ def test_one_bad_photo_does_not_stop_the_good_ones(tmp_path, capsys):
 
 def test_truth_computes_rms_and_n_samples_and_passes_the_gate(tmp_path, capsys):
     """真值按位置一一对应；RMS / n_samples 都算出来；判据明写出来，别让人背。"""
-    x0, y0, yaw0 = _exact_pose(tmp_path)
+    photos = _scenes()
     # 三个位置的真值各自偏一个已知的量：位移 (+1,−2) mm，航向 +0.5°
-    truths = [f"--truth={x0 + 1.0:.4f},{y0 - 2.0:.4f},{yaw0 + 0.5:.4f}"] * 3
+    truths = _truths_for(photos, tmp_path, dx=1.0, dy=-2.0, dyaw=0.5)
 
-    rc = verify_vision.main([PHOTO, PHOTO, PHOTO, *truths,
+    rc = verify_vision.main([*photos, *truths,
                              "--write-validation", "--calib", _calib_path(tmp_path)])
     out = capsys.readouterr().out
 
     assert rc == verify_vision.EXIT_OK
-    assert "n_samples=3" in out
+    assert "n_samples=3" in out and "distinct_photos=3" in out
     assert "residual_rms=2.24mm" in out               # hypot(1, 2) = 2.2360…
     assert "residual_yaw_rms=0.50deg" in out
     assert "A2 gate: PASS" in out
-    assert "RMS ≤ 3.0 mm 且 ≤ 1.5° 且 ≥ 3 个位置" in out
+    assert "RMS ≤ 3.0 mm 且 ≤ 1.5° 且 ≥ 3 个不同位置" in out
 
     v = json.loads((tmp_path / "car_calib.json").read_text(encoding="utf-8"))["validation"]
-    assert v["n_samples"] == 3
+    assert v["n_samples"] == 3 and v["n_distinct_photos"] == 3
     assert v["residual_rms_mm"] == pytest.approx(2.2360679, abs=1e-3)
     assert v["residual_rms_deg"] == pytest.approx(0.5, abs=1e-3)
     assert v["gate_passed"] is True
@@ -248,40 +280,35 @@ def test_truth_computes_rms_and_n_samples_and_passes_the_gate(tmp_path, capsys):
 
 def test_residual_is_solved_minus_truth(tmp_path, capsys):
     """符号钉死：残差 = 解出来 − 真值。真给反了，A2 的结论会整个反过来。"""
-    x0, y0, yaw0 = _exact_pose(tmp_path)
-    truths = [f"--truth={x0 - 1.0:.4f},{y0 + 2.0:.4f},{yaw0 - 0.5:.4f}"] * 3
-    rc = verify_vision.main([PHOTO, PHOTO, PHOTO, *truths, "--calib", _calib_path(tmp_path)])
+    photos = _scenes()
+    truths = _truths_for(photos, tmp_path, dx=-1.0, dy=-2.0, dyaw=-0.5)
+    rc = verify_vision.main([*photos, *truths, "--calib", _calib_path(tmp_path)])
     out = capsys.readouterr().out
     assert rc == verify_vision.EXIT_OK
-    assert "err_xy=(+1.0,-2.0)mm" in out
+    assert "err_xy=(+1.0,+2.0)mm" in out
     assert "dyaw=+0.5deg" in out
 
 
 def test_two_samples_are_not_evidence_and_the_gate_says_so(tmp_path, capsys):
-    """2 个点的残差 RMS 不算通过：退出码非 0，且说清是样本数不够。"""
-    x0, y0, yaw0 = _exact_pose(tmp_path)
-    rc = verify_vision.main([PHOTO, PHOTO,
-                             f"--truth={x0:.4f},{y0:.4f},{yaw0:.4f}",
-                             f"--truth={x0:.4f},{y0:.4f},{yaw0:.4f}",
+    """2 个位置的残差 RMS 不算通过：退出码非 0，且说清是位置不够。"""
+    photos = _scenes()[:2]
+    rc = verify_vision.main([*photos, *_truths_for(photos, tmp_path),
                              "--write-validation", "--calib", _calib_path(tmp_path)])
     out = capsys.readouterr().out
     assert rc == verify_vision.EXIT_GATE
-    assert "INSUFFICIENT" in out and "2 < 3" in out
+    assert "INSUFFICIENT" in out and "只有 2 个不同位置" in out
     v = json.loads((tmp_path / "car_calib.json").read_text(encoding="utf-8"))["validation"]
-    assert v["n_samples"] == 2 and v["gate_passed"] is False
+    assert v["n_samples"] == 2 and v["n_distinct_photos"] == 2 and v["gate_passed"] is False
 
 
 def test_rms_over_the_limit_fails_the_gate(tmp_path, capsys):
-    x0, y0, yaw0 = _exact_pose(tmp_path)
-    rc = verify_vision.main([PHOTO, PHOTO, PHOTO,
-                             f"--truth={x0 - 10.0:.4f},{y0:.4f},{yaw0:.4f}",
-                             f"--truth={x0 + 10.0:.4f},{y0:.4f},{yaw0:.4f}",
-                             f"--truth={x0 - 10.0:.4f},{y0:.4f},{yaw0:.4f}",
+    photos = _scenes()
+    rc = verify_vision.main([*photos, *_truths_for(photos, tmp_path, dx=10.0),
                              "--write-validation", "--calib", _calib_path(tmp_path)])
     out = capsys.readouterr().out
     assert rc == verify_vision.EXIT_GATE
     assert "A2 gate: FAIL" in out
-    assert "先查 A1 偏置" in out          # 失败时先怀疑 90° 那条换算
+    assert "先查 A1 偏置" in out          # 失败时先怀疑 dtheta 的 ±90 符号
 
 
 def test_partial_truth_match_is_rejected(tmp_path, capsys):
@@ -315,10 +342,11 @@ def test_negative_truth_works_with_and_without_the_equals_sign(tmp_path, capsys)
     assert verify_vision.normalise_truth_argv(["--truth", "-80,0,0"]) == ["--truth=-80,0,0"]
     assert verify_vision.parse_truth("-80,10,-190") == (-80.0, 10.0, 170.0)   # 归一到 (−180,180]
 
-    x0, y0, yaw0 = _exact_pose(tmp_path)
-    truths = [f"{x0:.4f},{y0:.4f},{yaw0:.4f}"] * 3
-    rc = verify_vision.main([PHOTO, PHOTO, PHOTO,
-                             "--truth", truths[0], f"--truth={truths[1]}", f"--truth={truths[2]}",
+    photos = _scenes()
+    values = _truth_values_for(photos, tmp_path)
+    rc = verify_vision.main([*photos,
+                             "--truth", values[0],
+                             f"--truth={values[1]}", f"--truth={values[2]}",
                              "--calib", _calib_path(tmp_path)])
     out = capsys.readouterr().out
     assert rc == verify_vision.EXIT_OK
@@ -456,6 +484,7 @@ def test_capture_count_is_equivalent_to_repeating_the_flag(tmp_path, capsys, mon
         return frame.copy()
 
     monkeypatch.setattr(verify_vision, "grab_frame", fake_grab)
+    caps_dir = tmp_path / "caps"
     rc = verify_vision.main(["--capture-count", "3", "--capture-dir", str(tmp_path / "c"),
                              "--calib", _calib_path(tmp_path)])
     capsys.readouterr()
@@ -526,10 +555,56 @@ def test_a_failed_capture_becomes_one_failed_line_not_a_traceback(tmp_path, caps
         raise verify_vision.CaptureError("/dev/video0 打不开（被别的程序占着？）")
 
     monkeypatch.setattr(verify_vision, "grab_frame", boom)
-    rc = verify_vision.main(["--capture", "--calib", _calib_path(tmp_path)])
+    rc = verify_vision.main(["--capture", "--capture-dir", str(tmp_path / "caps"),
+                             "--calib", _calib_path(tmp_path)])
     out = capsys.readouterr().out
     assert rc == verify_vision.EXIT_PHOTO_FAILED
     assert "reason=capture_failed" in out
+    assert "Traceback" not in out
+
+
+def test_capture_never_writes_into_the_repo(tmp_path, capsys, monkeypatch):
+    """测试套件不许在仓库里 mkdir。`capture_shots` 会 mkdir --capture-dir，
+    漏传这个标志就会在干净克隆上留下一个未跟踪目录。"""
+    frame = _fixture_image()
+    monkeypatch.setattr(verify_vision, "grab_frame", lambda d, s: frame.copy())
+    caps_dir = tmp_path / "caps"
+    repo_caps = calib_store.resolve_path(verify_vision.DEFAULT_CAPTURE_DIR)
+    existed_before = repo_caps.exists()          # 操作者真用过 --capture 就会已存在
+    rc = verify_vision.main(["--capture", "--capture-dir", str(caps_dir),
+                             "--calib", _calib_path(tmp_path)])
+    capsys.readouterr()
+    assert rc == 0
+    assert caps_dir.is_dir() and list(caps_dir.glob("*.jpg"))
+    assert repo_caps.exists() == existed_before
+
+
+def test_capture_count_adds_to_repeated_capture_flags(tmp_path, capsys, monkeypatch):
+    """`--capture --capture --capture-count 2` 拍 4 张，不是 2 张（覆盖 vs 叠加）。"""
+    frame = _fixture_image()
+    calls = []
+
+    def fake_grab(device, settle_frames):
+        calls.append(device)
+        return frame.copy()
+
+    monkeypatch.setattr(verify_vision, "grab_frame", fake_grab)
+    rc = verify_vision.main(["--capture", "--capture", "--capture-count", "2",
+                             "--capture-dir", str(tmp_path / "c"),
+                             "--calib", _calib_path(tmp_path)])
+    capsys.readouterr()
+    assert rc == 0
+    assert len(calls) == 4
+
+
+def test_unreadable_image_is_reported_as_image_unreadable(tmp_path, capsys):
+    """`image_unreadable` 是词表里唯一一个还没有用例的原因词。"""
+    broken = tmp_path / "not_an_image.jpg"
+    broken.write_text("这不是 JPEG，只是一段文本。", encoding="utf-8")
+    rc = verify_vision.main([str(broken), "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == verify_vision.EXIT_PHOTO_FAILED
+    assert "reason=image_unreadable" in out
     assert "Traceback" not in out
 
 
@@ -538,27 +613,27 @@ def test_a_failed_capture_becomes_one_failed_line_not_a_traceback(tmp_path, caps
 
 def test_help_carries_the_marker_frame_bias_conversion():
     """R35：车体「左 b」→ dx ±b、dy 0、dtheta ±90。help 是操作者眼前唯一的东西。"""
-    text = verify_vision.build_parser().format_help()
-    assert "码规范 +X" in text
-    assert "车体「左」 b mm" in text
-    assert "--bias-dx ±b" in text
-    assert "--bias-dtheta ±90" in text
-    assert "没有一处报错" in text          # 为什么值得照着做
+    stripped = [ln.strip() for ln in verify_vision.build_parser().format_help().splitlines()]
+    assert any("码规范 +X" in ln for ln in stripped)
+    assert any("车体「左」 b → --bias-dx ±b, --bias-dy 0, --bias-dtheta ±90" in ln
+               for ln in stripped)
+    assert any("车体「前」 f → --bias-dx 0,  --bias-dy ±f, --bias-dtheta ±90" in ln
+               for ln in stripped)
 
 
 def test_help_states_the_a2_gate_and_the_truth_ordering():
     text = verify_vision.build_parser().format_help()
     assert "X,Y,YAW_DEG" in text
     assert "第 1 个 --truth ↔ 第 1 张照片" in text
-    assert "RMS ≤ 3.0 mm 且 ≤ 1.5° 且 ≥ 3 个位置" in text
+    assert "RMS ≤ 3.0 mm 且 ≤ 1.5° 且 ≥ 3 个不同位置" in text
     assert "n_samples" in text
 
 
 def test_help_keeps_the_bias_conversion_on_its_own_lines():
     """argparse 默认会把参数 help 重新折行，折掉的换算表就没法照着填了。"""
     stripped = [ln.strip() for ln in verify_vision.build_parser().format_help().splitlines()]
-    assert "车体「左」 b mm → --bias-dx ±b  --bias-dy 0   --bias-dtheta ±90" in stripped
-    assert "车体「前」 f mm → --bias-dx 0   --bias-dy ±f  --bias-dtheta ±90" in stripped
+    assert "dx = FWD·cos(dtheta) + LEFT·sin(dtheta)" in stripped
+    assert "dy = −FWD·sin(dtheta) + LEFT·cos(dtheta)" in stripped
 
 
 def test_help_mentions_the_battery_verdict_is_human():
@@ -566,3 +641,256 @@ def test_help_mentions_the_battery_verdict_is_human():
     text = verify_vision.build_parser().format_help()
     assert "battery.verdict 只能由人用 --battery-verdict 给" in text
     assert "工具不猜" in text
+
+
+def test_help_offers_the_body_frame_form_for_a1():
+    """R35 的"±"只有在操作者知道码的轴朝哪时才可用 —— `--bias-body` 就是那个东西。"""
+    text = verify_vision.build_parser().format_help()
+    assert "--bias-body FWD,LEFT" in text
+    assert "--bias-dtheta" in text
+    assert "车头方向" in text and "车左方向" in text
+
+
+# --- 一次调用里写两处（Critical：第二处把第一处抹掉）-----------------------------
+#
+# 这组是 review 的 Critical 回归锁：一次调用里既给人工标志又给 --write-validation，
+# 两处必须**都**落盘。`save_calib` 是覆盖写，所以任何"第二次拿旧内存再写一遍"的写法
+# 都会静默把第一次写的内容抹掉，且两次都打印成功回执。
+
+
+def test_manual_writes_and_validation_in_one_run_both_land(tmp_path, capsys):
+    """R40 的同一条纪律，两个方向都要挡：`--write-validation` 不能抹掉人工写的那几段。"""
+    p = tmp_path / "car_calib.json"
+    calib_store.save_calib({"bias": {"dx_mm": -12.0, "dy_mm": 55.0, "dtheta_deg": 90.0},
+                            "coplanar": False,
+                            "battery": {"sag_v": 0.4, "verdict": None}}, path=str(p))
+    photos = _scenes()
+
+    rc = verify_vision.main([*photos,
+                             "--coplanar", "yes",
+                             "--battery-verdict", "接插件压降，接触正常",
+                             *_truths_for(photos, tmp_path),
+                             "--write-validation", "--calib", str(p)])
+    capsys.readouterr()
+    assert rc == verify_vision.EXIT_OK
+
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["coplanar"] is True                                    # 人工写的
+    assert data["battery"]["verdict"] == "接插件压降，接触正常"          # 人工写的
+    assert data["battery"]["sag_v"] == 0.4                             # 原有值没丢
+    assert data["bias"] == {"dx_mm": -12.0, "dy_mm": 55.0, "dtheta_deg": 90.0}
+    assert data["validation"]["n_samples"] == 3                        # 本轮写的
+    assert data["validation"]["gate_passed"] is True
+
+
+def test_bias_and_validation_in_one_run_both_land(tmp_path, capsys):
+    """review 的另一个复现：`--bias-dy 77` + `--write-validation`，问 77 得 77。"""
+    p = tmp_path / "car_calib.json"
+    calib_store.save_calib({"bias": {"dx_mm": -12.0, "dy_mm": 55.0, "dtheta_deg": 90.0}},
+                           path=str(p))
+    photos = _scenes()
+    verify_vision.main([*photos,
+                        "--bias-dy", "77.0",
+                        *_truths_for(photos, tmp_path),
+                        "--write-validation", "--calib", str(p)])
+    capsys.readouterr()
+
+    bias = json.loads(p.read_text(encoding="utf-8"))["bias"]
+    assert bias["dy_mm"] == 77.0
+    assert bias["dx_mm"] == -12.0 and bias["dtheta_deg"] == 90.0
+    assert json.loads(p.read_text(encoding="utf-8"))["validation"]["n_samples"] == 3
+
+
+def test_the_run_writes_the_file_exactly_once(tmp_path, capsys, monkeypatch):
+    """结构性钉子：不管给多少写标志，一次调用只许 `save_calib` 一次。
+
+    两次写 = 第二次要么覆盖第一次，要么得从磁盘重读 —— 后者是能修的写法，但两次写
+    本身就是"能静默丢数据"的形状，不该留着。
+    """
+    calls = []
+    real_save = calib_store.save_calib
+
+    def counting_save(data, path=None):
+        calls.append(json.loads(json.dumps(data)))
+        real_save(data, path)
+
+    monkeypatch.setattr(verify_vision.calib_store, "save_calib", counting_save)
+    photos = _scenes()
+    verify_vision.main([*photos,
+                        "--bias-dy", "77.0", "--coplanar", "yes", "--battery-sag-v", "0.4",
+                        *_truths_for(photos, tmp_path),
+                        "--write-validation", "--calib", _calib_path(tmp_path)])
+    capsys.readouterr()
+    assert len(calls) == 1
+    written = calls[0]
+    assert written["coplanar"] is True and written["battery"]["sag_v"] == 0.4
+    assert written["bias"]["dy_mm"] == 77.0 and written["validation"]["n_samples"] == 3
+
+
+# --- Important 2：结果行不能是旧 bias 算出来的 ------------------------------------
+
+
+def test_result_line_is_solved_with_the_bias_being_written(tmp_path, capsys):
+    """同一次调用里给了 --bias-dy，打印的 x/y/yaw 必须已经是新 bias 的结果。
+
+    旧代码用**写盘前**的 calib 求解，于是屏幕上那个数比文件里最终的值差几百毫米，
+    而操作者正是照着屏幕上那个数去判断"填对没有"。
+    """
+    rc = verify_vision.main([PHOTO, "--bias-dy", "-55.0", "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    printed = _results(out)[0]
+    stored = json.loads((tmp_path / "car_calib.json").read_text(encoding="utf-8"))
+
+    # 用**落盘后的**标定重解一次，结果行必须逐字相同
+    x0, y0, yaw0 = _exact_pose(tmp_path)       # 此刻文件里已是 dy=-55
+    verify_vision.main([PHOTO, "--calib", _calib_path(tmp_path)])
+    assert _results(capsys.readouterr().out)[0] == printed
+    assert RESULT_RE.match(printed).group("y") == f"{y0:+.1f}"
+    assert stored["bias"]["dy_mm"] == -55.0
+
+
+def test_stale_bias_line_is_marked_as_already_updated(tmp_path, capsys):
+    """写 bias 时表头要说明"下面几行已经用上了新值"，不是让人以为还是旧值。"""
+    verify_vision.main([PHOTO, "--bias-dy", "-55.0", "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert "即将写入" in out and "已经是写入后的值" in out
+
+
+# --- Important 3：同一张图重复 N 次不算 N 个位置 -----------------------------------
+
+
+def test_repeating_one_photo_three_times_does_not_pass_the_gate(tmp_path, capsys):
+    """一张图 + 三个 `--truth`：位置只有一个，判据不能算它过。"""
+    x0, y0, yaw0 = _exact_pose(tmp_path)
+    rc = verify_vision.main([PHOTO, PHOTO, PHOTO,
+                             f"--truth={x0:.4f},{y0:.4f},{yaw0:.4f}",
+                             f"--truth={x0:.4f},{y0:.4f},{yaw0:.4f}",
+                             f"--truth={x0:.4f},{y0:.4f},{yaw0:.4f}",
+                             "--write-validation", "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == verify_vision.EXIT_GATE
+    assert "INSUFFICIENT" in out and "1 个不同位置" in out
+    v = json.loads((tmp_path / "car_calib.json").read_text(encoding="utf-8"))["validation"]
+    assert v["n_samples"] == 3 and v["n_distinct_photos"] == 1
+    assert v["gate_passed"] is False
+
+
+def test_three_distinct_photos_still_pass(tmp_path, capsys):
+    """对照组：换了三张**不同**的照片就该照常通过（别把去重做成"永远不通过"）。"""
+    photos = _scenes()
+    rc = verify_vision.main([*photos, *_truths_for(photos, tmp_path), "--write-validation",
+                             "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == verify_vision.EXIT_OK
+    assert "distinct_photos=3" in out and "A2 gate: PASS" in out
+    assert "只有 1 个不同位置" not in out
+
+
+def test_help_says_the_gate_counts_distinct_positions():
+    text = verify_vision.build_parser().format_help()
+    assert "≥ 3 个不同位置" in text
+    assert "同一张照片重复" in text
+
+
+# --- Important 4：--bias-body 与 --explain-bias ------------------------------------
+
+
+def test_bias_body_round_trips_with_bias_dx_dy(tmp_path, capsys):
+    """R35 的锁：同一个物理偏置，走车体系入口和走码规范轴入口，解出来的结果必须逐字相同。
+
+    转换错了符号就只会让 ±90 变成 ∓90 —— x/y 各差一个偏置的两倍、yaw 差 180°，
+    而 RMS 判据要到 A2 才抓得到。这里当场就抓。
+    """
+    for dtheta in (-90.0, 90.0, 37.5):
+        for fwd, left in ((0.0, 120.0), (30.0, 0.0), (25.0, -80.0)):
+            dx = fwd * math.cos(math.radians(dtheta)) + left * math.sin(math.radians(dtheta))
+            dy = -fwd * math.sin(math.radians(dtheta)) + left * math.cos(math.radians(dtheta))
+
+            verify_vision.main([PHOTO, "--bias-dx", f"{dx:.9f}", "--bias-dy", f"{dy:.9f}",
+                                "--bias-dtheta", f"{dtheta:.9f}",
+                                "--calib", _calib_path(tmp_path)])
+            via_marker = _results(capsys.readouterr().out)[0]
+
+            verify_vision.main([PHOTO, "--bias-body", f"{fwd:.9f},{left:.9f}",
+                                "--bias-dtheta", f"{dtheta:.9f}",
+                                "--calib", _calib_path(tmp_path)])
+            via_body = _results(capsys.readouterr().out)[0]
+            assert via_body == via_marker, (dtheta, fwd, left, via_body, via_marker)
+
+
+def test_bias_body_left_offset_lands_on_dx_at_plus_90(tmp_path, capsys):
+    """R35 docstring 说的那条换算，在这里由代码直接兑现：dtheta=+90 时车左 b → dx=b。"""
+    dx, dy = verify_vision.body_to_marker(0.0, 120.0, 90.0)
+    assert dx == pytest.approx(120.0, abs=1e-9)
+    assert dy == pytest.approx(0.0, abs=1e-9)
+
+
+def test_bias_body_and_bias_dx_are_mutually_exclusive(tmp_path, capsys):
+    """两个入口给同一个量的两套数：混起来时以谁为准没有答案，必须报错。"""
+    with pytest.raises(SystemExit) as exc:
+        verify_vision.main([PHOTO, "--bias-body", "30,120", "--bias-dx", "5",
+                            "--calib", _calib_path(tmp_path)])
+    assert exc.value.code == verify_vision.EXIT_USAGE
+    assert "不能同时" in capsys.readouterr().err
+
+
+def test_bias_body_and_dtheta_only_is_enough(tmp_path, capsys):
+    """只给 --bias-body（两项一起）就够了，dtheta=+90 时车左 120 → dx=120, dy=−30。"""
+    rc = verify_vision.main([PHOTO, "--bias-body", "30,120", "--bias-dtheta", "90",
+                             "--calib", _calib_path(tmp_path)])
+    capsys.readouterr()
+    assert rc == 0
+    bias = json.loads((tmp_path / "car_calib.json").read_text(encoding="utf-8"))["bias"]
+    assert bias["dx_mm"] == pytest.approx(120.0, abs=1e-9)
+    assert bias["dy_mm"] == pytest.approx(-30.0, abs=1e-9)
+    assert bias["dtheta_deg"] == 90.0
+
+
+def test_explain_bias_prints_the_marker_axes_in_the_image(tmp_path, capsys):
+    """`--explain-bias` 必须给出码的规范 +X/+Y 在**图像**里的指向，并给出对应 dtheta 表。
+
+    没有这张表，help 里的"±90"就只能猜。
+    """
+    rc = verify_vision.main([PHOTO, "--explain-bias", "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "explain-bias" in out
+    assert "码规范 +X 在图像里指向" in out and "码规范 +Y 在图像里指向" in out
+    assert "车头朝图像上" in out and "--bias-dtheta" in out
+    # 参考照片实测（field.py 同一组数）：ID29 规范 +Y → 图像左，+X → 图像上
+    assert "图像左" in out and "图像上" in out
+    assert "码的航向（规范 +Y" in out
+
+
+def test_explain_bias_needs_a_photo(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        verify_vision.main(["--explain-bias", "--calib", _calib_path(tmp_path)])
+    assert exc.value.code == verify_vision.EXIT_USAGE
+
+
+def test_explain_bias_writes_nothing(tmp_path, capsys):
+    verify_vision.main([PHOTO, "--explain-bias", "--calib", _calib_path(tmp_path)])
+    capsys.readouterr()
+    assert not (tmp_path / "car_calib.json").exists()
+
+
+# --- Minor：要说真话 --------------------------------------------------------------
+
+
+def test_refused_validation_does_not_claim_read_only_mode(tmp_path, capsys):
+    """要了 --write-validation 却没写时，不能打"只读模式：没有写任何文件"。"""
+    _exact_pose(tmp_path)
+    broken = _cover_marker(tmp_path, 23, "no23.jpg")
+    rc = verify_vision.main([PHOTO, broken,
+                             "--truth=0,0,0", "--truth=0,0,0",
+                             "--write-validation", "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == verify_vision.EXIT_PHOTO_FAILED
+    assert "只读模式" not in out
+    assert "要写 validation 但没写成" in out
+
+
+def test_exit_usage_constant_matches_argparse():
+    """`EXIT_USAGE` 与 argparse 的 UsageError 同值，否则退出码契约就裂了。"""
+    assert verify_vision.EXIT_USAGE == 2

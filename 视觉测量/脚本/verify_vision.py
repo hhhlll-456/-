@@ -34,9 +34,19 @@
 - **R37** 偏置还没量：标定文件不存在（或 `bias` 三项都是 0.0）时，**表头醒目指出来**，
   并说明这一轮解出来的 x/y 是"码的中心"而不是"车体原点"。`dy = 55.0` 只出现在
   `vision_core/field.py` 的测试夹具里，**不是测量结果**。
-- **R40** 写盘一律 `deep_merge`。`{**a, **b}` 会整段换掉 `bias`：`--bias-dy 77` 存下去
-  之后，原有的 `dx_mm`/`dtheta_deg` 消失，而 `load_calib` 又拿默认值补齐 —— 量好的
-  `dy_mm=55` 读回来是 `0.0`，全程无报错。这是 Task 1 真出现过的缺陷，不是假想。
+- **R35 的可操作性**：`--bias-body FWD,LEFT` 让人按**车体系**（车头方向 / 车左方向）报数，
+  码规范轴向由 `body_to_marker` 换算（`dx = FWD·cos d + LEFT·sin d`、
+  `dy = −FWD·sin d + LEFT·cos d`）；`--explain-bias` 打印码的规范 ±X/±Y 在**图像**里朝哪，
+  外加一张"车头朝 8 个方向 → dtheta 取多少"的对照表，让 ±90 的符号看得见、不用猜。
+- **R40** 写盘一律 `deep_merge`，而且**整轮只写一次**。`{**a, **b}` 会整段换掉 `bias`：
+  `--bias-dy 77` 存下去之后，原有的 `dx_mm`/`dtheta_deg` 消失，而 `load_calib` 又拿默认值
+  补齐 —— 量好的 `dy_mm=55` 读回来是 `0.0`，全程无报错。同一族的另一种走法是**写两次**：
+  人工段先落盘，`validation` 再拿**写盘前**的内存覆盖一次，第一段就静默没了，而两次都打印
+  成功回执。所以人工段与 validation 段合成同一个 `updates`，`run()` 里只有一个写盘点子
+  （`test_the_run_writes_the_file_exactly_once` 钉住）。
+- **结果行不是旧 bias 算出来的**：本轮的写标志先收成 `updates`，求解用
+  `deep_merge(calib, updates)` —— 即写完之后的那套数。屏幕上那个数与最终落盘的一致，
+  操作者不用"先看数、猜对没有、再重跑一遍确认"。
 - **R41** `--coplanar yes|no` / `--battery-sag-v` 保留，但明说它们**不解决什么**：
   `coplanar` 只是把 A3 的人工复核结论记下来，解决 `v1_values.json`（"是"）与 xlsx
   （"否"）的记录冲突；`battery.sag_v` 是 D5（欠压先查硬件）的输入。**`battery.verdict`
@@ -47,7 +57,8 @@
     0  全部照片解出来了；做了 A2 验证的话，判据也满足
     1  至少一张照片没解出来（缺边界码 / 缺车载码 / 文件读不了 / 采集失败）
     2  命令行用法错误（argparse 自己也是 2）
-    3  A2 验证做了，但**没达标**：RMS 超限，或者样本数 < 3
+    3  A2 验证做了，但**没达标**：RMS 超限，或者**不同位置** < 3（同一张照片重复 N 次
+       只算 1 个位置 —— 一张图配三个真值是比"2 个点"更弱的证据）
 
 单张图解不出来**不中断整轮**：打印一行 `photo=... ok=False reason=...`，继续下一张，
 最后再以 1 退出。
@@ -67,6 +78,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 # `python3 视觉测量/脚本/verify_vision.py` 是**从仓库根**跑的，脚本目录不在 sys.path 上。
 # 这里补上自己所在的目录，于是调用方既不需要设 PYTHONPATH，也不需要 cd 到脚本目录；
@@ -79,7 +91,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from vision_core import calib_store  # noqa: E402
-from vision_core.field import body_pose_in_field, build_field_frame  # noqa: E402
+from vision_core.field import body_pose_in_field, build_field_frame, heading_deg  # noqa: E402
 from vision_core.markers import detect_markers  # noqa: E402
 
 # --- 常量 -----------------------------------------------------------------------
@@ -150,6 +162,9 @@ class PhotoResult:
     err_xy_mm: tuple[float, float] | None = None
     err_mm: float | None = None       # 位置残差的模，mm
     err_deg: float | None = None      # 航向残差，deg（已归一到 (−180, 180]）
+    # 仅供 `--explain-bias` 用：那件事要的是码在图像里的朝向，不是 x/y/yaw
+    field_frame: object | None = None
+    vehicle_pose: object | None = None
 
 
 # --- 数值与参数解析 -------------------------------------------------------------
@@ -282,7 +297,120 @@ def solve_image(img: np.ndarray, calib: dict, label: str, origin: str) -> PhotoR
     result.ok = True
     result.x_mm, result.y_mm, result.yaw_deg = x_mm, y_mm, yaw_deg
     result.reproj_rms_px = pose.reproj_rms_px
+    result.field_frame, result.vehicle_pose = ff, pose
     return result
+
+
+# --- A1 偏置：车体系 ⇄ 码规范轴 ---------------------------------------------------
+
+
+def body_to_marker(bx_mm: float, by_mm: float, dtheta_deg: float) -> tuple[float, float]:
+    """车体系偏移 → 码规范轴偏移 `(dx_mm, dy_mm)`。
+
+    **车体系定义（与 `vision_core/field.py` 的 R35 段一致）**：
+    `+X = 车头方向`，`+Y = 车左方向`。车体航向 `yaw_body = yaw_marker − dtheta`
+    就是"车体系相对码规范系绕 z 转了 dtheta"的定义，于是同一个物理向量在两套系里的
+    分量满足
+
+        dx = bx·cos(dtheta) + by·sin(dtheta)
+        dy = −bx·sin(dtheta) + by·cos(dtheta)
+
+    **推导**（怕符号错就照这个查一遍）：车体航向是 `yaw_body = yaw_marker − dtheta`，
+    也就是"车体系相对码规范系绕 z 转了 `dtheta`"。令 `yaw_marker = 0`（把场地转到码的
+    航向为零），则车头指向 `yaw_b = −dtheta`。拿车体系的单位向量 `b = (0,1)`（车头方向）
+    解一次：它在码规范系里的分量必须是 `m = (sin d, cos d)`，即 `m = Rot(−d)·b`
+    （`Rot(θ) = [[cos θ, −sin θ],[sin θ, cos θ]]`），一般式就是下面这两行。
+
+    `dtheta = +90` 时 `dx = by`、`dy = −bx`：车左 b → dx = b，与 `field.py` R35 段的
+    "车体左 b → dx ≈ ±b"对上（`test_bias_body_left_offset_lands_on_dx_at_plus_90` 钉住）。
+
+    为什么要这个函数：`--bias-dx/-dy` 要求操作者先知道**打印码的规范轴朝哪**，
+    而正方形的 +X = 角点0→角点1 在实物上根本看不出来（角点序号是解码器内部的次序），
+    所以"±90"过去只能靠猜。`--bias-body` 让操作者量人话里的前后/左右，轴向由代码定。
+    """
+    d = math.radians(float(dtheta_deg))
+    c, s = math.cos(d), math.sin(d)
+    return (float(bx_mm) * c + float(by_mm) * s,
+            -float(bx_mm) * s + float(by_mm) * c)
+
+
+def parse_bias_body(text: str) -> tuple[float, float]:
+    """`--bias-body FWD,LEFT`：车头方向 mm、车左方向 mm（车体系，R35）。"""
+    parts = [p.strip() for p in str(text).split(",")]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"--bias-body 要两个数 FWD,LEFT（车体系：车头方向 mm、车左方向 mm），实际 {text!r}"
+        )
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--bias-body 的两项都必须是数字，实际 {text!r}") from None
+    if not all(math.isfinite(v) for v in vals):
+        raise argparse.ArgumentTypeError(f"--bias-body 不能有 NaN/Inf，实际 {text!r}")
+    return (vals[0], vals[1])
+
+
+# 俯视图里"某方向"对应的场地系航向。图像 +x 右、+y 下；场地 +X = 右、+Y = 下；
+# 航向 = −atan2(v_y, v_x) —— 于是"图像方向角"（+x 为 0、**逆时针**为正）与航向**同值**。
+_NOSE_DIRECTIONS = (
+    ("上", 90.0), ("右上", 45.0), ("右", 0.0), ("右下", -45.0),
+    ("下", -90.0), ("左下", -135.0), ("左", 180.0), ("左上", 135.0),
+)
+
+
+def _image_dir_name(dx: float, dy: float) -> str:
+    """图像方向 (dx, dy)（+x 右、+y 下）→ "左"/"上" 这类词 + 偏角。
+
+    容差 12°：车是随便停的，码的轴 seldom 正好对着上下左右，指一个绝对方向不如
+    "接近某方向、偏多少度"有用。原始 (dx, dy) 始终一并打印，所以这里怎么近似都不妨碍
+    操作者据此定符号。
+    """
+    angle = math.degrees(math.atan2(-dy, dx)) % 360.0     # 0=右, 90=上
+
+    def gap(nominal: float) -> float:
+        return abs(((angle - nominal + 180.0) % 360.0) - 180.0)
+
+    name, nominal = min(_NOSE_DIRECTIONS, key=lambda nd: gap(nd[1]))
+    off = gap(nominal)
+    return f"图像{name}" if off <= 12.0 else f"接近图像{name}（偏 {off:.0f}°）"
+
+
+def explain_bias(res: PhotoResult) -> str:
+    """`--explain-bias`：把"码的规范轴在图像里朝哪"和"该填 dtheta 多少"打印出来。
+
+    R35 之所以只能写"±90"，是因为操作者没法在实物上看出角点序号，也就定不了轴向和符号。
+    这段输出让他**用眼睛**定符号：俯视图里车头朝哪是看得见的，而
+
+        dtheta = yaw_marker(+Y) − yaw(车头方向)
+
+    里的两项现在都印出来了，再附一张 8 个车头朝向的对照表 —— 查表即可，不用推。
+    """
+    if not res.ok:
+        return ""
+    ff, pose = res.field_frame, res.vehicle_pose
+    rvec = np.asarray(getattr(pose, "rvec", None), dtype=np.float64).reshape(3, 1)
+    R_cam2marker, _ = cv2.Rodrigues(rvec)
+
+    def axis_heading_deg(axis) -> float:
+        v = np.asarray(ff.R_cam2field, dtype=np.float64) @ (R_cam2marker @ axis)
+        return wrap180(-math.degrees(math.atan2(float(v[1]), float(v[0]))))
+
+    axes = (("+X", np.float64([1.0, 0.0, 0.0])), ("+Y", np.float64([0.0, 1.0, 0.0])))
+    lines = [f"explain-bias  {res.label}"]
+    for name, axis in axes:
+        cam = R_cam2marker @ axis
+        lines.append(
+            f"  码规范 {name} 在图像里指向 ({cam[0]:+.3f}, {cam[1]:+.3f})"
+            f"  ≈ {_image_dir_name(float(cam[0]), float(cam[1]))}"
+            f"  场地系航向 {axis_heading_deg(axis):+7.1f}°")
+    yaw_m = heading_deg(R_cam2marker, ff)
+    lines.append(f"  码的航向（规范 +Y，即 heading_deg 的定义）= {yaw_m:+.1f}°")
+    lines.append("  查表定 --bias-dtheta 的符号：找到车头在**这张图**里指向的那一行"
+                 "（俯视图方向：右 = 图像右，上 = 图像上）：")
+    for name, nose_heading in _NOSE_DIRECTIONS:
+        lines.append(f"      车头朝图像{name:<4} → --bias-dtheta "
+                     f"{wrap180(yaw_m - nose_heading):+.1f}°")
+    return "\n".join(lines)
 
 
 # --- 采集（R39）----------------------------------------------------------------
@@ -432,7 +560,8 @@ def bias_status(calib: dict, calib_path: Path) -> tuple[str, bool]:
                 "用之前先确认 A1 做了。", False)
     return ("A1 偏置**尚未测量**：标定文件不存在，bias 三项是内建默认 0.0。"
             "下面解出的 x/y 是**车载码的中心**，不是车体原点 —— 差一个未知的偏置，"
-            "而且不报错。做完 A1（--bias-dx/--bias-dy/--bias-dtheta）再拿这些数做位移。",
+            "而且不报错。做完 A1（推荐 --bias-body FWD,LEFT，配合 --explain-bias 定 "
+            "--bias-dtheta）再拿这些数做位移。",
             False)
 
 
@@ -467,34 +596,42 @@ def compute_residuals(results: list[PhotoResult]) -> None:
 def validation_summary(results: list[PhotoResult]) -> dict:
     """`residual_rms_mm` = sqrt(mean(|err_i|²))，`residual_rms_deg` = sqrt(mean(dyaw_i²))。
 
-    `n_samples` 一定等于照片张数（`--truth` 要么全给要么不给），它要回答的是
-    "这个 RMS 是几个点算出来的"。2 个点的残差 RMS 不是证据，所以它必须看得见、
-    也必须落进标定文件。
+    **判据按"不同位置"算，不是按样本条数算。** 同一张照片配三个 `--truth` 会得到
+    `n_samples=3` 且残差 RMS ≈ 0，而它其实只证明了一个位置 —— 这是比"2 个点"更弱的
+    证据（旧版就让它 PASS 过）。所以 `n_distinct_photos` 一并存下来，判据用它。
     """
     rms_mm = math.sqrt(sum(r.err_mm ** 2 for r in results) / len(results))
     rms_deg = math.sqrt(sum(r.err_deg ** 2 for r in results) / len(results))
     n = len(results)
+    n_distinct = len({r.origin for r in results})
     return {
         "residual_rms_mm": round(rms_mm, 4),
         "residual_rms_deg": round(rms_deg, 4),
         "n_samples": n,
+        "n_distinct_photos": n_distinct,
         "gate_passed": (rms_mm <= A2_GATE_RMS_MM and rms_deg <= A2_GATE_RMS_DEG
-                        and n >= A2_GATE_MIN_SAMPLES),
+                        and n_distinct >= A2_GATE_MIN_SAMPLES),
         "photos": [r.origin for r in results],
     }
 
 
 def print_validation(summary: dict) -> None:
     n = summary["n_samples"]
-    print(f"A2 尺子验证：n_samples={n}  residual_rms={summary['residual_rms_mm']:.2f}mm  "
+    n_distinct = summary["n_distinct_photos"]
+    print(f"A2 尺子验证：n_samples={n}  distinct_photos={n_distinct}  "
+          f"residual_rms={summary['residual_rms_mm']:.2f}mm  "
           f"residual_yaw_rms={summary['residual_rms_deg']:.2f}deg")
-    gate = f"RMS ≤ {A2_GATE_RMS_MM} mm 且 ≤ {A2_GATE_RMS_DEG}° 且 ≥ {A2_GATE_MIN_SAMPLES} 个位置"
+    gate = (f"RMS ≤ {A2_GATE_RMS_MM} mm 且 ≤ {A2_GATE_RMS_DEG}° 且 ≥ "
+            f"{A2_GATE_MIN_SAMPLES} 个不同位置")
+    if n < n_distinct or n_distinct < n:
+        print(f"  !! {n} 个样本里只有 {n_distinct} 张不同的照片：同一张照片重复几次"
+              "也只是**一个**位置，不构成证据。")
     if summary["gate_passed"]:
         print(f"  判据：{gate} → A2 gate: PASS")
-    elif n < A2_GATE_MIN_SAMPLES:
+    elif n_distinct < A2_GATE_MIN_SAMPLES:
         print(f"  判据：{gate} → A2 gate: INSUFFICIENT"
-              f"（{n} < {A2_GATE_MIN_SAMPLES} 个位置，这个 RMS 不能当证据；"
-              "把位置加到 3 个以上重测）")
+              f"（只有 {n_distinct} 个不同位置 < {A2_GATE_MIN_SAMPLES}，"
+              "把车摆到别的位置重拍）")
     else:
         over = []
         if summary["residual_rms_mm"] > A2_GATE_RMS_MM:
@@ -502,20 +639,32 @@ def print_validation(summary: dict) -> None:
         if summary["residual_rms_deg"] > A2_GATE_RMS_DEG:
             over.append(f"航向 RMS {summary['residual_rms_deg']:.2f} > {A2_GATE_RMS_DEG}°")
         print(f"  判据：{gate} → A2 gate: FAIL（{'；'.join(over)}）"
-              "——先查 A1 偏置是不是量错（尤其 90° 装反），再考虑重拍棋盘格铺到画面四角收紧畸变。")
+              "——先查 A1 偏置是不是量错（尤其 dtheta 的 ±90 符号），"
+              "再考虑重拍棋盘格铺到画面四角收紧畸变。")
 
 
 # --- 写标定（R40 / R41）---------------------------------------------------------
 
 
 def build_updates(args) -> dict:
-    """把命令行上的写标志收成 `deep_merge` 的 override 段。写哪些键只在这里出现。"""
+    """把命令行上的写标志收成 `deep_merge` 的 override 段。写哪些键只在这里出现。
+
+    **一次调用只调用 `run()` 里唯一那个写盘点子一次**，所以这里返回的字典必须是
+    "这一整轮所有要写的东西"的完整集合（人工段 + validation），而不是分两次写。
+    """
     updates: dict = {}
 
-    bias = {k: v for k, v in (("dx_mm", args.bias_dx),
-                              ("dy_mm", args.bias_dy),
-                              ("dtheta_deg", args.bias_dtheta))
-            if v is not None}
+    bias = {}
+    if args.bias_body is not None:
+        # 车体系入口：操作者量人话里的前后/左右，轴向由 body_to_marker 定，
+        # R35 的"±90 自己猜"变成"±90 查表"。
+        dtheta = args.bias_dtheta if args.bias_dtheta is not None else 0.0
+        dx, dy = body_to_marker(args.bias_body[0], args.bias_body[1], dtheta)
+        bias["dx_mm"], bias["dy_mm"] = dx, dy
+    for key, value in (("dx_mm", args.bias_dx), ("dy_mm", args.bias_dy),
+                       ("dtheta_deg", args.bias_dtheta)):
+        if value is not None:
+            bias[key] = value
     if bias:
         updates["bias"] = bias
 
@@ -568,7 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
             "例子：\n"
             "  只读看一张：\n"
             "    python3 视觉测量/脚本/verify_vision.py 视觉测量/照片/photo_review_20261013.jpg\n"
-            "  A2 尺子验证（每摆一个位置拍一张，3 个以上）：\n"
+            "  A2 尺子验证（每摆一个位置拍一张，3 个以上**不同**位置）：\n"
             "    python3 视觉测量/脚本/verify_vision.py --capture --capture --capture \\\n"
             "        --truth=0,0,0 --truth=100,50,90 --truth=-80,120,180 --write-validation\n"
             "  注意：负坐标要写成 --truth=-80,120,180（带等号），否则会被当成照片名。\n"
@@ -577,20 +726,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("photos", nargs="*",
                    help="照片路径，相对路径按**仓库根**解析（与 cwd 无关）")
 
-    g = p.add_argument_group("A1 车体偏置（沿打印码 ID29 的规范轴量，R35）")
+    g = p.add_argument_group("A1 车体偏置（R35）")
+    g.add_argument("--bias-body", type=parse_bias_body, metavar="FWD,LEFT", help=(
+        "A1（推荐）：按**车体系**量车载码相对四轮轴心矩形中心的偏移，单位 mm ——\n"
+        "    FWD  = 沿**车头方向**的偏移（正 = 往车头方向）\n"
+        "    LEFT = 沿**车左方向**的偏移（正 = 往左）\n"
+        "这两个数是拿卷尺直接量得出来的，**不用管码怎么贴**；码规范轴向由工具换算：\n"
+        "    dx = FWD·cos(dtheta) + LEFT·sin(dtheta)\n"
+        "    dy = −FWD·sin(dtheta) + LEFT·cos(dtheta)\n"
+        "dtheta 缺省按 0 换算；要带上朝向偏置就同时给 --bias-dtheta（符号用 --explain-bias 查表）。\n"
+        "与 --bias-dx/--bias-dy 互斥（同一个量的两套数，混起来以谁为准没有答案）。"))
     g.add_argument("--bias-dx", type=float, metavar="MM", help=(
-        "A1：ID29 相对四轮轴心矩形中心、沿**码规范 +X**（角点0→角点1）的偏移，mm。\n"
-        "当前贴法下码相对车体转了约 90°，所以车体方向的偏置要这样换算：\n"
-        "    车体「左」 b mm → --bias-dx ±b  --bias-dy 0   --bias-dtheta ±90\n"
-        "    车体「前」 f mm → --bias-dx 0   --bias-dy ±f  --bias-dtheta ±90\n"
-        "正负号由码的印刷/安装朝向定，A1 时实测一次确认。按车体轴填会把「左 55 mm」\n"
-        "当成「前后 55 mm」，之后每条实验的 x/y 都带 55 mm 的系统偏差，而且没有一处报错。\n"
-        "三项可以只给一部分：没给的保留标定文件里的原值（deep_merge，不会被清零）。"))
+        "A1（底层形式）：沿**码规范 +X**（角点0→角点1）的偏移，mm。\n"
+        "角点序号在实物上**看不出来**，所以除非已经用 --bias-body 定过轴向，"
+        "不要直接填这一项。\n"
+        "与 --bias-body 等价时：车体「左」 b → --bias-dx ±b, --bias-dy 0, --bias-dtheta ±90\n"
+        "                  车体「前」 f → --bias-dx 0,  --bias-dy ±f, --bias-dtheta ±90\n"
+        "按车体轴填会把「左 55 mm」当成「前后 55 mm」，之后每条实验的 x/y 都带 55 mm 的\n"
+        "系统偏差，而且没有一处报错。三项可以只给一部分：没给的保留文件里的原值\n"
+        "（deep_merge，不会被清零）。"))
     g.add_argument("--bias-dy", type=float, metavar="MM",
-                   help="A1：沿码规范 +Y（角点3→角点0，码正面的上轴）的偏移，mm。换算见 --bias-dx。")
+                   help="A1（底层形式）：沿码规范 +Y（角点3→角点0，码正面上轴）的偏移，mm。换算见 --bias-dx。")
     g.add_argument("--bias-dtheta", type=float, metavar="DEG", help=(
         "A1：码相对车体的朝向偏置，deg。车体航向 = 码航向 − dtheta。\n"
-        "当前贴法下这个数接近 ±90（码转了约 90°），不是 0；量成 0 会让每个 yaw 都差 90°。"))
+        "当前贴法下这个数接近 ±90（码转了约 90°），不是 0；量成 0 会让每个 yaw 都差 90°。\n"
+        "**符号不用猜**：跑 --explain-bias，它按「码规范 +Y 在图像里朝哪」列出 8 个车头朝向\n"
+        "各自对应的 dtheta，查表即可。"))
+    g.add_argument("--explain-bias", action="store_true", help=(
+        "只读打印：码的规范 +X/+Y 在**图像**里朝哪个方向，以及车头朝 8 个方向时\n"
+        "各自的 --bias-dtheta 取值。用来看图定 dtheta 的符号（配合 --bias-body 使用）。\n"
+        "不解算残差、不写任何文件。"))
 
     g = p.add_argument_group("A3 / A4")
     g.add_argument("--coplanar", choices=("yes", "no"), help=(
@@ -612,14 +777,17 @@ def build_parser() -> argparse.ArgumentParser:
         "负坐标写成 --truth=-80,120,180（带等号）。"))
     g.add_argument("--write-validation", action="store_true", help=(
         "把残差 RMS 与 n_samples 写进标定文件的 validation 段（需每张照片都有 --truth）。\n"
-        f"A2 判据：RMS ≤ {A2_GATE_RMS_MM} mm 且 ≤ {A2_GATE_RMS_DEG}° 且 ≥ {A2_GATE_MIN_SAMPLES} 个位置。\n"
-        "n_samples 会一并存下来 —— 2 个点的残差 RMS 不是证据。"))
+        f"A2 判据：RMS ≤ {A2_GATE_RMS_MM} mm 且 ≤ {A2_GATE_RMS_DEG}° 且 ≥ "
+        f"{A2_GATE_MIN_SAMPLES} 个不同位置（同一张照片重复 N 次只算 1 个位置）。\n"
+        "同一张照片重复 N 次只算 1 个位置（n_samples 会如实记条数，n_distinct_photos 记不同照片数）。\n"
+        "与 --bias-*/--battery-*/--coplanar 同一次调用时**一次写盘**，人工段不会被抹掉。"))
 
     g = p.add_argument_group("采集")
     g.add_argument("--capture", action="count", default=0,
                    help="从相机抓一张并解算，可重复（--capture --capture = 2 张）")
     g.add_argument("--capture-count", type=int, default=0, metavar="N",
-                   help="一次抓 N 张（等价于 --capture 重复 N 次）")
+                   help="一次抓 N 张；与重复的 --capture **叠加**（--capture ×2 加 "
+                        "--capture-count 2 = 4 张）")
     g.add_argument("--device", default=CAMERA_DEVICE,
                    help=f"相机设备（默认 {CAMERA_DEVICE}）")
     g.add_argument("--capture-dir", default=DEFAULT_CAPTURE_DIR,
@@ -634,25 +802,39 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _usage_error(parser: argparse.ArgumentParser, message: str) -> "NoReturn":
+    """用法错误：用法摘要 + 一行原因，退出码 `EXIT_USAGE`（= argparse 的 2）。"""
+    parser.print_usage(sys.stderr)
+    print(f"{parser.prog}: error: {message}", file=sys.stderr)
+    raise SystemExit(EXIT_USAGE)
+
+
 def validate_args(parser: argparse.ArgumentParser, args) -> None:
     """用法层面的自检。只碰人一定会踩的几条，别的交给 argparse。"""
-    args.capture = args.capture_count if args.capture_count else args.capture
+    args.capture = args.capture + max(0, args.capture_count)   # 叠加，不是覆盖
     n_shots = len(args.photos) + args.capture
-    if args.capture < 0:
-        parser.error("--capture-count 不能为负")
+    if args.capture_count < 0:
+        _usage_error(parser, "--capture-count 不能为负")
     if args.capture and args.photos:
-        parser.error("--capture 与照片路径不能混用：采集顺序就是 --truth 的对应顺序，"
-                     "混进来就说不清第几个 --truth 配哪一张了")
+        _usage_error(parser, "--capture 与照片路径不能混用：采集顺序就是 --truth 的对应顺序，"
+                              "混进来就说不清第几个 --truth 配哪一张了")
+    if args.explain_bias and n_shots == 0:
+        _usage_error(parser, "--explain-bias 需要一张照片（它要说码的轴在图像里朝哪）")
     if n_shots == 0:
-        parser.error("至少给一张照片路径，或者用 --capture 抓图")
+        _usage_error(parser, "至少给一张照片路径，或者用 --capture 抓图")
     if args.write_validation and not args.truth:
-        parser.error("--write-validation 需要每张照片都有 --truth（残差要拿真值比）")
+        _usage_error(parser, "--write-validation 需要每张照片都有 --truth（残差要拿真值比）")
     if args.truth and len(args.truth) != n_shots:
-        parser.error(f"--truth 给了 {len(args.truth)} 个，照片/采集共 {n_shots} 张："
-                     "必须按位置一一对应，要么全给要么全不给")
-    if any(v is not None for v in (args.bias_dx, args.bias_dy, args.bias_dtheta)):
-        print("提示：bias 沿**打印码**规范轴量，车体「左 b」→ --bias-dx ±b --bias-dy 0 "
-              "--bias-dtheta ±90（R35）。")
+        _usage_error(parser, f"--truth 给了 {len(args.truth)} 个，照片/采集共 {n_shots} 张："
+                              "必须按位置一一对应，要么全给要么全不给")
+    if args.bias_body is not None and (args.bias_dx is not None or args.bias_dy is not None):
+        _usage_error(parser, "--bias-body（车体系）与 --bias-dx/--bias-dy（码规范轴）"
+                              "不能同时给：同一个量的两套数，混起来以谁为准没有答案。"
+                              "要按码规范轴填就只给 --bias-dx/-dy；要按车体系量就只给 --bias-body。")
+    if (args.bias_body is not None or args.bias_dx is not None
+            or args.bias_dy is not None or args.bias_dtheta is not None):
+        print("提示：偏置可以按车体系量（--bias-body FWD,LEFT，正数 = 往车头/往左），"
+              "轴向由代码换算；dtheta 的 ±符号用 --explain-bias 查表定（R35）。")
 
 
 def run(args) -> int:
@@ -663,13 +845,31 @@ def run(args) -> int:
         print(f"标定文件读不出来，先修它：{exc}")
         return EXIT_PHOTO_FAILED
 
+    # 本轮要写的东西先收齐：**整轮只写一次**。分开写两次，第二次会拿**写盘前**的
+    # calib 覆盖掉第一次（save_calib 是覆盖写），两次都打印成功回执而第一次静默没了
+    # —— 与 R40 同一族的静默丢数据。
+    updates = build_updates(args)
+    # 求解用"写完之后"的标定：结果行必须是这次真正落盘的那套数。旧代码用写盘前的
+    # calib 求解，于是屏幕上差着新 bias 的量（实测差 180 mm / 90°），操作者正是照着
+    # 屏幕上那个数去判断"填对没有"。
+    effective = calib_store.deep_merge(calib, updates)
+
     results: list[PhotoResult] = []
     print_header(calib, calib_path)
+    if "bias" in updates:
+        b = updates["bias"]
+        print(f"  本次求解使用**即将写入**的 bias："
+              f"dx_mm={signed(b.get('dx_mm', effective['bias']['dx_mm']))} "
+              f"dy_mm={signed(b.get('dy_mm', effective['bias']['dy_mm']))} "
+              f"dtheta_deg={signed(b.get('dtheta_deg', effective['bias']['dtheta_deg']))}"
+              "（下面的结果行已经是写入后的值，不是旧值）")
     for res, frame in iter_shots(args):
         if frame is not None:
-            res = solve_image(frame, calib, res.label, res.origin)
+            res = solve_image(frame, effective, res.label, res.origin)
         results.append(res)
         print(format_line(res))
+        if args.explain_bias and res.ok:
+            print(explain_bias(res))
 
     failures = [r for r in results if not r.ok]
     if failures:
@@ -689,25 +889,25 @@ def run(args) -> int:
                 print(format_truth_line(res))
             summary = validation_summary(results)
             print_validation(summary)
+            if args.write_validation:
+                updates["validation"] = summary          # 与人工段同一次写
 
-    # --- 写盘（R40：整份文件只有这一个写盘点子）-----------------------------------
-    updates = build_updates(args)
+    # --- 写盘（R40：整轮唯一一次写盘）-----------------------------------------------
     if updates:
         apply_updates(calib, updates, calib_path)
-        print(f"已写入 {repo_rel(calib_path)}（deep_merge）：{describe_updates(updates)}")
+        print(f"已写入 {repo_rel(calib_path)}（deep_merge，一次写盘）：{describe_updates(updates)}")
         if "bias" in updates:
-            print("  bias 只在打印码规范轴上有意义（R35）；写完再跑一次只读，确认表头那行状态变了。")
+            print("  bias 只在打印码规范轴上有意义（R35）；只读重跑一遍即可确认表头那行状态已变。")
         if "coplanar" in updates:
             print("  A3 只记录人工结论，不做复核；下游不会拿它改任何标定量。")
         if "battery" in updates and "sag_v" in updates["battery"] \
                 and "verdict" not in updates["battery"]:
             print("  A4 的 battery.verdict 仍然为空：D5（欠压先查硬件）要人给结论，用 --battery-verdict 补。")
-    if args.write_validation and summary is not None:
-        apply_updates(calib, {"validation": summary}, calib_path)
-        print(f"已写入 {repo_rel(calib_path)}（deep_merge）：{describe_updates({'validation': summary})}")
-    if not updates and not (args.write_validation and summary is not None):
+    elif args.write_validation:
+        print("要写 validation 但没写成：没有写任何文件。原因见上面那一行。")
+    else:
         print("只读模式：没有写任何文件（要写请给 "
-              "--bias-* / --battery-* / --coplanar / --write-validation 之一）。")
+              "--bias-* / --bias-body / --battery-* / --coplanar / --write-validation 之一）。")
 
     if failures:
         return EXIT_PHOTO_FAILED
