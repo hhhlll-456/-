@@ -45,11 +45,15 @@
     q / ESC  退出        s  存快照（原帧，可直接喂给 verify_vision.py）
     g        网格开关（每 240 px，与 live_aruco.py 一致）
 
+**按 `s` 存的是未叠加的原帧**：叠加会把码的黑边糊掉（实测画完之后五个码一个都检不出来），
+所以 `draw_overlay` 只作用在 `frame.copy()` 上，`frame` 在任何绘制路径下都保持干净。
+存下来的图能直接 `verify_vision.py <路径>`，解出来的位姿与存之前那一帧逐项相同。
+
 ## 退出码
 
     0  每一帧都解出来了（READY）
     1  至少一帧没解出来 —— 相机正常，**取景/掉码**的问题（今天就是 1）
-    2  命令行用法错误（与 argparse 同值）
+    2  命令行用法错误（与 argparse 同值）；**或**没有显示环境却没给 --once/--frames
     4  相机打不开 —— 与 1 **故意分开**：1 是"拍到了但不能用"，4 是"根本没拍到"，
        操作者今天在这两端之间来回猜（R48），分开之后一眼能分。
 
@@ -249,21 +253,6 @@ def put_text(img: np.ndarray, text: str, org, color, px: int = TEXT_PX) -> None:
     )
     arr = np.asarray(patch)
     _blend(img, arr[:, :, :3], arr[:, :, 3].astype(np.float32) / 255.0, x, y)
-
-
-def fit_text(text: str, px: int, max_px: int) -> str:
-    """把文本裁到 `max_px` 像素宽（裁掉的用 `…` 表示）。横幅第二行的 `detail` 会很长。"""
-    if max_px <= 0 or text_width(text, px) <= max_px:
-        return text
-    ell = "…"
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if text_width(text[:mid] + ell, px) <= max_px:
-            lo = mid
-        else:
-            hi = mid - 1
-    return text[:lo] + ell if lo else ""
 
 
 def put_rich_text(img: np.ndarray, segments, org, px: int = TEXT_PX, gap: int = 18) -> int:
@@ -520,11 +509,13 @@ def draw_grid(img: np.ndarray, step: int = GRID_STEP_PX) -> None:
         put_text(img, str(y), (4, y + 2), COLOR_GRID, SMALL_PX)
 
 
-def draw_markers(img: np.ndarray, poses, shape) -> list:
-    """画四边形 + `ID=20 (400,70)`；余量不足的码红框加粗。返回告警文字列表。
+def draw_markers(img: np.ndarray, poses, shape) -> None:
+    """画四边形 + `ID=20 (400,70)`；余量不足的码红框加粗。
 
     框用 `cv2.aruco.drawDetectedMarkers` 画（显式给绿色，不让它每帧随机配色 ——
     随机色会在实时窗口里闪，操作者会以为码在变），贴边的码再叠一层红色粗多边形。
+    **这一步会把码的黑边糊掉**：画完的图 `detect_markers` 检不出任何码，
+    所以它只能作用在副本上（见 `draw_overlay`）。
     """
     healthy, healthy_ids = [], []
     risky = []
@@ -544,7 +535,6 @@ def draw_markers(img: np.ndarray, poses, shape) -> list:
     for marker_id in sorted(poses):
         cx, cy = marker_center_px(poses[marker_id])
         put_text(img, f"ID={marker_id} ({cx},{cy})", (cx + 8, cy - 10), COLOR_WHITE, LABEL_PX)
-    return edge_warnings(poses, shape)
 
 
 def draw_field_axes(img: np.ndarray, ff: FieldFrame, K, dist=None) -> None:
@@ -635,22 +625,29 @@ def draw_fps(img: np.ndarray, fps: float) -> None:
 
 def draw_overlay(img: np.ndarray, result, poses, calib, *,
                  bias_measured: bool = False, show_grid: bool = False,
-                 fps: float | None = None) -> list:
-    """把一帧画成"操作者要看的现场"，就地改 `img`，返回边缘告警列表。
+                 fps: float | None = None) -> np.ndarray:
+    """把一帧画成"操作者要看的现场"，**就地**改 `img` 并把它返回。
+
+    返回画好的画布而不是边缘告警列表：告警是 `edge_warnings(poses, shape)` 这个纯函数
+    的事，调用方自己算一遍更清楚，也让调用方能拿到"显示用的那张图"。
 
     分工：`result`（`solve_image` 的判定）决定横幅与车体原点，`poses`（`detect_markers`
     的检出）决定四边形。场地系/车体位姿只在 `result.ok` 时才有 —— `boundary_moved`
     的那一帧**根本没有场地系**，画出来的坐标轴是编的，所以不画。
+
+    **就地改写是故意的，调用方必须传副本**（`run_window` 传 `frame.copy()`）：叠加会把码的
+    黑边糊掉，存下来的图 `detect_markers` 一个码都检不出来。
     """
     shape = img.shape[:2]
     if show_grid:
         draw_grid(img)
-    warnings = draw_markers(img, poses, shape)
+    draw_markers(img, poses, shape)
     if result.ok and result.field_frame is not None:
         draw_field_axes(img, result.field_frame, calib["K"], calib.get("dist"))
         pose = result.vehicle_pose or poses.get(calib_store.VEHICLE_ID)
         if pose is not None:
             draw_body_origin(img, result, pose, calib)
+    warnings = edge_warnings(poses, shape)
     rows = [[segment] for segment in banner_lines(result, poses, bias_measured)]
     strip = warning_strip(bias_measured, warnings)
     if strip:
@@ -658,7 +655,7 @@ def draw_overlay(img: np.ndarray, result, poses, calib, *,
     draw_banner(img, rows, alert=bool(warnings))
     if fps is not None:
         draw_fps(img, fps)
-    return warnings
+    return img
 
 
 # --- 相机 -----------------------------------------------------------------------
@@ -709,7 +706,11 @@ def save_snapshot(frame: np.ndarray, out_dir) -> Path:
     """存**未叠加**的原帧到 `out_dir`，同名不覆盖，返回绝对路径。
 
     存原帧而不是叠加后的画面：快照的用途是"拿去做证据"，
-    `python3 视觉测量/脚本/verify_vision.py <打印出来的路径>` 要能直接解它。
+    `python3 视觉测量/脚本/verify_vision.py <打印出来的路径>` 要能直接解它 ——
+    而叠加过的图实测一个码都检不出来（框与标签糊掉了黑边）。
+
+    **调用方必须传原始像素**：本函数不判断"这张图是不是被画过"，那是 `run_window` 的
+    接线责任（它给的是 `frame`，叠加走的是 `frame.copy()`）。
     """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -773,19 +774,52 @@ def run_headless(cap, calib, n_frames: int, label: str, origin: str) -> int:
     return EXIT_OK if solved == max(1, n_frames) else EXIT_PHOTO_FAILED
 
 
-def run_window(cap, calib, args, bias_measured: bool) -> int:
-    """实时窗口主循环。返回 0（正常退出）—— 运行中解不出来不是脚本的错，是取景的账。"""
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, int(CAPTURE_WIDTH * args.scale), int(CAPTURE_HEIGHT * args.scale))
-    cv2.moveWindow(WINDOW_NAME, 0, 0)
-    print(f"窗口已启动（DISPLAY={os.environ.get('DISPLAY', '')}）；"
-          "q/ESC 退出，s 存快照，g 网格开关", flush=True)
+def _display_problem(detail: str = "") -> str:
+    """没有显示环境时打给操作者看的一段话（一行原因 + 一行该怎么办）。
 
-    show_grid = False
-    log = TerminalLog()
-    fps = 0.0
-    last = time.perf_counter()
+    这是**远端 shell 里最容易犯的用法错**：忘了加 `--once`，于是在没有 X 转发的机器上
+    直接开窗口。本机实测（OpenCV 4.6.0 + Qt）无 DISPLAY 时 `namedWindow`/`imshow`
+    **不抛异常、只是什么都不显示**，`waitKey` 永远返回 -1 —— 脚本于是无声无息地空转，
+    比抛 traceback 更难查。所以先看环境变量，OpenCV 那边再兜一层 `cv2.error`。
+    """
+    tail = f"原始错误：{detail}" if detail else ""
+    return (
+        "开不了图形窗口：当前没有显示环境（DISPLAY / WAYLAND_DISPLAY 都是空的）。\n"
+        "  无显示的机器上请改用无窗口模式：加 --once（只看一帧）或 --frames N（解 N 帧）。\n"
+        f"  {tail}"
+    )
+
+
+def _has_display() -> bool:
+    """当前环境能不能开窗口。
+
+    **只看 Linux**：Windows/macOS 的窗口系统不需要 DISPLAY 环境变量，
+    在那儿拿 DISPLAY 判断会误报"没有显示"。Wayland 另有一套 `WAYLAND_DISPLAY`。
+    """
+    if not sys.platform.startswith("linux"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def run_window(cap, calib, args, bias_measured: bool) -> int:
+    """实时窗口主循环。返回 0（正常退出）—— 运行中解不出来不是脚本的错，是取景的账。
+
+    开不了窗口时**不抛 traceback**：打一段说清"没有显示环境、请加 `--once` / `--frames N`"
+    的话，返回 `EXIT_USAGE`。窗口相关的 `cv2.*` 调用全在 `try` 里 ——
+    少了这一层，`namedWindow`/`imshow` 在无显示/无 GUI 编译的 OpenCV 上抛出的
+    `cv2.error` 会直接穿出 `main()`，在远端 shell 里就是一屏红字。
+    """
     try:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, int(CAPTURE_WIDTH * args.scale), int(CAPTURE_HEIGHT * args.scale))
+        cv2.moveWindow(WINDOW_NAME, 0, 0)
+        print(f"窗口已启动（DISPLAY={os.environ.get('DISPLAY', '')}）；"
+              "q/ESC 退出，s 存快照，g 网格开关", flush=True)
+
+        show_grid = False
+        log = TerminalLog()
+        fps = 0.0
+        last = time.perf_counter()
         while True:
             frame = read_frame(cap)
             if frame is None:
@@ -798,12 +832,25 @@ def run_window(cap, calib, args, bias_measured: bool) -> int:
             h, w = frame.shape[:2]
             poses = detect_markers(frame, calib)
             result = solve_image(frame, calib, f"live {w}x{h}", args.device)
-            draw_overlay(frame, result, poses, calib,
-                         bias_measured=bias_measured, show_grid=show_grid, fps=fps)
+            # **叠加只作用在副本上**，`frame` 始终是未叠加的原帧。
+            #
+            # 之前这里是 `draw_overlay(frame, ...)`（就地改写），于是 `s` 存下来的是
+            # 画过框、压过标签的图：`drawDetectedMarkers` 的绿框 + `ID=xx (x,y)` 标签
+            # + 红色粗多边形把码的黑边糊掉，**实测五个码一个都检不出来**，
+            # `verify_vision.py` 对那张快照报 `boundary_moved 缺[20,21,22,23]`。
+            # 而快照的唯一用途就是留 A1/A2 的证据 —— 这正是本任务要消灭的那类分叉
+            # （"预览说能存、正式工具说码没了"）。
+            #
+            # 用副本而不是"叠加前先 copy 一份留着"，是因为副本让 `frame` 在**任何**
+            # 绘制路径下都保持干净：以后再加一种叠加也不会漏掉快照。
+            # 代价是一帧 6 MB 的 memcpy（约 1 ms，占 45 ms 一帧的 2%），换一条结构性保证。
+            display_frame = draw_overlay(frame.copy(), result, poses, calib,
+                                         bias_measured=bias_measured, show_grid=show_grid,
+                                         fps=fps)
             log.report(result, poses)
 
-            display = cv2.resize(frame, None, fx=args.scale, fy=args.scale) \
-                if args.scale != 1.0 else frame
+            display = cv2.resize(display_frame, None, fx=args.scale, fy=args.scale) \
+                if args.scale != 1.0 else display_frame
             cv2.imshow(WINDOW_NAME, display)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
@@ -811,12 +858,19 @@ def run_window(cap, calib, args, bias_measured: bool) -> int:
             if key == ord("g"):
                 show_grid = not show_grid
             if key == ord("s"):
+                # 存 `frame`（原帧），不是 `display_frame`（叠加后的）。
                 try:
                     print(f"快照已存：{save_snapshot(frame, args.snapshot_dir)}", flush=True)
                 except OSError as exc:
                     print(f"快照存不了：{exc}", flush=True)
+    except cv2.error as exc:
+        print(_display_problem(str(exc).splitlines()[0] if str(exc) else ""), flush=True)
+        return EXIT_USAGE
     finally:
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:       # 窗口根本没开起来时这句也会抛；清理不该盖掉真正的错
+            pass
     return EXIT_OK
 
 
@@ -836,13 +890,14 @@ def build_parser() -> argparse.ArgumentParser:
             "    python3 视觉测量/脚本/live_field.py --once\n"
             "  压测/连续采样 N 帧：\n"
             "    python3 视觉测量/脚本/live_field.py --frames 30\n"
-            "  窗口里按 s 存下的快照是**未叠加的原帧**，可以直接：\n"
+            "  窗口里按 s 存下的快照是**未叠加的原帧**（画过框的图一个码都检不出来），可以直接：\n"
             "    python3 视觉测量/脚本/verify_vision.py /tmp/opencode/live_field/live_20261014_141500.jpg\n"
             "\n"
             "按键（只有开窗口时有效）：q / ESC 退出 | s 存快照 | g 网格开关（每 240 px）\n"
             "\n"
             "退出码：0 = 每帧都 READY；1 = 相机正常但有帧没解出来（取景/掉码）；\n"
-            "        2 = 用法错误；4 = 相机打不开（被别的程序占着）。\n"
+            "        2 = 用法错误，或没有显示环境（请加 --once / --frames N）；\n"
+            "        4 = 相机打不开（被别的程序占着）。\n"
         ),
     )
     p.add_argument("--device", default=CAMERA_DEVICE,
@@ -901,6 +956,12 @@ def run(args) -> int:
     n_frames = args.frames if args.frames > 0 else 1
     print(f"模式：{'无窗口' if headless else '实时窗口'}"
           f"  设备={args.device}  标定={args.calib}", flush=True)
+
+    # 显示环境**在开相机之前**查：没有显示就别去占 /dev/video0（那是共享设备，
+    # 操作者正开着 live_aruco.py 时被抢走几秒是没必要的），提示里直接告诉他加哪个标志。
+    if not headless and not _has_display():
+        print(_display_problem(), flush=True)
+        return EXIT_USAGE
 
     try:
         cap = open_camera(args.device)

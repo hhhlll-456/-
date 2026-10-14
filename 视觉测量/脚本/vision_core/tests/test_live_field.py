@@ -107,13 +107,27 @@ class FakeCap:
         self.released += 1
 
 
-def _run_headless(monkeypatch, frames, argv_extra=(), drop_after=None):
-    """把 `open_camera` 换成假相机，跑一次 `--once` / `--frames` 路径，返回 `(rc, cap)`。"""
+def _run_headless(monkeypatch, frames, argv_extra=(), drop_after=None,
+                  raiser=None, raiser_name=""):
+    """把 `open_camera` 换成假相机，跑一次 CLI 路径，返回 `(rc, cap)`。
+
+    `argv_extra` 为空时走的是**窗口**主循环（`--once`/`--frames` 才走无窗口那条），
+    所以 `raiser`/`raiser_name` 用来在某个 `cv2` 窗口调用上注入 `cv2.error`。
+    """
     cap = FakeCap(frames, drop_after=drop_after)
     monkeypatch.setattr(live_field, "open_camera", lambda *a, **k: cap)
     monkeypatch.setattr(live_field, "DEFAULT_SETTLE_FRAMES", 0)
     # 冷却在下面单独有用例覆盖；这里关掉，好把"变化才打"的规则单独验清楚。
     monkeypatch.setattr(live_field, "TERMINAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(live_field, "_has_display", lambda: True)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "resizeWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "moveWindow", lambda *a, **k: None)
+    if raiser is not None:
+        def boom(*_a, **_k):
+            raise cv2.error(raiser)
+
+        monkeypatch.setattr(cv2, raiser_name, boom)
     return live_field.main(list(argv_extra)), cap
 
 
@@ -403,11 +417,15 @@ def test_camera_constants_come_from_verify_vision():
     assert live_field.DEFAULT_SETTLE_FRAMES == verify_vision.DEFAULT_SETTLE_FRAMES
 
 
-def test_the_overlay_uses_exactly_the_poses_the_verdict_used():
+def test_detecting_markers_twice_on_one_frame_gives_the_same_poses():
     """同一帧上跑两遍 `detect_markers`（叠加层一遍、`solve_image` 里一遍）必须是同一份结果。
 
     这是"每帧跑两次检测"这个取舍的前提：它换来的性质必须成立，否则两次解算之间车动了，
     叠加层画的就是**上一刻**的位姿，而画面上没有任何东西会提示这一点。
+
+    （这条只证"检测是确定性的"。`run_window` 把这一份位姿**接到**叠加层上，是另一条接线，
+    由 `test_run_window_snapshots_a_frame_that_solve_image_can_still_read` 钉住 ——
+    那条才是能藏住"快照存成叠加帧"这种 bug 的。）
     """
     img = _fixture_image()
     calib = _default_calib()
@@ -667,9 +685,11 @@ def test_draw_overlay_paints_the_body_cross_at_the_solved_point_and_a_banner():
     assert result.ok
 
     canvas = np.zeros_like(img)          # 黑画布：画出来的每个像素都是本脚本画的
-    warnings = live_field.draw_overlay(canvas, result, poses, calib,
-                                       bias_measured=False, fps=20.0)
-    assert warnings == ["ID20 距上边缘 6px ⚠被切", "ID21 距右边缘 16px ⚠被切"]
+    out = live_field.draw_overlay(canvas, result, poses, calib,
+                                  bias_measured=False, fps=20.0)
+    assert out is canvas, "draw_overlay 必须把画好的画布原样返回"
+    assert live_field.edge_warnings(poses, canvas.shape[:2]) \
+        == ["ID20 距上边缘 6px ⚠被切", "ID21 距右边缘 16px ⚠被切"]
 
     # 车体原点十字是红的（BGR 0,0,255），且必须落在解出来的那个点上。
     bx, by = live_field.project_point(
@@ -694,9 +714,29 @@ def test_draw_overlay_does_not_invent_a_field_frame_on_a_failed_frame():
     assert not result.ok and result.field_frame is None
 
     canvas = np.zeros_like(bad)
-    warnings = live_field.draw_overlay(canvas, result, poses, calib, bias_measured=False)
+    live_field.draw_overlay(canvas, result, poses, calib, bias_measured=False)
     assert not _axis_x_pixels(canvas).any(), "没有场地系却画出了坐标轴"
-    assert warnings == ["ID21 距右边缘 16px ⚠被切"]
+    assert live_field.edge_warnings(poses, canvas.shape[:2]) == ["ID21 距右边缘 16px ⚠被切"]
+
+
+def test_an_annotated_frame_is_unreadable_which_is_why_the_overlay_gets_a_copy():
+    """反例钉子：叠加会把码的黑边糊掉，画完的图**一个码都检不出来**。
+
+    没有这条，下游任何"顺手把叠加后的 `frame` 存下来 / 传下去"的改动都会静悄悄地
+    毁掉证据，而画面上看起来一切正常 —— 快照还是"存下来了"，只是里面没有码。
+    """
+    img = _fixture_image()
+    calib = _default_calib()
+    assert sorted(detect_markers(img, calib)) == [20, 21, 22, 23, 29]
+
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    annotated = live_field.draw_overlay(img.copy(), result, poses, calib, bias_measured=False)
+
+    assert sorted(detect_markers(annotated, calib)) == []
+    assert not live_field.solve_image(annotated, calib, "annotated", "annotated.jpg").ok
+    # 原图当然不受影响
+    assert sorted(detect_markers(img, calib)) == [20, 21, 22, 23, 29]
 
 
 def test_grid_toggle_changes_the_pixels():
@@ -748,7 +788,11 @@ def test_snapshot_never_overwrites_and_stays_usable_by_verify_vision(tmp_path):
 
 
 def test_a_subprocess_run_of_once_needs_no_display(tmp_path):
-    """无 DISPLAY、无窗口的环境里 `--once` 必须跑得出结果（CI 与本机验收都靠这条）。"""
+    """无 DISPLAY、无窗口的环境里 `--once` 必须跑得出结果（CI 与本机验收都靠这条）。
+
+    `print_header` 在**开相机之前**就打，所以断言"标定文件"那行就能证明脚本确实跑到了
+    该跑的地方 —— 之前这条用 `returncode != 4` 一带而过，CI 没相机时等于什么都没验。
+    """
     env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
     proc = subprocess.run(
         [sys.executable, str(calib_store.resolve_path(SCRIPT)), "--once",
@@ -757,9 +801,157 @@ def test_a_subprocess_run_of_once_needs_no_display(tmp_path):
     )
     assert "Traceback" not in proc.stderr
     assert "模式：无窗口" in proc.stdout
+    assert "标定文件" in proc.stdout, "连表头都没打出来：脚本没跑到解算那一步"
     assert proc.returncode in (0, 1, 4), proc.stdout + proc.stderr   # 4 = 相机被占着
     if proc.returncode != 4:
         assert "READY" in proc.stdout or "boundary_moved" in proc.stdout
+
+
+# --- 窗口模式的接线（`run_window` 的真实顺序）-------------------------------------
+
+
+def _drive_window(monkeypatch, frames, keys, argv_extra=(), raiser=None, raiser_name=""):
+    """用假 GUI + 假相机跑一次真正的 `run_window`，返回 `(rc, 显示过的图, cap)`。
+
+    这条路径**不 stub 掉** `detect_markers` / `solve_image` / `draw_overlay` / `save_snapshot`
+    —— 要验的恰恰是它们**串在一起**的顺序（复核的 Critical 1 就藏在这段接线里：
+    叠加就地改写了 `frame`，于是 `s` 存下来的是画过框的图）。
+    `keys` 是逐帧喂给 `waitKey` 的按键序列；喂完 `q` 收尾。
+    """
+    cap = FakeCap(frames)
+    shown: list = []
+
+    monkeypatch.setattr(live_field, "open_camera", lambda *a, **k: cap)
+    monkeypatch.setattr(live_field, "DEFAULT_SETTLE_FRAMES", 0)
+    monkeypatch.setattr(live_field, "TERMINAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(live_field, "_has_display", lambda: True)   # 显示检查交给别的用例
+    monkeypatch.setattr(cv2, "namedWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "resizeWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "moveWindow", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "imshow", lambda _win, img: shown.append(img.copy()))
+
+    pending = list(keys)
+
+    def fake_wait_key(_delay):
+        return pending.pop(0) if pending else ord("q")
+
+    monkeypatch.setattr(cv2, "waitKey", fake_wait_key)
+    if raiser is not None:
+        def boom(*_a, **_k):
+            raise cv2.error(raiser)
+
+        monkeypatch.setattr(cv2, raiser_name, boom)
+    return live_field.main(list(argv_extra)), shown, cap
+
+
+def test_run_window_snapshots_a_frame_that_solve_image_can_still_read(monkeypatch, tmp_path, capsys):
+    """按 `s` 存下来的必须是**能解**的原帧 —— 与叠加之前那一帧逐项一致。
+
+    复核的 Critical 1：叠加（`drawDetectedMarkers` 的框 + `ID=xx` 标签 + 红色粗多边形）
+    把码的黑边糊掉，`detect_markers` 在画完的图上**五个码一个都检不出来**；
+    旧接线 `draw_overlay(frame, …)` 就地改写 `frame`，`s` 存的正是这张图。
+    之前那条用例直接拿干净数组调 `save_snapshot`，验的是函数没坏，不是"存出来的东西能用"。
+    """
+    img = _fixture_image()
+    calib = _default_calib()
+    before = verify_vision.solve_image(img, calib, "live", live_field.CAMERA_DEVICE)
+    assert before.ok
+
+    rc, shown, cap = _drive_window(
+        monkeypatch, [img], keys=[ord("s"), ord("q")],
+        argv_extra=["--snapshot-dir", str(tmp_path / "snaps")])
+    out = capsys.readouterr().out
+
+    assert rc == live_field.EXIT_OK
+    saved = sorted((tmp_path / "snaps").glob("*.jpg"))
+    assert len(saved) == 1 and str(saved[0].resolve()) in out, out
+    assert cap.released == 1
+
+    after = verify_vision.solve_image(cv2.imread(str(saved[0])), calib, "snap", str(saved[0]))
+    assert after.ok, f"存下来的快照解不出来：{after.reason} {after.detail}"
+    assert after.x_mm == pytest.approx(before.x_mm, abs=0.5)
+    assert after.y_mm == pytest.approx(before.y_mm, abs=0.5)
+    assert after.yaw_deg == pytest.approx(before.yaw_deg, abs=0.5)
+    assert after.reproj_rms_px == pytest.approx(before.reproj_rms_px, abs=0.05)
+
+    # 叠加只落在**显示副本**上：imshow 拿到的是画过的图，原帧原封不动。
+    assert shown and not np.array_equal(shown[0], img)
+    assert sorted(detect_markers(shown[0], calib)) == []        # 叠加确实毁掉了可读性
+    assert sorted(detect_markers(img, calib)) == [20, 21, 22, 23, 29]
+
+
+def test_run_window_never_mutates_the_frame_it_solves_and_saves(monkeypatch, tmp_path, capsys):
+    """`s` 连按两次 + 网格开关跑一轮：原帧必须始终干净，快照逐张可解。"""
+    img = _fixture_image()
+    calib = _default_calib()
+    _rc, shown, _cap = _drive_window(
+        monkeypatch, [img], keys=[ord("s"), ord("g"), ord("s"), ord("q")],
+        argv_extra=["--snapshot-dir", str(tmp_path / "snaps")])
+    capsys.readouterr()
+
+    saved = sorted((tmp_path / "snaps").glob("*.jpg"))
+    assert len(saved) == 2
+    for path in saved:
+        assert verify_vision.solve_image(cv2.imread(str(path)), calib, "snap", str(path)).ok
+    assert len(shown) == 4
+
+
+def test_window_mode_without_a_display_says_what_to_add_instead_of_a_traceback(monkeypatch, capsys):
+    """没有显示环境 → 一行提示 + 非零退出码；而且**不该先去占相机**（那是共享设备）。"""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    def boom(*_a, **_k):
+        raise AssertionError("没有显示环境就不该去开相机")
+
+    monkeypatch.setattr(live_field, "open_camera", boom)
+    rc = live_field.main([])
+    captured = capsys.readouterr()
+
+    assert rc != 0 and rc == live_field.EXIT_USAGE
+    assert "--once" in captured.out and "--frames" in captured.out
+    assert "没有显示环境" in captured.out
+    assert "Traceback" not in captured.out and "Traceback" not in captured.err
+
+
+def test_headless_modes_do_not_need_a_display(monkeypatch, capsys):
+    """对照组：环境变量检查不许误伤无窗口模式（Windows/macOS 也没有 DISPLAY）。"""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    rc, _cap = _run_headless(monkeypatch, [_fixture_image()], ["--once"])
+    assert rc == live_field.EXIT_OK
+    assert "READY" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("raiser_name", ["namedWindow", "imshow"])
+def test_a_window_call_that_raises_is_one_line_not_a_traceback(monkeypatch, capsys, raiser_name):
+    """`cv2.namedWindow`/`imshow` 抛 `cv2.error` 时不能穿出 `main()`（远端 shell 最常见的坑）。"""
+    monkeypatch.setenv("DISPLAY", ":0")           # 过了环境检查，逼出 cv2.error 那条路
+    rc, _cap = _run_headless(
+        monkeypatch, [_fixture_image()], [],
+        raiser="The function is not implemented. Rebuild the library with GUI support",
+        raiser_name=raiser_name)
+    captured = capsys.readouterr()
+
+    assert rc == live_field.EXIT_USAGE != 0
+    assert "--once" in captured.out and "--frames" in captured.out
+    assert "Traceback" not in captured.out and "Traceback" not in captured.err
+
+
+def test_has_display_is_true_when_a_display_variable_is_set(monkeypatch):
+    monkeypatch.setattr(live_field.sys, "platform", "linux")
+    for name in ("DISPLAY", "WAYLAND_DISPLAY"):
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.setenv(name, ":0")
+        assert live_field._has_display() is True, name
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert live_field._has_display() is False
+    # 非 Linux（Windows/macOS 的窗口系统不靠 DISPLAY）不许误报
+    monkeypatch.setattr(live_field.sys, "platform", "darwin")
+    assert live_field._has_display() is True
 
 
 # --- 真相机（设备不可用时 skip，不让测试红） ----------------------------------------
