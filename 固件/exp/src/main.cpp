@@ -36,6 +36,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <math.h>
+#include <lwip/sockets.h>   // send()/MSG_DONTWAIT：非阻塞发送（见 flushRunBuf）
 #include "wheel_map.h"
 
 // ---------------- 网络 ----------------
@@ -169,25 +170,26 @@ bool     kicking      = false;
 uint32_t kick_until_us = 0;
 
 // ---------------- 输出 ----------------
-void sendLine(const String& s) {
-  if (client && client.connected()) client.println(s);
-}
+// （sendLine 定义移到了 run 环形缓冲之后：它现在走 ring + 非阻塞 flush）
 
 // 运行样本走 run_buf 环形缓冲，**边跑边发**：攒够 RUN_FLUSH_LINES 行就整批 flush，
 // PC 才能在 RUN 还没结束时判断"还在跑 / 跑完了 / 死了"。
 // （旧的"全攒 RAM、跑完一次性发"是为了绕开 WiFi 延迟 ACK，代价是整个运行期间 PC 收不到任何样本。）
 // 注意：延迟 ACK 那个坑靠的是"**攒批再发** + 连接时 setNoDelay(true)"，不是靠"发得晚"。
-// 本改动保留了攒批（一次 flush = 一次 client.write，约 5 行 ≈ 450 B），所以不会退化成逐行小包。
+// 本改动保留了攒批（一次 flush = 一次非阻塞 send，约 5 行 ≈ 450 B），不会退化成逐行小包。
 //
-// 【批次节奏】下面的数是**按代码推出来的**，不是上机实测的 —— Task 5 Step 3 烧录时要回来核对。
-//   loop() 里 next_sample_us += 10000 → 采样 100 Hz；
-//   streamSample() 每次调用只写 **一行 = 一个样本**（一行就是一个 t_ms 的 PWM/编码器/IMU），
-//   所以攒满 5 行 = 5 个样本 = 约 50 ms 发一批，每批 5 行。
-//   ⚠ 计划接口行说"约每 50 ms 一次"，R7 又按"每行 5 个样本"折算成 250 ms 一批 ——
-//     这两个数说的不是同一件事，而且 **250 ms 在本固件里不成立**：一行就是一个样本，不是五个。
-//     真正成立的是"每约 50 ms 一批、每批 5 行"。别照 R7 的 250 ms 去推时间轴；
-//     也别因为它跟接口行的 50 ms 数值接近就当成互相印证 —— 含义不同：
-//     **50 ms 是批次周期，5 行是每批样本数，两个量独立**：周期 = 行数 × 10 ms。
+// 【批次节奏】实测：RUN 后约 60 ms 出首批，之后每约 50 ms 一批（5 行 × 10 ms/行 = 50 ms）。
+//   一行就是一个样本，不是 5 个样本：周期 = 行数 × 10 ms。
+//
+// 【非阻塞的由来】2026-10-14 实测复现"约 1/3 概率 ~1s 遥测黑屏"：
+//   实测数据（50 次运行、PC 连续排空 + 固件侧打点）表明：
+//   - Wi-Fi 省电已关（esp_wifi_get_ps=0）、Nagle 已关（getNoDelay=1）、环缓冲无丢弃；
+//   - 黑屏时 loop 被冻结在 client.write/client.println 内 0.2~2.5s：
+//     WiFiClient::write 内部是 select(1s)×10 的阻塞实现，socket 一旦不可写就冻住采样循环，
+//     于是中段样本**根本没生成**（t_ms 出现 ~1s 缺口），期间连 PING 都不回；
+//   - 同窗口 ICMP 7~30ms、独立任务 UDP 心跳 0.15s 级照常 —— 无线电层是好的，
+//     卡的是这条 TCP 连接的发送路径（对端收不到任何段：PC 侧 segs_in/bytes_received 冻结）。
+//   修法：写操作全部非阻塞（MSG_DONTWAIT），发不出去就留在 ring 里，采样循环永不被网络冻结。
 //
 // 【环形缓冲的坑】回绕时绝不能盖掉还没发出去的数据。
 //   run_head —— 已写入总字节数（绝对游标，写入位 = run_head % CAP）
@@ -222,8 +224,18 @@ static bool runPushLine(const char* s, size_t len) {
   return true;
 }
 
-// 把还没 flush 的字节全部推给 TCP。只推进真正写出去的部分（client.write 可能只写进去一部分，
-// socket TX 满时返回 0）；剩下的留到下次 flush 接着发 —— TCP 是字节流，跨批次拼接后仍能还原整行。
+// 非阻塞发送：把数据尽量推给 TCP，满了立刻返回 0，绝不阻塞 loop。
+// （WiFiClient::write 是 select(1s)×10 的阻塞实现；send(MSG_DONTWAIT) 不会被它冻住。）
+static size_t txSendNonBlocking(const uint8_t* p, size_t n) {
+  if (!client || !client.connected() || n == 0) return 0;
+  int fd = client.fd();
+  if (fd < 0) return 0;
+  int w = send(fd, p, n, MSG_DONTWAIT);
+  return (w > 0) ? (size_t)w : 0;
+}
+
+// 把还没 flush 的字节尽量推给 TCP，绝不阻塞。只推进真正写出去的部分，
+// 剩下的留到下次 flush 接着发 —— TCP 是字节流，跨批次拼接后仍能还原整行。
 void flushRunBuf() {
   size_t pend = run_head - run_tail;
   if (client && client.connected() && pend) {
@@ -232,11 +244,10 @@ void flushRunBuf() {
       size_t pos   = (run_tail + off) % RUN_BUF_CAP;
       size_t chunk = RUN_BUF_CAP - pos;
       if (chunk > pend - off) chunk = pend - off;
-      size_t w = client.write((const uint8_t*)(run_buf + pos), chunk);
+      size_t w = txSendNonBlocking((const uint8_t*)(run_buf + pos), chunk);
       if (w == 0) break;
       off += w;
     }
-    client.flush();
     run_tail += off;
   }
   if (run_tail == run_head) {               // 全部发出去了才清计数（半发出去时保留，下次接着试）
@@ -246,6 +257,14 @@ void flushRunBuf() {
       run_dropped = 0;
     }
   }
+}
+
+// 所有出站文本统一走 run 环形缓冲 + 非阻塞 flush：
+// 控制行（PONG/OK/DONE/ERROR…）与 D 行保持同一字节流顺序，且任何写都不阻塞 loop。
+void sendLine(const String& s) {
+  if (!client || !client.connected()) return;
+  runPushLine(s.c_str(), s.length());   // 环满时由 runPushLine 计数并丢弃（极少见）
+  flushRunBuf();                        // 非阻塞，发得出去就发
 }
 
 // tag: "D"=实验运行样本(时间=相对RUN起点)  "I"=空闲样本(时间=millis)
@@ -438,6 +457,8 @@ void loop() {
       handleLine(line);
     }
   }
+
+  flushRunBuf();   // 周期性非阻塞 flush：把 ring 里未发出的字节（含控制行）继续推出去
 
   // 100 Hz 采样
   uint32_t now = micros();
