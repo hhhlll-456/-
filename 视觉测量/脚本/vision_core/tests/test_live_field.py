@@ -1,0 +1,793 @@
+"""`live_field.py` 的行为锁：真管道一致性、边缘余量、偏置符号、CLI 与"不开窗"。
+
+这些用例守的是**已经出过一次问题、或者差一步就会静默出错**的地方：
+
+- **本任务本身要消灭的分叉**：`live_aruco.py` 自己设 `adaptiveThreshWinSize*`，
+  于是它显示"找到 4 个码"而 `verify_vision.py` 仍然失败。所以
+  `test_live_field_never_forks_the_detector` 直接扫源码禁掉任何自设检测参数，
+  `test_camera_constants_come_from_verify_vision` 把相机参数钉在 `verify_vision` 的常量上。
+- **R48（今天卡住的原因）**：边界码被画面边缘切掉。`edge_margin_px` 是这条的正面处理；
+  参考照片上 ID20 的上边余量实测 5.54 px（R27 当时记的"6 px"），必须被点名。
+- **bias 符号**（A1 要量的就是它）：叠加层上的车体原点十字与横幅里印的 `(x, y)` 必须是
+  同一个点。`body_origin_cam` 用错矩阵（拿 `R_cam2field` 当码的旋转）会得到一个
+  **看起来完全正常**的十字 —— 只有拿 `body_pose_in_field` 对拍才能抓住。
+- **不开窗也要能用**：`import live_field` 不许碰相机、不许建窗口；`--once` / `--frames`
+  在无 DISPLAY 的环境里必须跑得出结果（CI 与本机的验收命令都靠它）。
+
+正例用实拍照片 `视觉测量/照片/photo_review_20261013.jpg`（五码齐全）。相机相关的用例在设备
+不可用时 **skip**，不让测试红 —— 那不是代码的问题。
+"""
+import ast
+import math
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+
+import live_field
+import verify_vision
+from vision_core import calib_store
+from vision_core.field import FieldFrame, body_pose_in_field, build_field_frame, to_field
+from vision_core.markers import MarkerPose, detect_markers
+
+PHOTO = "视觉测量/照片/photo_review_20261013.jpg"
+SCRIPT = "视觉测量/脚本/live_field.py"
+
+# 参考照片上 ID20 上边到画面上边缘的实测余量（px）。R27 记的是"6 px"，
+# `edge_distances_px` 给的是未取整的 5.5444…，所以这里也用未取整的数。
+PHOTO_ID20_TOP_PX = 5.544453144073486
+
+# 盖住某个码的矩形（`test_verify_vision.py` 里同一张表：这张照片上五个码的实际位置）。
+COVER_BOX = {
+    20: (370, 0, 490, 105),
+    23: (345, 695, 450, 790),
+    29: (760, 245, 915, 405),
+}
+
+
+# --- 夹具 -----------------------------------------------------------------------
+
+
+def _fixture_image():
+    img = cv2.imread(str(calib_store.resolve_path(PHOTO)))
+    assert img is not None, f"读不到测试照片 {PHOTO}"
+    return img
+
+
+def _default_calib() -> dict:
+    """内建默认标定：标定文件不存在 → bias 三项 0.0（A1 还没做，R37）。不写任何盘。"""
+    return calib_store.load_calib("/nonexistent/car_calib.json")
+
+
+def _cover(img, box, donor=(1000, 300)):
+    """用图里一块空场盖住 `box`，造出"某个码检不出来"的反例（盖完当场验，见用例）。"""
+    x0, y0, x1, y1 = box
+    img[y0:y1, x0:x1] = img[donor[1]:donor[1] + (y1 - y0), donor[0]:donor[0] + (x1 - x0)]
+    return img
+
+
+def _pose_at(corners_px) -> MarkerPose:
+    """只带角点的极简 MarkerPose —— 边缘余量只看角点，不需要位姿。"""
+    quad = np.asarray(corners_px, dtype=np.float64).reshape(4, 2)
+    return MarkerPose(marker_id=0, rvec=np.zeros((3, 1)), tvec=np.zeros((3, 1)),
+                      reproj_rms_px=0.0, corners_px=quad)
+
+
+class FakeCap:
+    """`open_camera` 的替身：按给定顺序吐帧（用完重复最后一帧）。"""
+
+    def __init__(self, frames=(), drop_after=None):
+        self.frames = list(frames)
+        self.index = 0
+        self.grabbed = 0
+        self.released = 0
+        self.drop_after = drop_after
+        self.sets = []
+
+    def set(self, prop, value):
+        self.sets.append((prop, value))
+        return True
+
+    def grab(self):
+        self.grabbed += 1
+
+    def read(self):
+        if not self.frames or (self.drop_after is not None and self.index >= self.drop_after):
+            return False, None
+        frame = self.frames[min(self.index, len(self.frames) - 1)].copy()
+        self.index += 1
+        return True, frame
+
+    def release(self):
+        self.released += 1
+
+
+def _run_headless(monkeypatch, frames, argv_extra=(), drop_after=None):
+    """把 `open_camera` 换成假相机，跑一次 `--once` / `--frames` 路径，返回 `(rc, cap)`。"""
+    cap = FakeCap(frames, drop_after=drop_after)
+    monkeypatch.setattr(live_field, "open_camera", lambda *a, **k: cap)
+    monkeypatch.setattr(live_field, "DEFAULT_SETTLE_FRAMES", 0)
+    # 冷却在下面单独有用例覆盖；这里关掉，好把"变化才打"的规则单独验清楚。
+    monkeypatch.setattr(live_field, "TERMINAL_MIN_INTERVAL_S", 0.0)
+    return live_field.main(list(argv_extra)), cap
+
+
+# --- edge_margin_px：R48 的正面处理 ------------------------------------------------
+
+
+def test_edge_margin_is_large_when_the_marker_is_well_inside_the_frame():
+    quad = np.float64([[400.0, 100.0], [440.0, 100.0], [440.0, 140.0], [400.0, 140.0]])
+    assert live_field.edge_margin_px(quad, (1080, 1920)) == 100.0
+
+
+def test_edge_margin_takes_the_smallest_side_when_a_corner_touches_the_top():
+    quad = np.float64([[400.0, 3.0], [440.0, 3.0], [440.0, 43.0], [400.0, 43.0]])
+    assert live_field.edge_margin_px(quad, (1080, 1920)) == 3.0
+
+
+def test_edge_margin_measures_the_frame_side_not_the_nearest_corner():
+    """四角都在画面内、但整体离右边缘只有 12 px → 12.0。
+
+    "四个边上的最小值"是 brief 定的判据：实现成"离最近的角点/别的码有多远"，这个码会被
+    判成健康，而它正是今天被切的那一类。
+    """
+    quad = np.float64([[1900.0, 400.0], [1908.0, 400.0], [1908.0, 440.0], [1900.0, 440.0]])
+    dists = live_field.edge_distances_px(quad, (1080, 1920))
+    assert dists["right"] == 12.0
+    assert live_field.edge_margin_px(quad, (1080, 1920)) == 12.0
+
+
+def test_edge_margin_is_negative_when_the_marker_is_cut_by_the_frame():
+    quad = np.float64([[1900.0, 400.0], [1925.0, 400.0], [1925.0, 440.0], [1900.0, 440.0]])
+    assert live_field.edge_margin_px(quad, (1080, 1920)) == -5.0
+    assert live_field.edge_warnings({7: _pose_at(quad)}, (1080, 1920)) \
+        == ["ID7 超右边缘 5px ⚠被切"]
+
+
+def test_edge_margin_on_the_reference_photo_reproduces_the_recorded_six_pixels():
+    """R27 记的"ID20 上边离画面边界只有 6 px"必须能由代码算出来 —— 这正是今天的判据。"""
+    img = _fixture_image()
+    poses = detect_markers(img, _default_calib())
+    top = live_field.edge_distances_px(poses[20].corners_px, img.shape[:2])["top"]
+    assert top == pytest.approx(PHOTO_ID20_TOP_PX, abs=1e-6)
+
+
+def test_edge_warnings_name_the_offending_markers_and_stay_silent_when_healthy():
+    img = _fixture_image()
+    poses = detect_markers(img, _default_calib())
+    warnings = live_field.edge_warnings(poses, img.shape[:2])
+    # 参考照片上 ID20 贴上边缘、ID21 贴右边缘；其余三个健康（噪声必须能被"不在"表达出来）。
+    assert warnings == ["ID20 距上边缘 6px ⚠被切", "ID21 距右边缘 16px ⚠被切"]
+
+    roomy = np.float64([[500.0, 300.0], [540.0, 300.0], [540.0, 340.0], [500.0, 340.0]])
+    assert live_field.edge_warnings({20: _pose_at(roomy)}, (1080, 1920)) == []
+
+
+def test_edge_margin_rejects_a_degenerate_quad():
+    with pytest.raises(ValueError):
+        live_field.edge_margin_px(np.float64([[0.0, 0.0], [1.0, 1.0]]), (1080, 1920))
+
+
+# --- summarize：终端行与横幅的共同来源 ---------------------------------------------
+
+
+def test_summarize_ready_line_carries_ready_x_y_and_yaw():
+    img = _fixture_image()
+    calib = _default_calib()
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    assert result.ok
+
+    line = live_field.summarize(result, poses)
+    assert line.startswith("READY  ")
+    assert f"x={verify_vision.signed(result.x_mm)}" in line
+    assert f"y={verify_vision.signed(result.y_mm)}" in line
+    assert f"yaw={verify_vision.signed(result.yaw_deg)}" in line
+    # 每个检出的码都带中心像素：操作者不盯着窗口也能读到码在哪。
+    for marker_id in sorted(poses):
+        cx, cy = live_field.marker_center_px(poses[marker_id])
+        assert f"ID{marker_id}@({cx},{cy})" in line
+
+
+def test_summarize_failure_carries_the_reason_verbatim_and_the_missing_ids():
+    img = _cover(_fixture_image(), COVER_BOX[20])
+    calib = _default_calib()
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "broken", "broken.jpg")
+    assert not result.ok
+    assert 20 not in poses, "反例不成立：盖完 ID20 还检得出来"
+
+    line = live_field.summarize(result, poses)
+    assert line.startswith("boundary_moved")
+    assert "缺[20]" in line
+    assert "ID21@" in line
+
+
+def test_summarize_uses_the_reason_word_for_a_missing_vehicle_marker_too():
+    """词表是 Task 11 定的那五个，`no_vehicle_marker` 与 `boundary_moved` 不是一回事。"""
+    img = _cover(_fixture_image(), COVER_BOX[29])
+    calib = _default_calib()
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "no29", "no29.jpg")
+    assert not result.ok and 29 not in poses
+
+    line = live_field.summarize(result, poses)
+    assert line.startswith("no_vehicle_marker")
+    assert "缺[29]" in line and "boundary_moved" not in line
+
+
+# --- 车体原点的像素位置：bias 的符号与参考系 ---------------------------------------
+
+
+def _synthetic_scene(rvec_deg_z: float = 90.0):
+    """一个可手算的场景：场地系与相机系对齐、场地原点落在图像中心、ID29 也在图像中心。
+
+    `R_cam2field = I` 意味着 场地 +X = 图像右、+Y = 图像下 —— 对俯视相机这是正确取向，
+    于是"像素往哪边动"与"场地系往哪边动"一一对应，符号钉得住。
+    """
+    K = np.float64([[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]])
+    ff = FieldFrame(R_cam2field=np.eye(3), origin_cam=np.float64([0.0, 0.0, 500.0]),
+                    marker_px={}, normal_cam=np.float64([0.0, 0.0, -1.0]))
+    rvec = np.float64([[0.0], [0.0], [math.radians(rvec_deg_z)]])
+    pose = MarkerPose(marker_id=29, rvec=rvec, tvec=np.float64([[0.0], [0.0], [500.0]]),
+                      reproj_rms_px=0.0,
+                      corners_px=np.float64([[960.0, 540.0], [980.0, 540.0],
+                                              [980.0, 560.0], [960.0, 560.0]]))
+    return ff, pose, K
+
+
+def test_body_origin_pixel_moves_the_way_the_bias_says():
+    """A1 的偏置符号钉死。
+
+    场景里码绕相机 Z 转了 90°，所以它的规范 +Y（角点3→角点0）指向图像**左**。
+    `p_body = tvec − R_cam2marker @ [dx, dy, 0]`，于是 `dy_mm = +40` 把车体原点推到
+    图像**右**边 —— 同时场地区 x 变成 +40 mm（`to_field` 的方向与像素方向一致）。
+
+    用错矩阵（把 `R_cam2field` 当成码的旋转）会把它推到图像**上**边：同样是一个正常的
+    十字、同样有一个正常的 `(x, y)`，没有一处会报错 —— A1 的数就是这么被写错的。
+    """
+    ff, pose, K = _synthetic_scene(rvec_deg_z=90.0)
+
+    for dy_mm, expect_right in ((40.0, True), (-40.0, False)):
+        bias = {"dx_mm": 0.0, "dy_mm": dy_mm, "dtheta_deg": 0.0}
+        px = live_field.project_point(K, live_field.body_origin_cam(pose, bias))
+        assert (px[0] > 960.0) is expect_right, f"dy_mm={dy_mm} 推错了方向：{px}"
+        assert px[1] == pytest.approx(540.0, abs=1e-6)          # 没有上下分量
+        # 场地区落点与 field.py 的权威实现一致
+        assert to_field(ff, live_field.body_origin_cam(pose, bias))[:2] \
+            == pytest.approx(body_pose_in_field(ff, pose, bias)[:2], abs=1e-9)
+
+    wrong = np.float64([0.0, 0.0, 500.0]) - (np.eye(3) @ np.float64([0.0, 40.0, 0.0]))
+    assert live_field.project_point(K, wrong)[1] < 540.0, "反例不成立：用错矩阵落到了同一侧"
+
+
+def test_body_origin_pixel_moves_in_x_for_dx_in_the_unrotated_case():
+    """码不转（`R = I`）时 `dx_mm` 是纯图像水平方向。
+
+    方向由 `p_body = tvec − R@[dx,dy,0]` 决定：`dx_mm = +30` 意味着**码**在车体原点的
+    码 +X 方向 30 mm，所以车体原点在码的 −X 方向 —— 图像**左** 60 px（1000·30/500）。
+    这正是 R35 的读法（bias = 码相对车体原点的偏移），别把它当成"车体原点朝码那边偏"。
+    """
+    _ff, pose, K = _synthetic_scene(rvec_deg_z=0.0)
+    px = live_field.project_point(K, live_field.body_origin_cam(
+        pose, {"dx_mm": 30.0, "dy_mm": 0.0, "dtheta_deg": 0.0}))
+    assert px[0] == pytest.approx(960.0 - 1000.0 * 30.0 / 500.0, abs=1e-6)
+    assert px[1] == pytest.approx(540.0, abs=1e-6)
+
+
+def test_body_origin_pixel_agrees_with_body_pose_in_field_on_the_real_photo():
+    """叠加层上的十字与横幅里的 `(x, y)` 必须是同一个点的两种表示。
+
+    bias 全 0 时这条恒成立（看不出符号对不对），所以这里扫一组**非零**偏置 ——
+    A1 一填上真实偏置，两者必须仍然重合。
+    """
+    img = _fixture_image()
+    calib = _default_calib()
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    assert result.ok
+    ff, pose = result.field_frame, result.vehicle_pose
+
+    for bias in ({"dx_mm": 0.0, "dy_mm": 55.0, "dtheta_deg": 90.0},
+                 {"dx_mm": -30.0, "dy_mm": 0.0, "dtheta_deg": -90.0},
+                 {"dx_mm": 12.5, "dy_mm": -7.25, "dtheta_deg": 89.5}):
+        point = live_field.body_origin_cam(pose, bias)
+        assert to_field(ff, point)[:2] \
+            == pytest.approx(body_pose_in_field(ff, pose, bias)[:2], abs=1e-9), bias
+        assert live_field.project_point(calib["K"], point, calib["dist"]) is not None
+
+    # bias = 0（今天的实际状态）时，车体原点就落在车载码的中心像素上。
+    zero = live_field.project_point(calib["K"], live_field.body_origin_cam(pose, calib["bias"]))
+    assert zero == pytest.approx(live_field.marker_center_px(pose), abs=1.0)
+
+
+def test_field_point_cam_inverts_to_field_coordinates():
+    """场地系平面上的点 → 相机系 → 再 `to_field` 回去必须原样（坐标轴转置没搞反）。"""
+    ff, _pose, _K = _synthetic_scene()
+    for u, v in ((0.0, 0.0), (100.0, 0.0), (0.0, 100.0), (-37.5, 88.25)):
+        back = to_field(ff, live_field.field_point_cam(ff, u, v))
+        assert back[0] == pytest.approx(u, abs=1e-9)
+        assert back[1] == pytest.approx(v, abs=1e-9)
+
+
+def test_field_axes_point_the_way_the_field_frame_says():
+    """参考照片上 场地 +X = ID20→ID21 = 图像**右**、+Y = ID20→ID23 = 图像**下**（R4/R34）。"""
+    calib = _default_calib()
+    img = _fixture_image()
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    ff, K = result.field_frame, calib["K"]
+    origin = live_field.project_point(K, ff.origin_cam, calib["dist"])
+    tip_x = live_field.project_point(K, live_field.field_point_cam(ff, live_field.AXIS_LEN_MM, 0.0),
+                                     calib["dist"])
+    tip_y = live_field.project_point(K, live_field.field_point_cam(ff, 0.0, live_field.AXIS_LEN_MM),
+                                     calib["dist"])
+    assert tip_x[0] > origin[0], "场地 +X 必须指向图像右"
+    assert tip_y[1] > origin[1], "场地 +Y 必须指向图像下"
+
+
+def test_projection_rejects_points_behind_or_on_the_camera_plane():
+    _ff, _pose, K = _synthetic_scene()
+    assert live_field.project_point(K, np.float64([0.0, 0.0, -1.0])) is None
+    assert live_field.project_point(K, np.float64([0.0, 0.0, 0.0])) is None
+    assert live_field.project_point(K, np.float64([0.0, 0.0, np.nan])) is None
+
+
+def test_projection_with_and_without_distortion_agree_on_the_current_calibration():
+    """`calib_intrinsics_chess.json` 的 dist 全是 0：两条路必须给出同一个像素。
+
+    参数保留是为了 `calib_distortion.py` 之后不用改这里；今天两条路若不等，
+    就说明叠加层与检测结果已经不在同一个像素空间里了。
+    """
+    calib = _default_calib()
+    assert len(calib["dist"]) == 5 and not any(calib["dist"])
+    poses = detect_markers(_fixture_image(), calib)
+    for marker_id in sorted(poses):
+        point = poses[marker_id].tvec.reshape(3)
+        assert live_field.project_point(calib["K"], point) \
+            == pytest.approx(live_field.project_point(calib["K"], point, calib["dist"]), abs=1e-6)
+
+
+def test_clamp_px_keeps_drawn_points_inside_the_canvas():
+    shape = (1080, 1920)
+    assert live_field.clamp_px((-500, -500), shape) == (8, 8)
+    assert live_field.clamp_px((99999, 99999), shape) == (1911, 1071)
+    assert live_field.clamp_px((100.4, 200.6), shape) == (100, 201)
+
+
+# --- 真管道一致性：不分叉、不复制 ---------------------------------------------------
+
+
+def test_both_files_end_with_a_newline_and_are_utf8():
+    """`d8850c4` 立的规矩：末尾换行 + UTF-8。
+
+    少了末尾换行，git diff 里那行会显示成 "\\ No newline at end of file"，而仓库里
+    有别的工具按行处理文本 —— 这条不是洁癖。
+    """
+    for name in (SCRIPT, "视觉测量/脚本/vision_core/tests/test_live_field.py"):
+        raw = calib_store.resolve_path(name).read_bytes()
+        raw.decode("utf-8")                                  # 不是 UTF-8 就抛
+        assert raw.endswith(b"\n"), f"{name} 末尾没有换行"
+        assert not raw.endswith(b"\n\n"), f"{name} 末尾多了一个空行"
+
+
+def test_live_field_never_forks_the_detector():
+    """本任务要消灭的分叉：自设 `DetectorParameters` / 自己调 `detectMarkers` 的副本。
+
+    `live_aruco.py` 就是这么做的，于是它显示"找到码"而 `verify_vision.py` 仍然失败。
+
+    这里扫的是 **AST 的属性名与函数名**，不是源码文本：模块 docstring 里必须能写清楚
+    "为什么不能自己设 `adaptiveThreshWinSize*`"，写了就会把纯文本扫描变成自欺欺人。
+    """
+    src = calib_store.resolve_path(SCRIPT).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    used = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    used |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    for banned in ("detectMarkers", "DetectorParameters_create", "adaptiveThreshWinSizeMin",
+                   "adaptiveThreshConstant", "cornerRefinementMethod", "Dictionary_get"):
+        assert banned not in used, f"live_field.py 里出现了自设检测：{banned}"
+    # 反向确认：真管道的两个入口都在（模块里确实写着它们的名字）。
+    assert "solve_image" in used and "detect_markers" in used
+    # 画框是允许的（`drawDetectedMarkers` 只画不检），但不许出现另一个 detect 调用点。
+    assert "drawDetectedMarkers" in used
+
+
+def test_camera_constants_come_from_verify_vision():
+    assert live_field.CAMERA_DEVICE == verify_vision.CAMERA_DEVICE == "/dev/video0"
+    assert live_field.CAPTURE_WIDTH == verify_vision.CAPTURE_WIDTH == 1920
+    assert live_field.CAPTURE_HEIGHT == verify_vision.CAPTURE_HEIGHT == 1080
+    assert live_field.CAPTURE_FOURCC == verify_vision.CAPTURE_FOURCC == "MJPG"
+    assert live_field.DEFAULT_SETTLE_FRAMES == verify_vision.DEFAULT_SETTLE_FRAMES
+
+
+def test_the_overlay_uses_exactly_the_poses_the_verdict_used():
+    """同一帧上跑两遍 `detect_markers`（叠加层一遍、`solve_image` 里一遍）必须是同一份结果。
+
+    这是"每帧跑两次检测"这个取舍的前提：它换来的性质必须成立，否则两次解算之间车动了，
+    叠加层画的就是**上一刻**的位姿，而画面上没有任何东西会提示这一点。
+    """
+    img = _fixture_image()
+    calib = _default_calib()
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    assert result.ok
+    assert result.vehicle_pose.marker_id == calib_store.VEHICLE_ID
+    assert np.allclose(result.vehicle_pose.corners_px,
+                       poses[calib_store.VEHICLE_ID].corners_px)
+    assert np.allclose(result.field_frame.origin_cam, build_field_frame(poses).origin_cam)
+
+
+def test_the_snapshot_default_directory_is_outside_the_repo():
+    """快照默认不落进仓库：它是调取景的中间产物，不是证据（证据走 verify_vision --capture）。"""
+    default = live_field.DEFAULT_SNAPSHOT_DIR
+    assert default.startswith("/tmp/")
+    assert calib_store.REPO_ROOT not in Path(default).parents
+    assert "视觉测量" not in default
+
+
+# --- import 安全性与相机 ------------------------------------------------------------
+
+
+def test_importing_live_field_touches_no_camera_and_no_window(monkeypatch):
+    """`import live_field` 不许开设备、不许建窗口（测试与 CI 都靠它能 import）。"""
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("QT_QPA_PLATFORM", raising=False)
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("模块顶层不许碰相机/窗口")
+
+    for name in ("VideoCapture", "namedWindow", "imshow"):
+        monkeypatch.setattr(cv2, name, boom)
+
+    spec_path = calib_store.resolve_path(SCRIPT)
+    code = compile(spec_path.read_text(encoding="utf-8"), str(spec_path), "exec")
+    namespace = {"__name__": "live_field_import_probe", "__file__": str(spec_path)}
+    exec(code, namespace)                      # 这就是要验的那件事本身
+    assert callable(namespace["edge_margin_px"])
+    assert namespace["EXIT_CAMERA_UNAVAILABLE"] == 4
+
+
+def test_open_camera_sets_the_pipeline_format_and_keeps_autofocus_on(monkeypatch):
+    """分辨率/FourCC 必须与 `verify_vision.grab_frame` 一致，自动对焦保持开启。"""
+
+    class Cap(FakeCap):
+        def __init__(self, *_args):
+            super().__init__([_fixture_image()])
+
+        def isOpened(self):
+            return True
+
+    monkeypatch.setattr(cv2, "VideoCapture", Cap)
+    cap = live_field.open_camera("/dev/video0")
+    props = dict(cap.sets)
+    assert props[cv2.CAP_PROP_FOURCC] == cv2.VideoWriter_fourcc(*live_field.CAPTURE_FOURCC)
+    assert props[cv2.CAP_PROP_FRAME_WIDTH] == live_field.CAPTURE_WIDTH
+    assert props[cv2.CAP_PROP_FRAME_HEIGHT] == live_field.CAPTURE_HEIGHT
+    assert props[cv2.CAP_PROP_AUTOFOCUS] == 1                # 本任务不锁对焦
+    assert cv2.CAP_PROP_EXPOSURE not in props, "不该去锁曝光"
+
+
+def test_a_busy_camera_is_one_readable_line_not_a_traceback(monkeypatch, capsys):
+    class DeadCap:
+        def __init__(self, *_args):
+            pass
+
+        def isOpened(self):
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", DeadCap)
+    with pytest.raises(live_field.CameraUnavailable) as exc:
+        live_field.open_camera("/dev/video9")
+    assert "占用" in str(exc.value)
+
+    rc = live_field.main(["--once", "--device", "/dev/video9"])
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_CAMERA_UNAVAILABLE == 4
+    assert "占用" in out and "Traceback" not in out
+
+
+def test_settle_discards_buffer_frames_without_decoding():
+    """R39：启动那一刻必须丢缓冲帧等自动对焦收敛（实时循环里不每帧丢）。"""
+    cap = FakeCap([_fixture_image()])
+    live_field.settle(cap, frames=7)
+    assert cap.grabbed == 7
+    assert cap.index == 0                      # grab 不解码
+
+
+# --- 无窗口命令行路径 --------------------------------------------------------------
+
+
+def test_once_prints_a_ready_line_from_a_solvable_frame_without_a_window(monkeypatch, capsys):
+    def boom(*_args, **_kwargs):
+        raise AssertionError("--once 不许开窗口")
+
+    for name in ("namedWindow", "imshow"):
+        monkeypatch.setattr(cv2, name, boom)
+
+    rc, cap = _run_headless(monkeypatch, [_fixture_image()], ["--once"])
+    out = capsys.readouterr().out
+
+    assert rc == live_field.EXIT_OK == 0
+    assert "READY" in out and "ID20@(" in out and "ID29@(" in out
+    assert "x=" in out and "yaw=" in out
+    assert "Traceback" not in out
+    assert cap.released == 1, "退出时必须 release 相机"
+
+
+def test_once_together_with_frames_one_is_the_acceptance_command(monkeypatch, capsys):
+    """验收命令是 `--once --frames 1`：两个标志不是互斥的，按 --frames 的帧数解算。"""
+    rc, cap = _run_headless(monkeypatch, [_fixture_image(), _fixture_image()],
+                            ["--once", "--frames", "1"])
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_OK
+    assert cap.index == 1
+    assert "1/1 帧 READY" in out
+
+
+def test_frames_solves_exactly_n_frames(monkeypatch, capsys):
+    rc, cap = _run_headless(monkeypatch, [_fixture_image()] * 5, ["--frames", "5"])
+    out = capsys.readouterr().out
+    assert cap.index == 5
+    assert rc == live_field.EXIT_OK
+    assert "5/5 帧 READY" in out
+    assert "ms/帧" in out and "两次 detect_markers" in out     # 压测要给出每帧耗时
+
+
+def test_an_unsolvable_frame_exits_one_and_prints_the_reason_word(monkeypatch, capsys):
+    """今天实拍就是这个状态：相机正常，帧拿到了，但解不出来（取景问题，R48）。"""
+    broken = _cover(_fixture_image(), COVER_BOX[20])
+    rc, _cap = _run_headless(monkeypatch, [broken], ["--once"])
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_PHOTO_FAILED == 1
+    assert "boundary_moved" in out and "缺[20]" in out
+    assert "0/1 帧 READY" in out
+
+
+def test_the_terminal_line_is_printed_only_when_the_state_changes(monkeypatch, capsys):
+    """状态不变就不重复打：否则实时模式会把终端刷爆，操作者 `tail` 不到东西。"""
+    good = _fixture_image()
+    bad = _cover(good.copy(), COVER_BOX[20])
+    rc, _cap = _run_headless(monkeypatch, [good, good, good, bad, bad, good], ["--frames", "6"])
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert rc == live_field.EXIT_PHOTO_FAILED
+    assert len(lines) == 3, lines                    # 好 →（好 好）→ 坏 →（坏）→ 好
+    assert "READY" in lines[0] and "boundary_moved" in lines[1] and "READY" in lines[2]
+
+
+def test_the_terminal_log_cools_down_so_jitter_does_not_flood_it(capsys):
+    """边缘上抖动的码（ID22/ID23 时有时无、中心差 1 px）不能把终端刷爆。
+
+    实测：开着窗口跑 1 秒会打 12 行，全是同一个意思。冷却把频率按住，而
+    "短暂的变化只是**延后**、不丢弃"是这条设计的要点。
+    """
+    good = _fixture_image()
+    bad = _cover(good.copy(), COVER_BOX[20])
+    assert live_field.TERMINAL_MIN_INTERVAL_S > 0.0
+
+    log = live_field.TerminalLog(interval=60.0)          # 冷却期内不会打第二行
+    for i in range(40):
+        log.report(*_pose_result(good if i % 2 == 0 else bad))
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert len(lines) == 1 and "READY" in lines[0]      # 40 帧抖动 → 1 行
+
+    log.last_at = time.perf_counter() - 120.0            # 模拟冷却过去
+    log.report(*_pose_result(bad))
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert len(lines) == 1 and "boundary_moved" in lines[0]
+
+    log.last_at = time.perf_counter() - 120.0
+    log.report(*_pose_result(good))                      # 冷却期内发生的变化，现在才打出来
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[")]
+    assert len(lines) == 1 and "READY" in lines[0]
+
+
+def _pose_result(img):
+    """`(result, poses)`：给纯函数测试用的一对，避免每处都写两行。"""
+    calib = _default_calib()
+    return live_field.solve_image(img, calib, "p", "p"), detect_markers(img, calib)
+
+
+def test_a_read_failure_is_one_line_not_a_traceback(monkeypatch, capsys):
+    rc, cap = _run_headless(monkeypatch, [_fixture_image()], ["--frames", "3"], drop_after=1)
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_PHOTO_FAILED
+    assert "读帧失败" in out and "Traceback" not in out
+    assert cap.released == 1
+
+
+def test_negative_frames_is_a_usage_error(capsys):
+    with pytest.raises(SystemExit) as exc:
+        live_field.main(["--frames", "-2"])
+    assert exc.value.code == live_field.EXIT_USAGE == 2
+    assert "不能为负" in capsys.readouterr().err
+
+
+def test_a_zero_scale_is_a_usage_error(capsys):
+    with pytest.raises(SystemExit) as exc:
+        live_field.main(["--scale", "0"])
+    assert exc.value.code == 2
+    assert "--scale" in capsys.readouterr().err
+
+
+def test_help_runs_and_documents_the_keys_and_exit_codes(capsys):
+    with pytest.raises(SystemExit) as exc:
+        live_field.main(["--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    for token in ("--once", "--frames", "--scale", "--snapshot-dir",
+                  "ESC", "存快照", "退出码", "4 = 相机打不开"):
+        assert token in out, token
+
+
+# --- 叠加绘制 ----------------------------------------------------------------------
+
+
+def _axis_x_pixels(frame: np.ndarray) -> np.ndarray:
+    """画面上"场地 +X 轴"那种洋红（BGR 255,0,255）的像素掩码。
+
+    黑画布上只有本脚本会画它（黄/红/绿/白都不撞这个色），所以它同时是
+    "画没画坐标轴"的判据与"颜色有没有搞反 BGR"的探针。
+    """
+    return (frame[:, :, 0] > 200) & (frame[:, :, 1] < 60) & (frame[:, :, 2] > 200)
+
+
+def test_overlay_text_is_drawn_in_bgr_not_rgb():
+    """PIL 出的是 RGB，`_blend` 贴进 OpenCV 的 BGR 画布必须换通道。
+
+    换反了不会报错，只会把"红色失败横幅"画成蓝色、把黄色 A1 警告画成橙色 ——
+    而操作者正是靠颜色区分这三行的。用黑画布取像素，颜色一写错就会红。
+    """
+    calib = _default_calib()
+    bad = _cover(_fixture_image(), COVER_BOX[20])
+    poses = detect_markers(bad, calib)
+    result = live_field.solve_image(bad, calib, "bad", "bad.jpg")
+    assert not result.ok
+
+    canvas = np.zeros_like(bad)
+    live_field.draw_overlay(canvas, result, poses, calib, bias_measured=False)
+    band = canvas[:80]
+    red = (band[:, :, 2] > 150) & (band[:, :, 1] < 100) & (band[:, :, 0] < 100)
+    blue = (band[:, :, 0] > 150) & (band[:, :, 2] < 100)
+    assert red.any(), "失败横幅应该是红色"
+    assert not blue.any(), "红色被画成了蓝色：BGR/RGB 通道搞反了"
+
+
+def test_draw_overlay_paints_the_body_cross_at_the_solved_point_and_a_banner():
+    img = _fixture_image()
+    calib = _default_calib()
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    assert result.ok
+
+    canvas = np.zeros_like(img)          # 黑画布：画出来的每个像素都是本脚本画的
+    warnings = live_field.draw_overlay(canvas, result, poses, calib,
+                                       bias_measured=False, fps=20.0)
+    assert warnings == ["ID20 距上边缘 6px ⚠被切", "ID21 距右边缘 16px ⚠被切"]
+
+    # 车体原点十字是红的（BGR 0,0,255），且必须落在解出来的那个点上。
+    bx, by = live_field.project_point(
+        calib["K"], live_field.body_origin_cam(result.vehicle_pose, calib["bias"]), calib["dist"])
+    patch = canvas[int(by) - 30:int(by) + 30, int(bx) - 30:int(bx) + 30]
+    red = (patch[:, :, 2] > 180) & (patch[:, :, 1] < 80) & (patch[:, :, 0] < 80)
+    assert red.any(), "车体原点十字没画在解出来的那个点上"
+
+    # 场地坐标轴（只有场地系建起来时才画）
+    assert _axis_x_pixels(canvas).any()
+    # 横幅在顶部：那里有亮像素（文字）；左下角有比例尺文字
+    assert (canvas[:80, :, :].max(axis=2) > 150).any()
+    assert (canvas[-80:, :, :].max(axis=2) > 150).any()
+
+
+def test_draw_overlay_does_not_invent_a_field_frame_on_a_failed_frame():
+    """`boundary_moved` 的那一帧根本没有场地系：画出来的坐标轴是编的，所以不画。"""
+    bad = _cover(_fixture_image(), COVER_BOX[20])
+    calib = _default_calib()
+    poses = detect_markers(bad, calib)
+    result = live_field.solve_image(bad, calib, "bad", "bad.jpg")
+    assert not result.ok and result.field_frame is None
+
+    canvas = np.zeros_like(bad)
+    warnings = live_field.draw_overlay(canvas, result, poses, calib, bias_measured=False)
+    assert not _axis_x_pixels(canvas).any(), "没有场地系却画出了坐标轴"
+    assert warnings == ["ID21 距右边缘 16px ⚠被切"]
+
+
+def test_grid_toggle_changes_the_pixels():
+    img = _fixture_image()
+    calib = _default_calib()
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    plain, gridded = img.copy(), img.copy()
+    live_field.draw_overlay(plain, result, poses, calib)
+    live_field.draw_overlay(gridded, result, poses, calib, show_grid=True)
+    assert not np.array_equal(plain, gridded)
+
+
+def test_banner_says_the_bias_is_unmeasured_only_until_a1_is_done():
+    calib = _default_calib()
+    img = _fixture_image()
+    poses = detect_markers(img, calib)
+    result = live_field.solve_image(img, calib, "photo", PHOTO)
+    assert result.ok
+
+    # R37：READY 那一行本身不带 A1 警告，警告在独立的混合行里。
+    rows = live_field.banner_lines(result, poses, bias_measured=True)
+    assert len(rows) == 1 and rows[0][1] == live_field.COLOR_OK
+
+    assert live_field.warning_strip(True, []) == []
+    assert live_field.warning_strip(False, [])[0][0] == live_field.A1_WARNING
+    # 有边缘告警时两件事挤在同一行（横幅必须矮：它盖住的正是贴边的那个码）
+    strip = live_field.warning_strip(False, ["ID20 距上边缘 3px ⚠被切"])
+    assert len(strip) == 2 and strip[1][1] == live_field.COLOR_BAD
+    assert "车载码的中心" in live_field.A1_WARNING
+
+
+def test_snapshot_never_overwrites_and_stays_usable_by_verify_vision(tmp_path):
+    """快照存的是**未叠加的原帧**：拿它跑 `verify_vision.solve_image` 必须还能解出同一个位姿。"""
+    img = _fixture_image()
+    calib = _default_calib()
+    first = live_field.save_snapshot(img, tmp_path / "snaps")
+    second = live_field.save_snapshot(img, tmp_path / "snaps")
+    assert first != second and first.exists() and second.exists()
+    assert first.is_absolute() and first.suffix == ".jpg"
+
+    back = cv2.imread(str(first))
+    assert back is not None
+    solved = verify_vision.solve_image(back, calib, "snap", str(first))
+    reference = verify_vision.solve_image(img, calib, "photo", PHOTO)
+    assert solved.ok
+    assert solved.x_mm == pytest.approx(reference.x_mm, abs=0.5)
+    assert solved.yaw_deg == pytest.approx(reference.yaw_deg, abs=0.5)
+
+
+def test_a_subprocess_run_of_once_needs_no_display(tmp_path):
+    """无 DISPLAY、无窗口的环境里 `--once` 必须跑得出结果（CI 与本机验收都靠这条）。"""
+    env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+    proc = subprocess.run(
+        [sys.executable, str(calib_store.resolve_path(SCRIPT)), "--once",
+         "--calib", str(tmp_path / "car_calib.json")],
+        cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert "Traceback" not in proc.stderr
+    assert "模式：无窗口" in proc.stdout
+    assert proc.returncode in (0, 1, 4), proc.stdout + proc.stderr   # 4 = 相机被占着
+    if proc.returncode != 4:
+        assert "READY" in proc.stdout or "boundary_moved" in proc.stdout
+
+
+# --- 真相机（设备不可用时 skip，不让测试红） ----------------------------------------
+
+
+def test_once_on_the_real_camera_when_one_is_available():
+    """设备在就真跑一帧：格式必须是 1920x1080，且判定与叠加出自同一次解算。"""
+    try:
+        cap = live_field.open_camera(live_field.CAMERA_DEVICE)
+    except live_field.CameraUnavailable as exc:
+        pytest.skip(f"本机没有可用的相机：{exc}")
+    try:
+        live_field.settle(cap, frames=5)
+        frame = live_field.read_frame(cap)
+    finally:
+        cap.release()
+    if frame is None:
+        pytest.skip("相机打开了但读不出帧")
+    assert (frame.shape[1], frame.shape[0]) == (live_field.CAPTURE_WIDTH, live_field.CAPTURE_HEIGHT)
+
+    calib = _default_calib()
+    poses = detect_markers(frame, calib)
+    result = live_field.solve_image(frame, calib, "live", live_field.CAMERA_DEVICE)
+    line = live_field.summarize(result, poses)
+    # 这一帧可能 READY 也可能 boundary_moved（取决于操作者把相机摆到哪了），
+    # 但状态行必须与 solve_image 的判定一致，且不出现自造的 reason 词。
+    if result.ok:
+        assert line.startswith("READY")
+    else:
+        assert line.startswith(result.reason)
+        assert result.reason in ("boundary_moved", "no_vehicle_marker")
