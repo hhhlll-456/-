@@ -355,13 +355,30 @@ def body_pose_in_field(ff: FieldFrame, pose, bias) -> tuple[float, float, float]
     本车当前贴法下（实测 ID29 规范 +Y → 相机 `(−0.998, −0.056, −0.027)` = 图像左，
     规范 +X → `(0.056, −0.998, 0.012)` = 图像上方）码被转了约 90°，所以
 
-        车体坐标系里的**左**向偏置 b mm  →  dx_mm ≈ ±b,  dy_mm ≈ 0,  dtheta_deg ≈ ±90°
+        车体坐标系里的**左**向偏置 b mm  →  dx_mm ≈ 0,  dy_mm ≈ ±b,  dtheta_deg ≈ ±90°
+        车体坐标系里的**前**向偏置 f mm  →  dx_mm ≈ ±f,  dy_mm ≈ 0,  dtheta_deg ≈ ±90°
+
+    **这两行曾经是反的**（写成"左 b → dx ≈ ±b, dy ≈ 0"，那其实是**前**的落点），
+    而且被 `视觉测量/脚本/verify_vision.py` 的 `body_to_marker` 原样抄了过去，于是
+    A1 的入口也是 90° 错的：`--bias-body 0,55 --bias-dtheta 89.5` 与
+    `--bias-dx 0 --bias-dy 55 --bias-dtheta 89.5` 在参考照片上差 77.8 mm（55·√2）。
+    正确的推导（依据全在本模块里）：
+
+    1. `heading_deg` 取的是码的**规范 +Y** 的航向，`yaw = heading_deg − dtheta`
+       ⇒ `dtheta = H_Y − yaw_body`，`yaw_body` 是**车头**方向的航向。
+    2. 码规范 +X 相对 +Y 在**顺时针** 90°（实测 +Y +179.51°、+X +89.59°）。
+    3. 于是车体方向在码系里的分量是 `(−sin φ, cos φ)`，φ = 相对码 +Y 的航向差；
+       车头 φ = −dtheta，车左 φ = −dtheta + 90（逆时针为正，左 = 前 +90）。
+    4. 代进去：车头 → `(sin d, cos d)`、车左 → `(−cos d, sin d)`。`dtheta = +90` 时
+       车头与码 **+X** 重合、车左与码 **+Y** 重合 —— 这是决定性的一条。
 
     （符号由码的印刷/安装朝向定；`dtheta_deg ≈ ±90°` 正是 R25 预告过的现象。）
-    若 A1 的人用卷尺量到"车体中心在码的左边 55 mm"，却按车体系填成
-    `dy_mm = 55`，代码会把它当成**前后**偏置转 90° 用掉 —— 每条实验的 x 和 y 都
-    带一个 ~55 mm 的系统偏差，而且没有任何一处会报错。**A1 记录时必须写明
-    所填的 dx/dy 是沿码的规范轴量的。**
+    这两行由 `verify_vision` 的 `body_to_marker` 直接兑现，操作者**别手填 dx/dy**：
+    用 `verify_vision.py --bias-body FWD,LEFT` 按车体系（前 / 左）报数，工具内部换算；
+    它的换算与本段由 `test_bias_body_and_field_py_docstring_state_the_same_mapping`
+    钉住，两边不许各说各话。若 A1 的人用卷尺量到"车体中心在码的左边 55 mm"，却
+    填进 `dx_mm = 55`，代码会把它当成**前后**偏置用掉 —— 每条实验的 x 和 y 都带一个
+    ~55 mm 的系统偏差，而且没有任何一处会报错。
 
     ## 为什么必须先在码系里减
 

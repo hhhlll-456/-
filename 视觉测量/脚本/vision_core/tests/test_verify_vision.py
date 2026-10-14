@@ -9,7 +9,7 @@
   `test_a_shallow_merge_would_have_dropped_dy_mm` 是它的反例钉子。
 - **R37**：偏置没量过的时候，输出必须**说**它没量过，而不是把内建默认的 0.0
   当测量值印出来。
-- **R35**：`--help` 里必须带着"沿码规范轴 / 车体左 b → dx ±b、dtheta ±90"这条换算。
+- **R35**：`--help` 里必须带着"沿码规范轴 / 车体左 b → dy ±b、dtheta ±90"这条换算。
   操作者马上就要拿卷尺量车，这段 help 是唯一会出现在他眼前的东西。
 - **R34**：表头必须说清 yaw 的零基准是场地 +X，并印出 +92.79° 这个常数。
 - **R39**：采集必须丢缓冲帧、必须在读不到帧时**换一根新 handle** 重试。
@@ -612,12 +612,16 @@ def test_unreadable_image_is_reported_as_image_unreadable(tmp_path, capsys):
 
 
 def test_help_carries_the_marker_frame_bias_conversion():
-    """R35：车体「左 b」→ dx ±b、dy 0、dtheta ±90。help 是操作者眼前唯一的东西。"""
+    """R35：车体「左 b」→ dy ±b、「前 f」→ dx ±f。help 是操作者眼前唯一的东西。
+
+    曾经把这两行写反（写成"左 → dx"），于是 A1 的入口差 90°，见
+    `test_bias_body_matches_the_documented_frame_rotation`。
+    """
     stripped = [ln.strip() for ln in verify_vision.build_parser().format_help().splitlines()]
     assert any("码规范 +X" in ln for ln in stripped)
-    assert any("车体「左」 b → --bias-dx ±b, --bias-dy 0, --bias-dtheta ±90" in ln
+    assert any("车体「左」 b → --bias-dx 0,   --bias-dy ±b, --bias-dtheta ±90" in ln
                for ln in stripped)
-    assert any("车体「前」 f → --bias-dx 0,  --bias-dy ±f, --bias-dtheta ±90" in ln
+    assert any("车体「前」 f → --bias-dx ±f,  --bias-dy 0,  --bias-dtheta ±90" in ln
                for ln in stripped)
 
 
@@ -804,8 +808,8 @@ def test_bias_body_round_trips_with_bias_dx_dy(tmp_path, capsys):
     """
     for dtheta in (-90.0, 90.0, 37.5):
         for fwd, left in ((0.0, 120.0), (30.0, 0.0), (25.0, -80.0)):
-            dx = fwd * math.cos(math.radians(dtheta)) + left * math.sin(math.radians(dtheta))
-            dy = -fwd * math.sin(math.radians(dtheta)) + left * math.cos(math.radians(dtheta))
+            dx = fwd * math.sin(math.radians(dtheta)) - left * math.cos(math.radians(dtheta))
+            dy = fwd * math.cos(math.radians(dtheta)) + left * math.sin(math.radians(dtheta))
 
             verify_vision.main([PHOTO, "--bias-dx", f"{dx:.9f}", "--bias-dy", f"{dy:.9f}",
                                 "--bias-dtheta", f"{dtheta:.9f}",
@@ -819,11 +823,92 @@ def test_bias_body_round_trips_with_bias_dx_dy(tmp_path, capsys):
             assert via_body == via_marker, (dtheta, fwd, left, via_body, via_marker)
 
 
-def test_bias_body_left_offset_lands_on_dx_at_plus_90(tmp_path, capsys):
-    """R35 docstring 说的那条换算，在这里由代码直接兑现：dtheta=+90 时车左 b → dx=b。"""
-    dx, dy = verify_vision.body_to_marker(0.0, 120.0, 90.0)
-    assert dx == pytest.approx(120.0, abs=1e-9)
-    assert dy == pytest.approx(0.0, abs=1e-9)
+# 车身系（+X = 车头方向、+Y = 车左方向）→ 码规范轴（+X = 角点0→角点1、+Y = 角点3→角点0）
+# 在四个基准朝向上的应有落点。**这张表就是 R35 的定义**，不是从实现反推的：
+#
+#   dtheta 的定义（field.py）：yaw_body = yaw_marker(+Y) − dtheta，且 heading_deg 取的是
+#   码的规范 **+Y**。实测（参考照片）码规范 +X 的航向比 +Y **小 90°**（+Y 179.51°，
+#   +X 89.59°）—— 也就是 "+X 在 +Y 的顺时针 90°"。
+#   于是一个车体系方向在码系里的分量 = (−sin φ, cos φ)，其中 φ = 该方向相对码 +Y 的
+#   航向差；车头 φ = −dtheta、车左 φ = −dtheta + 90。代进去：
+#
+#       车头 → (sin d, cos d)        车左 → (−cos d, sin d)
+#
+# 三个可验证的基准：
+#   dtheta = 0   车头与码 +Y 重合、车左与码 −X 重合
+#   dtheta = +90 车头与码 **+X** 重合、车左与码 **+Y** 重合   ← 决定性的一条
+#   dtheta = −90 车头与码 −X 重合、车左与码 −Y 重合
+BODY_TO_MARKER_BASELINES = (
+    (0.0, (0.0, 55.0), (-55.0, 0.0)),
+    (90.0, (55.0, 0.0), (0.0, 55.0)),
+    (-90.0, (-55.0, 0.0), (0.0, -55.0)),
+    (37.5, (55.0 * math.sin(math.radians(37.5)), 55.0 * math.cos(math.radians(37.5))),
+     (-55.0 * math.cos(math.radians(37.5)), 55.0 * math.sin(math.radians(37.5)))),
+)
+
+
+@pytest.mark.parametrize("dtheta,forward_expected,left_expected", BODY_TO_MARKER_BASELINES)
+def test_bias_body_matches_the_documented_frame_rotation(dtheta, forward_expected, left_expected):
+    """车体系 → 码规范轴的换算必须落在文档定义的那四个基准上。
+
+    曾经差 90°：`dtheta=+90` 时车头**本该**与码 +X 重合，旧公式却把它与码 +Y 重合，
+    于是 55 mm 的"车左"被当成 55 mm 的"车前"，参考照片上两个入口差 77.8 mm（55·√2）。
+    A2 的 RMS 判据要等摆够 3 个位置才抓得到，而 A1 的数是当场写进标定文件的。
+    """
+    got_forward = verify_vision.body_to_marker(55.0, 0.0, dtheta)
+    got_left = verify_vision.body_to_marker(0.0, 55.0, dtheta)
+    assert got_forward == pytest.approx(forward_expected, abs=1e-9)
+    assert got_left == pytest.approx(left_expected, abs=1e-9)
+
+
+def test_bias_body_and_field_py_docstring_state_the_same_mapping():
+    """`verify_vision.body_to_marker` 与 `vision_core/field.py` 的 R35 段不许各说各话。
+
+    field.py 那段话被抄错过一次（"车体左 b → dx ≈ ±b, dy ≈ 0" 其实是车**前**的落点）。
+    它是全项目唯一一份给操作者看的换算说明，所以在这里钉住：docstring 说的与代码做的
+    必须是同一件事，且 base=左 的落点必须在 (0, ±b) 而不是 (±b, 0)。
+    """
+    import re
+    src = calib_store.resolve_path("视觉测量/脚本/vision_core/field.py").read_text(encoding="utf-8")
+    left_line = re.search(r"车体坐标系里的\*\*左\*\*向偏置 b mm.*", src)
+    assert left_line, "field.py 里找不到 R35 的左向换算说明"
+    assert "dx_mm ≈ 0" in left_line.group(0) and "dy_mm ≈ ±b" in left_line.group(0), left_line.group(0)
+    fwd_line = re.search(r"车体坐标系里的\*\*前\*\*向偏置 f mm.*", src)
+    assert fwd_line, "field.py 里找不到 R35 的前向换算说明"
+    assert "dx_mm ≈ ±f" in fwd_line.group(0) and "dy_mm ≈ 0" in fwd_line.group(0), fwd_line.group(0)
+    # 文档说的落点 = 代码算出来的落点
+    dx, dy = verify_vision.body_to_marker(0.0, 55.0, 90.0)
+    assert (round(dx, 6), round(abs(dy), 6)) == (0.0, 55.0)
+
+
+def test_bias_body_without_dtheta_says_which_dtheta_it_used(tmp_path, capsys):
+    """只给 --bias-body 时必须**大嗓门**说清按哪个 dtheta 换算，否则落盘的是个不可能的朝向。
+
+    换算用的 dtheta 与写进文件的 dtheta_deg 必须一致；不一致就等于凭空造出一个
+    "码的朝向与车差 0°，但偏置却是按 90° 换算出来的"这种几何上不存在的三元组。
+    """
+    p = tmp_path / "car_calib.json"
+    calib_store.save_calib({"bias": {"dx_mm": 0.0, "dy_mm": 0.0, "dtheta_deg": 90.0}},
+                           path=str(p))
+    rc = verify_vision.main([PHOTO, "--bias-body", "0,55", "--calib", str(p)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "!!" in out and "--bias-body" in out and "dtheta_deg=+90.0" in out
+    bias = json.loads(p.read_text(encoding="utf-8"))["bias"]
+    # 与文件里那个 dtheta 一致换算出来的落点，三元组自洽
+    assert bias["dtheta_deg"] == 90.0
+    assert (round(bias["dx_mm"], 6), round(bias["dy_mm"], 6)) == (0.0, 55.0)
+
+
+def test_bias_body_without_dtheta_defaults_to_zero_when_the_file_has_none(tmp_path, capsys):
+    """文件里也没有 dtheta（未测）时按 0 换算，同样要说出来。"""
+    rc = verify_vision.main([PHOTO, "--bias-body", "0,55", "--calib", _calib_path(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "!!" in out and "dtheta_deg=+0.0" in out
+    bias = json.loads((tmp_path / "car_calib.json").read_text(encoding="utf-8"))["bias"]
+    assert bias["dtheta_deg"] == 0.0
+    assert (round(bias["dx_mm"], 6), round(bias["dy_mm"], 6)) == (-55.0, 0.0)
 
 
 def test_bias_body_and_bias_dx_are_mutually_exclusive(tmp_path, capsys):
@@ -837,13 +922,14 @@ def test_bias_body_and_bias_dx_are_mutually_exclusive(tmp_path, capsys):
 
 def test_bias_body_and_dtheta_only_is_enough(tmp_path, capsys):
     """只给 --bias-body（两项一起）就够了，dtheta=+90 时车左 120 → dx=120, dy=−30。"""
+    # dtheta=+90：车头→码 +X、车左→码 +Y，所以 (前 30, 左 120) → (30, 120)
     rc = verify_vision.main([PHOTO, "--bias-body", "30,120", "--bias-dtheta", "90",
                              "--calib", _calib_path(tmp_path)])
     capsys.readouterr()
     assert rc == 0
     bias = json.loads((tmp_path / "car_calib.json").read_text(encoding="utf-8"))["bias"]
-    assert bias["dx_mm"] == pytest.approx(120.0, abs=1e-9)
-    assert bias["dy_mm"] == pytest.approx(-30.0, abs=1e-9)
+    assert bias["dx_mm"] == pytest.approx(30.0, abs=1e-9)
+    assert bias["dy_mm"] == pytest.approx(120.0, abs=1e-9)
     assert bias["dtheta_deg"] == 90.0
 
 

@@ -505,7 +505,9 @@ def test_body_bias_is_expressed_in_the_marker_frame():
     这条同时是 **I1 的人肉防线**：A1 的人若用卷尺量到"车体中心在码的左边 55 mm"，
     却按车体系填成 `dy_mm = 55`，代码会把它当前后偏置转 90° 用掉 —— 每条实验的
     x 和 y 都带 ~55 mm 的系统偏差且无人报错。本车当前贴法下（ID29 规范 +Y →
-    图像左、规范 +X → 图像上）正确的填法是 `dx_mm ≈ ±b, dy_mm ≈ 0, dtheta_deg ≈ ±90°`。
+    图像左、规范 +X → 图像上）正确的填法是 `dx_mm ≈ 0, dy_mm ≈ ±b, dtheta_deg ≈ ±90°`
+    （车**前** f 才是 `dx_mm ≈ ±f, dy_mm ≈ 0`；这两行曾经写反过，见 field.py 的 R35 段）。
+    操作者不必手填：A1 用 `verify_vision.py --bias-body FWD,LEFT`，换算由代码做。
     """
     ff = _identity_ff()
     t_cam = np.float64([10.0, -20.0, 500.0])
