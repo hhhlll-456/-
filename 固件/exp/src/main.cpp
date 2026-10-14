@@ -256,6 +256,32 @@ void applyRamp() {
 // 错峰抬升窗口的总时长：最后一个轮子放行 + 它自己的 kick 结束。
 static uint32_t rampSpanMs() { return staggerDelayMs(3) + KICK_MS; }
 
+// ---------------- 链路安全：失联停车 ----------------
+// RUN 自带时长超时，但 M 没有超时：链路断了（WiFi 掉线 / client 被断开）时开环输出
+// 会一直跑。所以只要电机还在输出、而链路已丢失 >CLIENT_LOST_STOP_MS（500 ms 宽限，
+// 容忍瞬时抖动）就强制停车。
+// 注意：必须在 loop 最前面调用（WiFi 断线的 early-return 之前）—— WiFi 掉线时 loop
+// 会提前 return，RUN 的到时检查根本走不到。
+static const uint32_t CLIENT_LOST_STOP_MS = 500;
+static uint32_t client_lost_t0_ms = 0;      // 失联开始时刻；0 = 当前链路正常
+
+static bool motorsActive() {
+  for (int i = 0; i < 4; i++) if (lastPwm[i] != 0) return true;
+  return false;
+}
+
+void updateLinkSafety() {
+  bool link_ok = (WiFi.status() == WL_CONNECTED) && client && client.connected();
+  if (link_ok || !motorsActive()) { client_lost_t0_ms = 0; return; }   // 链路好 / 没在输出：不计时
+  if (client_lost_t0_ms == 0) client_lost_t0_ms = millis();
+  if ((uint32_t)(millis() - client_lost_t0_ms) < CLIENT_LOST_STOP_MS) return;
+  Serial.println("[link] client lost >500ms while motors active: stop");
+  running = false;
+  ramp_active = false;
+  stopAll();
+  client_lost_t0_ms = 0;    // 已停；若之后仍失联，电机已是 0，不再重复触发
+}
+
 // ---------------- 输出 ----------------
 // （sendLine 定义移到了 run 环形缓冲之后：它现在走 ring + 非阻塞 flush）
 
@@ -318,6 +344,11 @@ static bool runPushLine(const char* s, size_t len) {
   return true;
 }
 
+// ---------------- TX 停摆看门狗（R62 防死兜底） ----------------
+// 时间戳在 txSendNonBlocking 真正写出字节时刷新；判定逻辑见 checkTxStall。
+static const uint32_t TX_STALL_MS = 2000;   // 连续 >2s 一个字节都没发出去 ⇒ 僵尸
+static uint32_t tx_last_ok_ms = 0;          // 最近一次 send() 真正写出字节的 millis()
+
 // 非阻塞发送：把数据尽量推给 TCP，满了立刻返回 0，绝不阻塞 loop。
 // （WiFiClient::write 是 select(1s)×10 的阻塞实现；send(MSG_DONTWAIT) 不会被它冻住。）
 static size_t txSendNonBlocking(const uint8_t* p, size_t n) {
@@ -325,6 +356,7 @@ static size_t txSendNonBlocking(const uint8_t* p, size_t n) {
   int fd = client.fd();
   if (fd < 0) return 0;
   int w = send(fd, p, n, MSG_DONTWAIT);
+  if (w > 0) tx_last_ok_ms = millis();   // 只有真的写出字节才算"TX 还活着"
   return (w > 0) ? (size_t)w : 0;
 }
 
@@ -351,6 +383,27 @@ void flushRunBuf() {
       run_dropped = 0;
     }
   }
+}
+
+// TX 停摆看门狗（每轮 loop 在 flushRunBuf 之后调用）——R62 的防死兜底：
+// 背景：这条 socket 会进入「TCP 层连着、send() 已不成功」的僵尸态（射频层正常；
+// 停读/接收窗口关死等场景实测可确定复现）。WiFiClient::connected() 只探测 RX
+// （recv(fd,&dummy,0)），完全不看 TX —— 僵尸态下它仍返回 true，于是：
+//   1) flushRunBuf 反复尝试、一个字节都发不出去 → 环被新样本填满，DONE/控制行一起被丢；
+//   2) 接受路径 `if (!client.connected())` 永不成立 → 新连接永不被 accept（堵死到复位）。
+// 兜底：环里有未发出的数据、且连续 >TX_STALL_MS 一个字节都没成功发出去 ⇒ 判僵尸，
+// client.stop()（把接受路径踢回可 accept 状态）+ 清环 + 停车。
+// 正常 100 Hz 流式（健康 socket）每批都发得出去，时间戳一直新鲜，绝不会误触发。
+void checkTxStall() {
+  if (run_head == run_tail) { tx_last_ok_ms = millis(); return; }   // 环空：没有可判停摆的量
+  if ((uint32_t)(millis() - tx_last_ok_ms) <= TX_STALL_MS) return;  // 2s 内还有字节出去
+  Serial.printf("[tx] stall >2s: drop zombie client, ring cleared (pending=%u B)\n",
+                (unsigned)(run_head - run_tail));
+  client.stop();
+  resetRunBuf();
+  running = false;
+  ramp_active = false;
+  stopAll();      // 停车：TX 死掉期间 PC 已看不到遥测，而 M 没有超时，绝不能继续开环输出
 }
 
 // 所有出站文本统一走 run 环形缓冲 + 非阻塞 flush：
@@ -537,6 +590,9 @@ void loop() {
   ArduinoOTA.handle();
   imuPump();
 
+  // 失联停车：先于 WiFi 断线的 early-return（否则 RUN 的到时检查走不到）。
+  updateLinkSafety();
+
   // 错峰抬升窗口：每次迭代重算四轮输出；最后一轮放行且它的 kick 到时后，
   // 收敛到目标值并关闭窗口（此后轮子保持目标 PWM，不再重算）。
   if (ramp_active) {
@@ -566,9 +622,11 @@ void loop() {
 
   // TCP 客户端
   if (!client || !client.connected()) {
+    client.stop();             // 先显式释放旧 socket 的 fd（含僵尸），再让 available() 覆盖
     client = server.available();
     if (client) {
       client.setNoDelay(true);   // 关 Nagle：否则 100Hz 小包会被 delayed-ACK 攒成突发、延迟数秒
+      resetRunBuf();             // 旧会话残留的字节已无人接收（僵尸期堆的），别混进新会话
       Serial.printf("TCP client %s\n", client.remoteIP().toString().c_str());
     }
   }
@@ -580,6 +638,7 @@ void loop() {
   }
 
   flushRunBuf();   // 周期性非阻塞 flush：把 ring 里未发出的字节（含控制行）继续推出去
+  checkTxStall();  // TX 停摆看门狗：僵尸 socket 主动踢掉（R62 防死兜底）
 
   // 100 Hz 采样
   uint32_t now = micros();

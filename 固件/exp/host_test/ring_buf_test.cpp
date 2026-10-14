@@ -2,10 +2,12 @@
 // 目的：烧录前先证明「回绕不覆盖未发数据」「三个复位点必须两个游标一起清零」，并演示
 // 不对称复位（只清一个游标）的真实后果 —— **覆盖未发数据**（不是"判满、静默丢弃"）。
 //
-// 【这是拷贝，不是共享代码】下面标注"拷贝自 main.cpp"的 3 个函数 + 4 个变量必须与
-// main.cpp 的环形缓冲逻辑逐字一致（只允许两处替换：CAP 换成小值、client/send 换成假 socket）。
-// 改了 main.cpp 的环形缓冲（resetRunBuf / runPushLine / flushRunBuf），必须同步改这里，
-// 否则这条锁会腐烂成"永远绿"的假锁 —— 变异自检（run.sh 第 2 步）只兜底不复位一处。
+// 【这是拷贝，不是共享代码】下面标注"拷贝自 main.cpp"的 4 个函数 + 相关变量必须与
+// main.cpp 的逻辑逐字一致（只允许两类替换：CAP 换成小值、client/send/millis 换成假依赖）。
+// 拷贝块 1：环形缓冲（resetRunBuf / runPushLine / flushRunBuf）；
+// 拷贝块 2：TX 停摆看门狗（checkTxStall，R62 —— "环里有积压且 >2s 没发出一个字节 = 僵尸"）。
+// 改了 main.cpp 的这两块，必须同步改这里，否则这条锁会腐烂成"永远绿"的假锁 ——
+// 变异自检（run.sh 第 2 步）只兜底不复位一处。
 //
 // 为什么 CAP 取 40（真实是 32768）：让"回绕"和"缓冲满"在几十行内反复发生，测试才有杠杆。
 // 一行 8 B × 一批 5 行 = 40 B 恰好等于 CAP —— 顺便锁住"一整批必须能整批放下"这个边界。
@@ -46,6 +48,12 @@ static bool runPushLine(const char* s, size_t len) {
 // —— 假 socket：等价于 main.cpp 的 txSendNonBlocking（send(MSG_DONTWAIT)）——
 // 真实现"能写就写一部分、写不动立刻返回 0"；这里用"每次 flushRunBuf 给一份字节额度"复现：
 // 额度内尽量写、用完即返回 0（模拟 socket TX 满）。写出去的字节追加到 wire（TCP 是字节流）。
+// 与 main.cpp 相同：只有真的写出字节（w>0）才刷新看门狗时间戳（见下一块拷贝）。
+static const uint32_t TX_STALL_MS = 2000;            // 拷贝自 main.cpp（看门狗阈值）
+static uint32_t tx_last_ok_ms = 0;                   // 拷贝自 main.cpp（最近成功写出字节的时刻）
+static uint32_t fake_now_ms = 0;                     // 主机侧假时钟（替代 millis()）
+static uint32_t fakeMillis() { return fake_now_ms; }
+
 static bool        fake_connected    = true;         // 等价 client.connected()
 static long        fake_budget_cap   = 1L << 30;     // 每次 flush 的可用额度（等价"总能写"）
 static long        fake_budget       = 0;
@@ -62,6 +70,7 @@ static size_t fakeSendNonBlocking(const uint8_t* p, size_t n) {
     fake_budget -= (long)w;
     wire.append((const char*)p, w);
   }
+  if (w > 0) tx_last_ok_ms = fakeMillis();           // main.cpp: 只有真写出字节才算 TX 活着
   return w;
 }
 
@@ -84,6 +93,28 @@ void flushRunBuf() {
     run_pending = 0;
     if (run_dropped) { dropped_reported += run_dropped; run_dropped = 0; }   // main.cpp 此处 printf 上报
   }
+}
+// ===== 拷贝自 main.cpp 的 TX 停摆看门狗（checkTxStall，R62）=====
+// 触发条件与 main.cpp 逐字同构；只把依赖换成假对象：
+//   millis() → fakeMillis()      Serial.printf → 无
+//   client.stop() → fakeClientStop()   stopAll() → fakeStopAll()
+//   running / ramp_active → fake_running / fake_ramp_active
+static bool fake_client_stopped = false;   // client.stop() 的代理：停掉后 connected() 即 false
+static int  fake_watchdog_fires = 0;       // 记录触发次数
+static bool fake_running        = false;
+static bool fake_ramp_active    = false;
+
+static void fakeClientStop() { fake_client_stopped = true; fake_watchdog_fires++; }
+static void fakeStopAll()    {}
+
+void checkTxStall() {
+  if (run_head == run_tail) { tx_last_ok_ms = fakeMillis(); return; }   // 环空：不判停摆
+  if ((uint32_t)(fakeMillis() - tx_last_ok_ms) <= TX_STALL_MS) return;  // 2s 内还有字节出去
+  fakeClientStop();      // main.cpp: Serial.printf(...) + client.stop()
+  resetRunBuf();
+  fake_running = false;
+  fake_ramp_active = false;
+  fakeStopAll();
 }
 // ===== 拷贝结束（以下为测试脚手架）=====
 
@@ -197,6 +228,54 @@ int main() {
   check(run_pending == 0, "全部发完后 run_pending 归零");
   check(calls == 10, "40 字节 / 每次 4 字节 = 正好 10 次 flushRunBuf 才发干净");
   check(dropped_reported == 0, "部分写不会误判成缓冲满");
+
+  // ---- T7 TX 停摆看门狗（R62）：健康流式不误触；停摆 >2 s 判僵尸 → stop + 清环 + 停车 ----
+  printf("T7 TX 停摆看门狗（checkTxStall）：健康不误触 / 停摆 >2s 判僵尸\n");
+  resetRunBuf(); wire.clear();
+  fake_connected = true; fake_budget_cap = 16; dropped_reported = 0;
+  fake_now_ms = 0; tx_last_ok_ms = 0; fake_watchdog_fires = 0;
+  fake_client_stopped = false; fake_running = true; fake_ramp_active = true;
+
+  // 健康但"慢"的流式：生产 8 B/50 ms，每 5 ms 一次 flush 发 ≤16 B ——
+  // 吞吐不宽裕但**持续有字节出去**，看门狗绝不能触发（跑 10 s）。
+  for (int i = 1, t = 0; t <= 10000; t += 5) {
+    fake_now_ms = (uint32_t)t;
+    if (t % 50 == 0) { pushLine(mkline(i++)); run_pending++; }
+    flushRunBuf();
+    checkTxStall();
+  }
+  check(fake_watchdog_fires == 0, "健康慢速流式 10 s：0 次误触发");
+  check(run_head == run_tail && run_pending == 0, "健康流式：每次 flush 后环都排空");
+
+  // 空闲：环里没有未发数据，时间过多久都不判停摆（时间戳被刷新）。
+  resetRunBuf(); fake_now_ms = 20000; tx_last_ok_ms = 0; fake_watchdog_fires = 0;
+  for (int t = 20000; t <= 620000; t += 1000) { fake_now_ms = (uint32_t)t; checkTxStall(); }
+  check(fake_watchdog_fires == 0, "空闲 10 分钟：0 次误触发（无积压不判停摆）");
+
+  // 僵尸停摆：连接仍"在线"（fake_connected=true）但一个字节都写不出去 —— 正是 R62。
+  fake_budget_cap = 0; fake_watchdog_fires = 0; fake_client_stopped = false;
+  int last_ok_ms = (int)fake_now_ms;            // 此刻 TX 还是好的（时间戳新鲜）
+  int fired_at = -1;
+  for (int k = 0; k <= 5000; k += 50) {
+    fake_now_ms = (uint32_t)(last_ok_ms + k);
+    pushLine(mkline(900 + k / 50)); run_pending++;
+    flushRunBuf();                              // budget 0：一个字节也发不出去
+    checkTxStall();
+    if (k == 2000) check(fake_watchdog_fires == 0, "停摆满 2.000 s：边界未过，尚未触发");
+    if (fake_watchdog_fires) { fired_at = k; break; }
+  }
+  check(fired_at == 2050, "停摆后第一个检测点（2.05 s）触发 —— 2 s 阈值边界正确");
+  check(fake_client_stopped, "触发时调用了 client.stop()（僵尸被踢回可 accept 状态）");
+  check(run_head == 0 && run_tail == 0 && run_pending == 0, "触发时清环（resetRunBuf）");
+  check(!fake_running && !fake_ramp_active, "触发时停车（running / ramp_active 清零）");
+
+  // 踢掉僵尸后：新会话恢复发送，看门狗不再触发。
+  fake_connected = true; fake_budget_cap = 1L << 30;
+  fake_watchdog_fires = 0; wire.clear();
+  pushLine(mkline(7777)); run_pending++;
+  flushRunBuf();
+  check(wire.find("L007777") != std::string::npos, "踢掉僵尸后新会话恢复发送");
+  check(tx_last_ok_ms == fake_now_ms, "恢复发送后看门狗时间戳被刷新");
 
   printf("\n%s (%d failure(s))\n", fails ? "FAILED" : "ALL PASS", fails);
   return fails ? 1 : 0;
