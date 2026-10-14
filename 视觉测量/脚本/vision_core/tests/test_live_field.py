@@ -120,9 +120,10 @@ def _run_headless(monkeypatch, frames, argv_extra=(), drop_after=None,
     # 冷却在下面单独有用例覆盖；这里关掉，好把"变化才打"的规则单独验清楚。
     monkeypatch.setattr(live_field, "TERMINAL_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(live_field, "_has_display", lambda: True)
-    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
-    monkeypatch.setattr(cv2, "resizeWindow", lambda *a, **k: None)
-    monkeypatch.setattr(cv2, "moveWindow", lambda *a, **k: None)
+    # **GUI 全 stub**（含 namedWindow）：否则在操作者的桌面上真会弹出一个窗口，
+    # 而且 destroyAllWindows 被 stub 掉之后它会一直留在屏幕上。
+    for name in ("namedWindow", "resizeWindow", "moveWindow", "destroyAllWindows"):
+        monkeypatch.setattr(cv2, name, lambda *a, **k: None)
     if raiser is not None:
         def boom(*_a, **_k):
             raise cv2.error(raiser)
@@ -640,7 +641,8 @@ def test_help_runs_and_documents_the_keys_and_exit_codes(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
     for token in ("--once", "--frames", "--scale", "--snapshot-dir",
-                  "ESC", "存快照", "退出码", "4 = 相机打不开"):
+                  "ESC", "存快照", "退出码", "4 = 相机打不开",
+                  "没有显示环境"):
         assert token in out, token
 
 
@@ -926,7 +928,11 @@ def test_headless_modes_do_not_need_a_display(monkeypatch, capsys):
 
 @pytest.mark.parametrize("raiser_name", ["namedWindow", "imshow"])
 def test_a_window_call_that_raises_is_one_line_not_a_traceback(monkeypatch, capsys, raiser_name):
-    """`cv2.namedWindow`/`imshow` 抛 `cv2.error` 时不能穿出 `main()`（远端 shell 最常见的坑）。"""
+    """`cv2.namedWindow`/`imshow` 抛 `cv2.error` 时不能穿出 `main()`（远端 shell 最常见的坑）。
+
+    两个点都参数化：`namedWindow` 是"开不起来"，`imshow` 是"开起来了但显示这一帧失败"，
+    两者都还没有任何码被解算过，所以都该走显示提示。
+    """
     monkeypatch.setenv("DISPLAY", ":0")           # 过了环境检查，逼出 cv2.error 那条路
     rc, _cap = _run_headless(
         monkeypatch, [_fixture_image()], [],
@@ -937,6 +943,51 @@ def test_a_window_call_that_raises_is_one_line_not_a_traceback(monkeypatch, caps
     assert rc == live_field.EXIT_USAGE != 0
     assert "--once" in captured.out and "--frames" in captured.out
     assert "Traceback" not in captured.out and "Traceback" not in captured.err
+
+
+def test_a_snapshot_failure_is_not_disguised_as_a_display_problem(monkeypatch, capsys):
+    """窗口已经开起来之后的 `cv2.error` **不许**被贴上"没有显示环境"的标签。
+
+    `cv2.error` 的兜底是为开窗口准备的；它的作用域一旦盖住 `detect_markers` /
+    `solve_image` / `save_snapshot`，写盘失败就会被说成"没有显示环境"、给出
+    "加 `--once`"这种帮不上忙的补救、并以 `EXIT_USAGE` 结束整个实时会话。
+    真实触发路径：`cv2.imwrite` 对不认识的扩展名是**抛** `cv2.error` 而不是返回 False
+    （本机实测 `imwrite("x.zzz")` 抛 `could not find a writer`）。
+
+    这里注入 `save_snapshot` 抛 `cv2.error`：断言**不是**显示那条文案、**不是**退出码 2，
+    而且会话还活着（预览继续跑，按一次 `s` 失败不该把实时窗口带走）。
+    """
+    img = _fixture_image()
+
+    def boom(_frame, _out_dir):
+        raise cv2.error("could not find a writer for the specified extension")
+
+    monkeypatch.setattr(live_field, "save_snapshot", boom)
+    rc, shown, _cap = _drive_window(monkeypatch, [img], keys=[ord("s"), ord("s"), ord("q")])
+    out = capsys.readouterr().out
+
+    assert rc == live_field.EXIT_OK != live_field.EXIT_USAGE
+    assert "开不了图形窗口" not in out and "没有显示环境" not in out
+    assert "快照存不了" in out and "could not find a writer" in out
+    assert len(shown) == 3, "按 s 失败不该结束会话：后面的帧还要继续显示"
+
+
+def test_a_cv2_error_outside_the_window_calls_is_not_reported_as_a_display_problem(monkeypatch, capsys):
+    """兜底层的**类型**边界：循环里的 `cv2.error` 不许被当成"没有显示环境"。
+
+    `_window_call` 只包住 `namedWindow`/`resizeWindow`/`moveWindow`/`imshow`/`waitKey`，
+    所以 `draw_overlay` 这类非窗口环节抛的 `cv2.error` 原样穿出 —— 那是真 bug，
+    贴一个"加 `--once`"的标签既误导、退出码也错。
+    """
+
+    def boom(*_a, **_k):
+        raise cv2.error("boom inside the overlay stage")
+
+    monkeypatch.setattr(live_field, "draw_overlay", boom)
+    with pytest.raises(cv2.error):
+        live_field.main([])
+    out = capsys.readouterr().out
+    assert "开不了图形窗口" not in out and "没有显示环境" not in out
 
 
 def test_has_display_is_true_when_a_display_variable_is_set(monkeypatch):

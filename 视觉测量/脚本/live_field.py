@@ -24,8 +24,9 @@
 
 叠加层要画四边形/中心/边缘余量，这些来自 `detect_markers`；判定来自 `solve_image`，
 它内部又调了一次 `detect_markers`。同一帧上两次检测是**确定性**的同一结果（实测 17.7 ms/帧），
-换来的是"叠加层与判定用的是同一次检测"这条可验证的性质 ——
-`test_the_overlay_uses_exactly_the_poses_the_verdict_used` 把两种路线同时钉死。
+这个前提由 `test_detecting_markers_twice_on_one_frame_gives_the_same_poses` 钉住
+（它只证"检测是确定性的"；`run_window` 把这一份位姿**接到**叠加层上是另一条接线，
+由 `test_run_window_snapshots_a_frame_that_solve_image_can_still_read` 那几条钉住）。
 省掉那 17 ms 的唯一办法是让 `solve_image` 接收位姿，那要改 `verify_vision.py`，本任务禁止。
 
 ## 叠加内容（从下往上）
@@ -782,11 +783,11 @@ def _display_problem(detail: str = "") -> str:
     **不抛异常、只是什么都不显示**，`waitKey` 永远返回 -1 —— 脚本于是无声无息地空转，
     比抛 traceback 更难查。所以先看环境变量，OpenCV 那边再兜一层 `cv2.error`。
     """
-    tail = f"原始错误：{detail}" if detail else ""
+    tail = f"  原始错误：{detail}" if detail else ""
     return (
         "开不了图形窗口：当前没有显示环境（DISPLAY / WAYLAND_DISPLAY 都是空的）。\n"
         "  无显示的机器上请改用无窗口模式：加 --once（只看一帧）或 --frames N（解 N 帧）。\n"
-        f"  {tail}"
+        + tail
     )
 
 
@@ -801,18 +802,45 @@ def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+class _DisplayUnavailable(RuntimeError):
+    """窗口相关的 `cv2.*` 调用失败了（没有显示环境 / 无 GUI 编译 / X 连接断了）。"""
+
+
+def _window_call(func, *args, **kwargs):
+    """跑一个**窗口相关**的 `cv2` 调用；失败就换成 `_DisplayUnavailable` 再抛。
+
+    ## 为什么要这一层，而不是"小心地把 try 缩到窗口调用那里"
+
+    上一版的 `except cv2.error` 从 `namedWindow` 一路包到循环里的 `detect_markers` /
+    `solve_image` / `save_snapshot`。那三个环节与显示毫无关系，它们抛的 `cv2.error`
+    却被贴上"开不了图形窗口：当前没有显示环境"的标签、给出"加 `--once`"这种帮不上忙
+    的补救，并以 `EXIT_USAGE` 结束整个实时会话 —— **误导性诊断** + 错的退出码。
+    真实触发路径：`cv2.imwrite` 对不认识的扩展名是**抛** `cv2.error` 而不是返回 False
+    （本机实测 `imwrite("x.zzz")` 抛 `could not find a writer`），磁盘满/权限不足同理。
+
+    用**异常类型**而不是 try 的作用域来划界，就不会出现"以后往循环里加一行代码，
+    它又被贴上显示问题的标签"这种事：能抛 `_DisplayUnavailable` 的只有那几个窗口调用。
+    """
+    try:
+        return func(*args, **kwargs)
+    except cv2.error as exc:
+        raise _DisplayUnavailable(str(exc).splitlines()[0] if str(exc) else "") from exc
+
+
 def run_window(cap, calib, args, bias_measured: bool) -> int:
     """实时窗口主循环。返回 0（正常退出）—— 运行中解不出来不是脚本的错，是取景的账。
 
-    开不了窗口时**不抛 traceback**：打一段说清"没有显示环境、请加 `--once` / `--frames N`"
-    的话，返回 `EXIT_USAGE`。窗口相关的 `cv2.*` 调用全在 `try` 里 ——
-    少了这一层，`namedWindow`/`imshow` 在无显示/无 GUI 编译的 OpenCV 上抛出的
-    `cv2.error` 会直接穿出 `main()`，在远端 shell 里就是一屏红字。
+    窗口打不开时**不抛 traceback**：打一段说清"没有显示环境、请加 `--once` / `--frames N`"
+    的话，返回 `EXIT_USAGE`。那一层兜底只包**窗口调用**（`_window_call`）——
+    少了它，无显示/无 GUI 编译的 OpenCV 上 `namedWindow`/`imshow` 抛的 `cv2.error`
+    会直接穿出 `main()`，在远端 shell 里就是一屏红字；而它一旦包得过大，
+    解算/写盘失败又会被说成"没有显示环境"。见 `_window_call` 的 docstring。
     """
     try:
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, int(CAPTURE_WIDTH * args.scale), int(CAPTURE_HEIGHT * args.scale))
-        cv2.moveWindow(WINDOW_NAME, 0, 0)
+        _window_call(cv2.namedWindow, WINDOW_NAME, cv2.WINDOW_NORMAL)
+        _window_call(cv2.resizeWindow, WINDOW_NAME,
+                     int(CAPTURE_WIDTH * args.scale), int(CAPTURE_HEIGHT * args.scale))
+        _window_call(cv2.moveWindow, WINDOW_NAME, 0, 0)
         print(f"窗口已启动（DISPLAY={os.environ.get('DISPLAY', '')}）；"
               "q/ESC 退出，s 存快照，g 网格开关", flush=True)
 
@@ -851,8 +879,8 @@ def run_window(cap, calib, args, bias_measured: bool) -> int:
 
             display = cv2.resize(display_frame, None, fx=args.scale, fy=args.scale) \
                 if args.scale != 1.0 else display_frame
-            cv2.imshow(WINDOW_NAME, display)
-            key = cv2.waitKey(1) & 0xFF
+            _window_call(cv2.imshow, WINDOW_NAME, display)
+            key = _window_call(cv2.waitKey, 1) & 0xFF
             if key in (27, ord("q")):
                 break
             if key == ord("g"):
@@ -861,15 +889,18 @@ def run_window(cap, calib, args, bias_measured: bool) -> int:
                 # 存 `frame`（原帧），不是 `display_frame`（叠加后的）。
                 try:
                     print(f"快照已存：{save_snapshot(frame, args.snapshot_dir)}", flush=True)
-                except OSError as exc:
-                    print(f"快照存不了：{exc}", flush=True)
-    except cv2.error as exc:
-        print(_display_problem(str(exc).splitlines()[0] if str(exc) else ""), flush=True)
+                except (OSError, cv2.error) as exc:
+                    # 写盘失败是**按一次 s** 的事，不该把整个实时会话带走：
+                    # 磁盘满/权限不足/编码器不认识扩展名（cv2.imwrite 是抛 cv2.error，
+                    # 不是返回 False）都归这里。报一行实话，预览继续跑。
+                    print(f"快照存不了：{str(exc).splitlines()[0]}", flush=True)
+    except _DisplayUnavailable as exc:
+        print(_display_problem(str(exc)), flush=True)
         return EXIT_USAGE
     finally:
         try:
             cv2.destroyAllWindows()
-        except cv2.error:       # 窗口根本没开起来时这句也会抛；清理不该盖掉真正的错
+        except cv2.error:       # GUI 后端不可用/连接已断时这句会抛；清理不该盖掉真正的错
             pass
     return EXIT_OK
 
