@@ -22,6 +22,10 @@
  *   YAWZERO                   -> 请求 IMU 航向归零（需要 TX 有效，可选）
  *
  * 数据行： 'D <t_ms> <pwm0..3> <enc0..3> <roll> <pitch> <yaw>'
+ *          一行 = 一个样本。D 行在运行期间就分批发过来（攒够 5 行一批，约每 50 ms 一批），
+ *          运行结束时再补发不足一批的残余，然后发一行 'DONE' 作为结束标志。
+ *          所以 PC 侧"还在跑 / 跑完了 / 死了"三种状态的判据是：
+ *          持续收到 D 行 = 还在跑；收到 DONE = 跑完；D 行断了又没有 DONE = 死了。
  *
  * 硬件：FL{13,15} FR{12,14} RL{27,26} RR{25,33}
  *       编码器 A 相 FL32 FR34 RL35 RR36（单相，只能计数不能辨向）
@@ -169,9 +173,80 @@ void sendLine(const String& s) {
   if (client && client.connected()) client.println(s);
 }
 
-// 运行样本先攒在 RAM，跑完一次性发；逐条 100Hz 小包直发会被 WiFi/延迟ACK 拖到只剩约 1/3
-static char   run_buf[32768];
-static size_t run_len = 0;
+// 运行样本走 run_buf 环形缓冲，**边跑边发**：攒够 RUN_FLUSH_LINES 行就整批 flush，
+// PC 才能在 RUN 还没结束时判断"还在跑 / 跑完了 / 死了"。
+// （旧的"全攒 RAM、跑完一次性发"是为了绕开 WiFi 延迟 ACK，代价是整个运行期间 PC 收不到任何样本。）
+// 注意：延迟 ACK 那个坑靠的是"**攒批再发** + 连接时 setNoDelay(true)"，不是靠"发得晚"。
+// 本改动保留了攒批（一次 flush = 一次 client.write，约 5 行 ≈ 450 B），所以不会退化成逐行小包。
+//
+// 【批次节奏】下面的数是**按代码推出来的**，不是上机实测的 —— Task 5 Step 3 烧录时要回来核对。
+//   loop() 里 next_sample_us += 10000 → 采样 100 Hz；
+//   streamSample() 每次调用只写 **一行 = 一个样本**（一行就是一个 t_ms 的 PWM/编码器/IMU），
+//   所以攒满 5 行 = 5 个样本 = 约 50 ms 发一批，每批 5 行。
+//   ⚠ 计划接口行说"约每 50 ms 一次"，R7 又按"每行 5 个样本"折算成 250 ms 一批 ——
+//     这两个数说的不是同一件事，而且 **250 ms 在本固件里不成立**：一行就是一个样本，不是五个。
+//     真正成立的是"每约 50 ms 一批、每批 5 行"。别照 R7 的 250 ms 去推时间轴；
+//     也别因为它跟接口行的 50 ms 数值接近就当成互相印证 —— 含义不同：
+//     **50 ms 是批次周期，5 行是每批样本数，两个量独立**：周期 = 行数 × 10 ms。
+//
+// 【环形缓冲的坑】回绕时绝不能盖掉还没发出去的数据。
+//   run_head —— 已写入总字节数（绝对游标，写入位 = run_head % CAP）
+//   run_tail —— 已 flush 总字节数（绝对游标，发出位 = run_tail % CAP）
+//   两者之差就是"还没发出去的字节数"。RUN / STOP / M 换指令时必须**两个游标一起归零**：
+//   只清一个，另一个还是上一轮的值，run_head - run_tail 会以 size_t 下溢成一个巨大数，
+//   缓冲立刻被判满，之后所有样本被静默丢弃 —— 这是本改动最容易埋的雷。
+#define RUN_BUF_CAP     32768
+#define RUN_FLUSH_LINES 5        // 攒够几行 flush 一批（改它只改"每批几行"，周期随之线性变化）
+static char   run_buf[RUN_BUF_CAP];
+static size_t run_head = 0;      // 已写入总字节数
+static size_t run_tail = 0;      // 已 flush 总字节数
+static int    run_pending = 0;   // 已写入、还没 flush 的整行数（flush 的触发条件）
+static int    run_dropped = 0;   // 缓冲满被丢弃的行数；丢弃不静默，flush 时上报 Serial
+
+// 清空本次运行的环形缓冲。三个复位点（RUN / STOP / M）共用，必须整体调用。
+void resetRunBuf() { run_head = 0; run_tail = 0; run_pending = 0; run_dropped = 0; }
+
+// 整行入环形缓冲；返回 false = 缓冲满、本行被丢弃。
+// 满了丢**新**行而不是盖**旧**行：开头的数据比结尾的值钱（起动 kick、初始编码器零位都在开头）。
+static bool runPushLine(const char* s, size_t len) {
+  size_t need = len + 1;                                   // 含行尾 '\n'
+  if (need > RUN_BUF_CAP) return false;
+  if (RUN_BUF_CAP - (run_head - run_tail) < need) { run_dropped++; return false; }
+  size_t pos   = run_head % RUN_BUF_CAP;
+  size_t first = RUN_BUF_CAP - pos;                 // 回绕前还能连着放多少字节
+  if (first > len) first = len;
+  memcpy(run_buf + pos, s, first);                  // 前半段（不回绕）
+  if (len > first) memcpy(run_buf, s + first, len - first);   // 后半段（回绕到 0）
+  run_buf[(pos + len) % RUN_BUF_CAP] = '\n';
+  run_head += need;
+  return true;
+}
+
+// 把还没 flush 的字节全部推给 TCP。只推进真正写出去的部分（client.write 可能只写进去一部分，
+// socket TX 满时返回 0）；剩下的留到下次 flush 接着发 —— TCP 是字节流，跨批次拼接后仍能还原整行。
+void flushRunBuf() {
+  size_t pend = run_head - run_tail;
+  if (client && client.connected() && pend) {
+    size_t off = 0;
+    while (off < pend) {
+      size_t pos   = (run_tail + off) % RUN_BUF_CAP;
+      size_t chunk = RUN_BUF_CAP - pos;
+      if (chunk > pend - off) chunk = pend - off;
+      size_t w = client.write((const uint8_t*)(run_buf + pos), chunk);
+      if (w == 0) break;
+      off += w;
+    }
+    client.flush();
+    run_tail += off;
+  }
+  if (run_tail == run_head) {               // 全部发出去了才清计数（半发出去时保留，下次接着试）
+    run_pending = 0;
+    if (run_dropped) {
+      Serial.printf("[run_buf] 缓冲满，丢弃 %d 行 (cap=%u B)\n", run_dropped, (unsigned)RUN_BUF_CAP);
+      run_dropped = 0;
+    }
+  }
+}
 
 // tag: "D"=实验运行样本(时间=相对RUN起点)  "I"=空闲样本(时间=millis)
 void streamSample(const char* tag, uint32_t t_ms) {
@@ -183,27 +258,15 @@ void streamSample(const char* tag, uint32_t t_ms) {
            e[0], e[1], e[2], e[3],
            imu_roll, imu_pitch, imu_yaw);
   if (n <= 0) return;
+  if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;     // snprintf 截断保护：只按实际写入的长度取
   if (tag[0] == 'D') {
-    if (run_len + (size_t)n + 1 < sizeof(run_buf)) {
-      memcpy(run_buf + run_len, buf, n);
-      run_len += n;
-      run_buf[run_len++] = '\n';
+    if (runPushLine(buf, (size_t)n)) {
+      run_pending++;
+      if (run_pending >= RUN_FLUSH_LINES) flushRunBuf();    // 攒够一批就发，不等 DONE
     }
   } else {
     sendLine(buf);
   }
-}
-void flushRunBuf() {
-  if (client && client.connected() && run_len) {
-    size_t off = 0;
-    while (off < run_len) {
-      size_t w = client.write((const uint8_t*)(run_buf + off), run_len - off);
-      if (w == 0) break;
-      off += w;
-    }
-    client.flush();
-  }
-  run_len = 0;
 }
 uint32_t runElapsedMs() { return (uint32_t)((micros() - run_t0_us) / 1000); }
 
@@ -223,7 +286,7 @@ void handleLine(String line) {
     sendLine("PING|ID|CHIP|M f f f f|STOP|ZENC|RUN vx vy om ms|STREAM 0/1|SNIFF|IMU <rxpin> [baud]");
     return;
   }
-  if (line.equalsIgnoreCase("STOP")) { running = false; kicking = false; run_len = 0; stopAll(); sendLine("OK STOP"); return; }
+  if (line.equalsIgnoreCase("STOP")) { running = false; kicking = false; resetRunBuf(); stopAll(); sendLine("OK STOP"); return; }
   if (line.equalsIgnoreCase("YAWZERO")) { sendLine("ERR TX pin unavailable (RX-only); zero yaw in software"); return; }
   if (line.equalsIgnoreCase("ZENC")) { zeroEncoders(); sendLine("OK ZENC"); return; }
   if (line.startsWith("IMU ")) {
@@ -254,7 +317,7 @@ void handleLine(String line) {
   if (line.startsWith("M ")) {
     int d[4] = {0, 0, 0, 0};
     if (sscanf(line.c_str(), "M %d %d %d %d", &d[0], &d[1], &d[2], &d[3]) == 4) {
-      running = false; kicking = false; run_len = 0;
+      running = false; kicking = false; resetRunBuf();
       for (int i = 0; i < 4; i++) setMotor(i, d[i]);
       sendLine("OK M");
     } else sendLine("ERR need 4 ints");
@@ -272,7 +335,7 @@ void handleLine(String line) {
     float vx = 0, vy = 0, om = 0; long ms = 0;
     if (sscanf(line.c_str(), "RUN %f %f %f %ld", &vx, &vy, &om, &ms) == 4 && ms > 0) {
       zeroEncoders();
-      run_len = 0;
+      resetRunBuf();        // 环形缓冲的读写游标必须一起归零（run_pending 也在这里清）
       bodyToPWM(vx, vy, om, run_wheel_pwm);
       // 起步 kick：每个转动轮的幅值至少抬到 KICK_DUTY，方向与正常一致；停转轮保持 0
       for (int i = 0; i < 4; i++) {
@@ -389,7 +452,7 @@ void loop() {
         kicking = false;
         stopAll();
         streamSample("D", runElapsedMs());   // 停车后的最后一个样本，仍用相对时间
-        flushRunBuf();                        // 一次性把本次运行样本发出去
+        flushRunBuf();                        // 把末尾不足一批的残余样本发出去（流式之后这里只清尾账）
         sendLine("DONE");
       }
     } else if (stream_idle) {
