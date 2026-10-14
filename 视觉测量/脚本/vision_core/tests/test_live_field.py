@@ -20,6 +20,7 @@
 import ast
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -113,6 +114,11 @@ def _run_headless(monkeypatch, frames, argv_extra=(), drop_after=None,
 
     `argv_extra` 为空时走的是**窗口**主循环（`--once`/`--frames` 才走无窗口那条），
     所以 `raiser`/`raiser_name` 用来在某个 `cv2` 窗口调用上注入 `cv2.error`。
+
+    **退出只能靠注入 raiser 或喂空 frames**：本夹具把 `cv2.waitKey` 钉成恒 −1
+    （`FakeCap` 的帧用完之后会无限重复最后一帧），所以 `argv_extra=()` 且不注入
+    raiser/drop_after 的用例会**永远退不出来**，在 pytest 里挂成死循环。要走窗口主
+    循环请用 `_drive_window`（它有按键序列、`drop_after` 与 `interrupt_after`）。
     """
     cap = FakeCap(frames, drop_after=drop_after)
     monkeypatch.setattr(live_field, "open_camera", lambda *a, **k: cap)
@@ -815,16 +821,26 @@ def test_a_subprocess_run_of_once_needs_no_display(tmp_path):
 # --- 窗口模式的接线（`run_window` 的真实顺序）-------------------------------------
 
 
-def _drive_window(monkeypatch, frames, keys, argv_extra=(), raiser=None, raiser_name=""):
+def _drive_window(monkeypatch, frames, keys, argv_extra=(), raiser=None, raiser_name="",
+                  drop_after=None, interrupt_after=None, swallow_interrupt=False):
     """用假 GUI + 假相机跑一次真正的 `run_window`，返回 `(rc, 显示过的图, cap)`。
 
     这条路径**不 stub 掉** `detect_markers` / `solve_image` / `draw_overlay` / `save_snapshot`
     —— 要验的恰恰是它们**串在一起**的顺序（复核的 Critical 1 就藏在这段接线里：
     叠加就地改写了 `frame`，于是 `s` 存下来的是画过框的图）。
     `keys` 是逐帧喂给 `waitKey` 的按键序列；喂完 `q` 收尾。
+
+    `drop_after=N` 让相机在第 N 帧之后读不出来（中途掉线），`interrupt_after=N` 让第
+    N 次 `waitKey` 抛 `KeyboardInterrupt`（操作者按 Ctrl-C）。两者都不是"可变异检测的
+    覆盖"，而是让这两条会话终止路径**跑得到**的前向性夹具。
+
+    `swallow_interrupt=True` 把穿出 `main()` 的 `KeyboardInterrupt` 收下来（rc 记成
+    None）：不这么做的话，Ctrl-C 那条用例在修复被撤掉时会把**整个 pytest 会话**连同
+    正在跑的其它用例一起掀掉，而不是干净地红一条。
     """
-    cap = FakeCap(frames)
+    cap = FakeCap(frames, drop_after=drop_after)
     shown: list = []
+    destroyed: list = []
 
     monkeypatch.setattr(live_field, "open_camera", lambda *a, **k: cap)
     monkeypatch.setattr(live_field, "DEFAULT_SETTLE_FRAMES", 0)
@@ -833,12 +849,17 @@ def _drive_window(monkeypatch, frames, keys, argv_extra=(), raiser=None, raiser_
     monkeypatch.setattr(cv2, "namedWindow", lambda *a, **k: None)
     monkeypatch.setattr(cv2, "resizeWindow", lambda *a, **k: None)
     monkeypatch.setattr(cv2, "moveWindow", lambda *a, **k: None)
-    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda: destroyed.append(True))
     monkeypatch.setattr(cv2, "imshow", lambda _win, img: shown.append(img.copy()))
 
     pending = list(keys)
+    waited = {"n": 0}
 
     def fake_wait_key(_delay):
+        if interrupt_after is not None and waited["n"] >= interrupt_after:
+            # 与操作者按 Ctrl-C 一样：KeyboardInterrupt 从 waitKey 穿出主循环。
+            raise KeyboardInterrupt
+        waited["n"] += 1
         return pending.pop(0) if pending else ord("q")
 
     monkeypatch.setattr(cv2, "waitKey", fake_wait_key)
@@ -847,7 +868,16 @@ def _drive_window(monkeypatch, frames, keys, argv_extra=(), raiser=None, raiser_
             raise cv2.error(raiser)
 
         monkeypatch.setattr(cv2, raiser_name, boom)
-    return live_field.main(list(argv_extra)), shown, cap
+    rc = None
+    if swallow_interrupt:
+        try:
+            rc = live_field.main(list(argv_extra))
+        except KeyboardInterrupt:
+            rc = None                      # 修复被撤掉时的真实形态，由用例断言出来
+    else:
+        rc = live_field.main(list(argv_extra))
+    assert destroyed, "无论怎么退出，destroyAllWindows 都必须跑（窗口/相机别留在操作者桌面上）"
+    return rc, shown, cap
 
 
 def test_run_window_snapshots_a_frame_that_solve_image_can_still_read(monkeypatch, tmp_path, capsys):
@@ -925,14 +955,108 @@ def test_window_mode_exits_zero_once_any_frame_was_solved(monkeypatch, capsys):
     assert rc == live_field.EXIT_OK
 
 
+def _plain_doc(text: str) -> str:
+    """去掉 markdown 强调与所有空白，让"判据**整句**"能逐字比对。
+
+    文档里整句常被 `**` 打断、也被换行拆开（表格要缩进才读得下去），所以比对之前
+    先归一 —— 但**只**归一空白与强调，不归一用词，否则"整场一帧都没解出来算失败"改成
+    "也算成功"这种说反话照样能过。
+    """
+    return re.sub(r"\s+", "", text.replace("*", ""))
+
+
 def test_the_exit_code_table_in_the_docs_matches_what_the_code_does():
-    """退出码表的每一行都要能被代码兑现 —— 上一轮的 bug 正是"文档说 1、代码给 0"。"""
-    text = live_field.build_parser().format_help()
-    assert "至少有一帧 READY" in text and "整场一帧都没解出来" in text
-    assert "标定文件读不出来" in text and "连不上显示服务器" in text
-    # 模块 docstring 里那张表也要跟着改（两份不能各说各话）
-    doc = live_field.__doc__
-    assert "整场一帧都没解出来" in doc and "标定文件读不出来" in doc
+    """三处文档（模块 docstring / `--help` / `run_window.__doc__`）必须**逐字**给出判据整句。
+
+    上一版只 grep 了 5 个子串，于是三个变异全部逃逸：把"整场一帧都没解出来算失败"改成
+    "也算成功"、`run_window` 的 docstring 整段判据删掉、`--help` 的交叉指引删掉 ——
+    三次都是全绿。行为侧另有 `test_window_mode_exits_one_when_not_a_single_frame_was_ever_`
+    `_solved` 兜着，所以那不是假通过的风险；但**这条用例守的正是本轮的核心命题**：
+    文档不许说反话，而子串级的断言只守得住"提到过"，守不住"说得对"。
+    """
+    help_text = _plain_doc(live_field.build_parser().format_help())
+    module_doc = _plain_doc(live_field.__doc__)
+    window_doc = _plain_doc(live_field.run_window.__doc__)
+    three_way = (("--help", help_text), ("模块 docstring", module_doc),
+                 ("run_window docstring", window_doc))
+
+    # 窗口模式的 0/1 分界：三处都必须整句出现（删掉任何一段整句都要红）。
+    for name, text in three_way:
+        for sentence in ("整场一帧都没解出来算失败", "至少有一帧READY"):
+            assert sentence in text, f"{name} 里没有这条判据：{sentence}"
+
+    # 无窗口模式那半张表：窗口模式的 docstring 也要能说清对照，否则"刻意不同"没人看得到。
+    for name, text in three_way:
+        for sentence in ("每一帧都READY", "整场零READY"):
+            assert sentence in text, f"{name} 里没有无窗口模式的判据：{sentence}"
+
+    # 中途掉线：两种模式方向相反（窗口 0 / 无窗口 1），三处都必须写明，否则
+    # 下一个人会当笔误"统一"掉。判据本身由
+    # test_the_camera_dropping_out_mid_session_keeps_the_frames_it_already_solved 钉住。
+    for name, text in three_way:
+        assert "中途" in text and "读帧失败" in text, f"{name} 没写中途掉线怎么算"
+
+    # `--help` 必须指回模块 docstring（判据为什么两种模式不一样，写在哪里）。
+    assert "两种模式判据不同" in help_text and "run_window" in help_text
+
+    # 1 与 4 的分工：标定文件读不出来也是 1，那时相机还没开，所以"1 = 拍到了但不能用"
+    # 这句旧文案是不成立的。
+    assert "连相机都没打开" in help_text and "连相机都没打开" in module_doc
+    assert "含配置错误" in module_doc
+
+
+def test_the_camera_dropping_out_mid_session_keeps_the_frames_it_already_solved(monkeypatch, capsys):
+    """窗口模式中途掉线：解出来的帧是有效的测量 → 0；`run_headless` 同一场景 → 1。
+
+    这个差异是**刻意的**（理由见 `run_window` / `run_headless` 的 docstring）：无窗口
+    模式是有界采样（`--frames N` 就是要 N 帧），读不到就是这一轮没跑完；窗口模式是
+    长时间会话，跑了一半的测量仍然拿得走。之前它只写在"整场零 READY"那句话的尾巴上，
+    读者要自己反推 —— 而 `run_headless` 那边第一句就是"中途读帧失败 → 1"。
+    """
+    good = _fixture_image()
+    rc, shown, cap = _drive_window(monkeypatch, [good] * 4, keys=[-1, -1],
+                                   drop_after=2)          # 两帧 READY 之后相机被拔
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_OK == 0, out
+    assert "读帧失败" in out and len(shown) == 2
+    assert cap.released == 1
+
+    # 对照组：同样两帧 READY + 掉线，无窗口模式给 1（有界采样没跑完）。
+    rc_headless, _cap = _run_headless(monkeypatch, [good] * 4, ["--frames", "3"], drop_after=2)
+    assert rc_headless == live_field.EXIT_PHOTO_FAILED == 1
+
+    # 反例钉子：真的一个问题都没解出来时，窗口模式**也**是 1（别让"掉线"把这条盖掉）。
+    bad = _cover(good.copy(), COVER_BOX[20])
+    rc_zero, _shown, _cap = _drive_window(monkeypatch, [bad] * 4, keys=[-1], drop_after=1)
+    capsys.readouterr()
+    assert rc_zero == live_field.EXIT_PHOTO_FAILED == 1
+
+
+def test_ctrl_c_leaves_the_window_mode_with_one_line_and_the_usual_verdict(monkeypatch, capsys):
+    """Ctrl-C：一行提示 + **按同一判据**返回，不打 traceback，也不把相机/窗口留在原地。
+
+    之前 `KeyboardInterrupt` 直接穿出 `main()`：操作者在终端里随手 Ctrl-C 就会吃到一屏
+    红字 —— 而这个工具的出发点就是"别给操作者一屏红字"。
+    注意返回的是**判据**（有过 READY → 0 / 零 READY → 1），不是随手 `return EXIT_OK`：
+    否则"整场零 READY 却返回 0"这条假通过换个入口又回来了。
+    """
+    img = _fixture_image()
+
+    rc, shown, cap = _drive_window(monkeypatch, [img] * 4, keys=[-1, -1], interrupt_after=2,
+                                   swallow_interrupt=True)
+    out = capsys.readouterr().out
+    assert rc == live_field.EXIT_OK == 0, f"Ctrl-C 穿出了 main()（rc={rc}）：操作者会吃到一屏红字"
+    assert "Ctrl-C" in out and "KeyboardInterrupt" not in out and "Traceback" not in out
+    assert len(shown) == 3                         # 第 3 次 waitKey 才是 Ctrl-C
+    assert cap.released == 1, "Ctrl-C 不许把 /dev/video0 占住"
+
+    # 同一判据的另一半：整场零 READY 时 Ctrl-C 给 1。
+    bad = _cover(img.copy(), COVER_BOX[20])
+    rc_zero, _shown, _cap = _drive_window(monkeypatch, [bad] * 4, keys=[-1, -1],
+                                          interrupt_after=2, swallow_interrupt=True)
+    out = capsys.readouterr().out
+    assert rc_zero == live_field.EXIT_PHOTO_FAILED == 1
+    assert "Ctrl-C" in out and "Traceback" not in out
 
 
 def test_a_calib_file_that_cannot_be_read_returns_one(monkeypatch, capsys, tmp_path):
@@ -1039,6 +1163,65 @@ def test_the_display_message_does_not_claim_no_display_when_a_display_is_set(mon
     assert "连不上图形窗口" not in cold
     assert "export DISPLAY=:0" in cold or "ssh -X" in cold    # 上一轮遗留的提示一起做掉
     assert not cold.endswith("\n  ") and "\n\n" not in cold
+
+
+def test_window_mode_on_macos_reports_the_failure_instead_of_crashing_in_the_except_block(monkeypatch, capsys):
+    """darwin：`_has_display()` 恒为 True，而 `DISPLAY`/`WAYLAND_DISPLAY` 通常都没设。
+
+    之前的 bug：`_display_problem` 无条件拼 `"xdpyinfo -display " + seen`，而这里
+    `seen is None` → `TypeError: can only concatenate str (not "NoneType") to str`，
+    **发生在 `except _DisplayUnavailable` 里面** —— 于是该给的提示与退出码 2 一起被
+    顶掉，退出码变成 1、stderr 一屏 traceback。macOS 上这条路必然踩到（那里根本没有
+    `DISPLAY`），而 `_has_display` 的 docstring 明说它支持 Windows/macOS：
+    **声称了却没兑现**。
+
+    讽刺的是当时唯一钉这条分支的用例把 `sys.platform` 显式钉成了 `"linux"`。
+    """
+    monkeypatch.setattr(live_field.sys, "platform", "darwin")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    def boom(*_a, **_k):
+        raise cv2.error("The function is not implemented. Rebuild the library with GUI support")
+
+    cap = FakeCap([_fixture_image()])
+    monkeypatch.setattr(live_field, "open_camera", lambda *a, **k: cap)
+    monkeypatch.setattr(live_field, "DEFAULT_SETTLE_FRAMES", 0)
+    monkeypatch.setattr(live_field, "TERMINAL_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(cv2, "namedWindow", boom)
+    monkeypatch.setattr(cv2, "destroyAllWindows", lambda *a, **k: None)
+
+    rc = live_field.main([])
+    captured = capsys.readouterr()
+
+    assert rc == live_field.EXIT_USAGE == 2
+    assert "xdpyinfo" not in captured.out
+    assert "显示环境变量有值" not in captured.out, "这台机器上一个显示环境变量都没有，不能这么说"
+    assert "darwin" in captured.out and "--once" in captured.out
+    assert "Traceback" not in captured.out and "Traceback" not in captured.err
+    assert cap.released == 1
+
+
+def test_the_xdpyinfo_self_check_is_offered_only_for_an_x_display(monkeypatch):
+    """`xdpyinfo` 连的是 X display：纯 Wayland（`wayland-0`）时给出去必然失败。
+
+    给一条必然失败的命令比不给更糟 —— 操作者会以为显示环境本身有问题，
+    于是去折腾 X 转发，而真正的原因是 OpenCV 在纯 Wayland 会话里没有后端。
+    """
+    monkeypatch.setattr(live_field.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    wayland = live_field._display_problem("boom")
+    assert "wayland-0" in wayland                 # 还是说清了它看到了哪个变量
+    assert "xdpyinfo" not in wayland
+    assert "Wayland" in wayland
+
+    monkeypatch.setenv("DISPLAY", ":0")           # X11（`:0`）才有自查命令
+    assert "xdpyinfo -display :0" in live_field._display_problem("boom")
+    # X 转发那条提示只在真的连着 X display 时给（Wayland 那条路径里它是误导）
+    assert "X 转发" not in wayland
 
 
 @pytest.mark.parametrize("exc_factory", [lambda: cv2.error(""), lambda: OSError("")])

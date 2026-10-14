@@ -54,15 +54,21 @@
 
 **两种模式的判据不同，是用法决定的，不是笔误**（详见 `run_window` 的 docstring）：
 
-    0  会话跑完了。无窗口模式（--once / --frames N）：每一帧都 READY。
-       窗口模式：至少有一帧 READY —— 调取景途中掉几帧不算失败，
-                 但**整场一帧都没解出来**算失败（否则按 $? 判断会拿到假通过）。
-    1  本轮没产出可用的解。可能是：有帧没解出来（取景/掉码，`no_vehicle_marker` /
-       `boundary_moved`）、中途读帧失败、标定文件读不出来（与 `verify_vision.py`
-       同一口径：同一个输入错误、同一类返回码）。窗口模式下则是整场零 READY。
+    0  会话跑完了，且整场**有过一帧** READY。无窗口模式（--once / --frames N）：
+       **每一帧都 READY**；窗口模式：**至少有一帧 READY** —— 调取景途中掉几帧不算
+       失败，但**整场一帧都没解出来算失败**（否则按 $? 判断会拿到假通过）。
+    1  本轮没产出可用的解。三种来源，窗口模式与无窗口模式判据不同：
+       · 有帧没解出来（取景/掉码，`no_vehicle_marker` / `boundary_moved`）。无窗口
+         模式下**任何一帧没解出来就是 1**；窗口模式下则是**整场零 READY** 才算失败。
+       · 中途读帧失败（相机被拔/被别的程序抢走）。**只发生在无窗口模式**：它是有界
+         采样（`--frames N` 就是要 N 帧），读不到就是这一轮没跑完。窗口模式中途掉线
+         不算失败 —— 已经解出来的帧是有效的测量，按上面 0 的判据走（有 READY 仍给 0）。
+       · 标定文件读不出来（与 `verify_vision.py` 同一口径：同一个输入错误、同一类
+         返回码）。这一条两种模式一样，因为那时相机还没开。
     2  命令行用法错误（与 argparse 同值）；**或**窗口打不开（没有显示环境 / 连不上
        显示服务器 —— 提示会分别给出 `export DISPLAY=:0` 与 X 转发的说法）。
-    4  相机打不开 —— 与 1 **故意分开**：1 是"拍到了但不能用"，4 是"根本没拍到"，
+    4  相机打不开 —— 与 1 **故意分开**：1 是"本轮没产出可用的解"（**含配置错误**，
+       标定文件读不出来也是 1，那时相机还没开），4 是"**连相机都没打开**"。
        操作者今天在这两端之间来回猜（R48），分开之后一眼能分。
 
 ## 硬规矩
@@ -762,7 +768,24 @@ class TerminalLog:
 
 
 def run_headless(cap, calib, n_frames: int, label: str, origin: str) -> int:
-    """`--once` / `--frames`：解算 N 帧，**不开窗口**（无 DISPLAY 环境 / CI 用）。"""
+    """`--once` / `--frames`：解算 N 帧，**不开窗口**（无 DISPLAY 环境 / CI 用）。
+
+    ## 判据：任何一帧没解出来就是 1，中途读帧失败也是 1
+
+    与 `run_window` **刻意不同**（理由写在那个函数的 docstring 里）：这里每一帧都是
+    一次**独立的采样** —— `--frames N` 的字面意思就是"要 N 帧"，采样没跑完、或者跑完
+    却一帧都没解出来，都意味着这一轮没产出可用的测量。与 `verify_vision` "至少一张照片
+    没解出来 → 1"同一口径。窗口模式是长时间会话，判据因此放宽到"整场有过一帧 READY"。
+
+    两者的差异（同一场景：2 帧 READY 之后相机断开）：
+
+        --frames N → 1（这一轮采样没跑完）
+        窗口模式   → 0（跑了一半的测量仍然拿得走）
+
+    这个方向相反**不是笔误**，别"顺手统一"掉；退出码表（模块 docstring / `--help` /
+    `run_window` docstring 三处）都写着它，并由
+    `test_the_camera_dropping_out_mid_session_keeps_the_frames_it_already_solved` 钉住。
+    """
     log = TerminalLog()
     solved = 0
     started = time.perf_counter()
@@ -800,27 +823,57 @@ def _display_problem(detail: str = "") -> str:
     （`imshow` 收到畸形图、Qt 连接断了都会），那时候"当前没有显示环境"是假话，
     而"加 `--once`"的补救又恰好废掉这个工具存在的理由 —— 它就是给要看画面的人用的。
 
+    **分三种情况，而不是两种**：`_has_display()` 在非 Linux 上恒为 True，而
+    `DISPLAY`/`WAYLAND_DISPLAY` 在 macOS/Windows 上通常都没设，于是"有显示环境"这件事
+    和"这两个变量有值"不是一回事。旧版把两者当成一件，在 `seen is None` 时拼
+    `"xdpyinfo -display " + seen` 抛 `TypeError` —— 那个 `TypeError` 发生在
+    `except _DisplayUnavailable` **里面**，于是本该给的提示与退出码 2 一起被顶掉，
+    操作者看到的是一屏 traceback 而不是一行说明（macOS 上必然踩到）。
+
+    `xdpyinfo` 那条自查命令只对 **X11** 有意义（它连的是 X display），所以它**只在
+    `seen` 真是一个 X display（以 `:` 开头）时**出现；纯 Wayland（`wayland-0`）时给出
+    的必然失败命令比不给更糟。
+
     这是**远端 shell 里最容易犯的用法错**：忘了加 `--once`，于是在没有 X 转发的机器上
     直接开窗口。本机实测（OpenCV 4.6.0 + Qt）无 DISPLAY 时 `namedWindow`/`imshow`
     **不抛异常、只是什么都不显示**，`waitKey` 永远返回 -1 —— 脚本于是无声无息地空转，
     比抛 traceback 更难查。所以 `run()` 先看环境变量，OpenCV 那边再兜一层。
     """
-    if _has_display():
-        seen = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        lines = [
-            f"连不上图形窗口：显示环境变量有值（{seen}），但窗口还是开不起来。",
-            "  常见原因：X 转发没开、远端的 :0 已经失效、或者 OpenCV 没有 GUI 支持。",
-            "  查一下：`xdpyinfo -display " + seen + " >/dev/null && echo ok` 能通就是窗口的问题。",
-            "  实在起不来：加 --once（只看一帧）或 --frames N（无窗口解 N 帧）。",
-        ]
-    else:
+    seen = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    fallback = "  实在起不来：加 --once（只看一帧）或 --frames N（无窗口解 N 帧）。"
+    if not _has_display():
         lines = [
             "当前没有显示环境（DISPLAY / WAYLAND_DISPLAY 都是空的）。",
             "  本机图形界面：`echo $DISPLAY` 应该有个值（X11 常见是 :0）。",
             "  远端 shell：需要 X 转发 —— `ssh -X`，或 `export DISPLAY=:0` 且本机有 X；"
             "本机的 X11 会话随时可能被关掉，连不上时换一个 DISPLAY 试。",
-            "  实在没有图形界面：加 --once（只看一帧）或 --frames N（无窗口解 N 帧）。",
+            fallback,
         ]
+    elif not seen:
+        # 走到这里只有一种可能：非 Linux（`_has_display()` 恒为 True）。
+        # **不能**说"显示环境变量有值"—— 这台机器上一个显示环境变量都没有。
+        lines = [
+            f"连不上图形窗口：系统是 {sys.platform}，它的窗口系统不靠 DISPLAY，"
+            "但 OpenCV 这边仍然起不来窗口。",
+            "  常见原因：装的是 opencv-python 的 headless 版，或编译时没带 GUI 支持。",
+            "  （没有显示环境变量可查 —— macOS/Windows 不走 X11，所以这一条没有自查命令。）",
+            fallback,
+        ]
+    else:
+        lines = [
+            f"连不上图形窗口：显示环境变量有值（{seen}），但窗口还是开不起来。",
+        ]
+        if seen.startswith(":"):
+            lines += [
+                "  常见原因：X 转发没开、远端的 :0 已经失效、或者 OpenCV 没有 GUI 支持。",
+                "  查一下：`xdpyinfo -display " + seen + " >/dev/null && echo ok` 能通就是窗口的问题。",
+            ]
+        else:
+            lines.append(
+                f"  这是 Wayland 的显示环境变量（{seen}），不是 X11 —— X 的那套自查命令在"
+                "这里用不了；而 OpenCV 在纯 Wayland 会话里常常没有可用的后端。"
+            )
+        lines.append(fallback)
     if detail:
         lines.append(f"  原始错误：{detail}")
     return "\n".join(lines)
@@ -863,22 +916,33 @@ def _window_call(func, *args, **kwargs):
 
 
 def run_window(cap, calib, args, bias_measured: bool) -> int:
-    """实时窗口主循环。返回 0（会话跑完且至少有一帧 READY）。
+    """实时窗口主循环。返回 0（会话跑完，且整场**有过一帧** READY）。
 
-    ## 退出码判据：整场**一帧都没解出来**才算失败
+    ## 退出码判据：至少有一帧 READY 就算成功，整场一帧都没解出来算失败
 
     窗口模式是长时间会话：操作者开窗 → 挪相机 → 看码进没进画面 → `q` 退出。
     这条判据是按这个用法定的：
 
-    - **有掉帧不是失败**。调取景的途中码时有时无（今天 ID23 就是），拿"有帧没解出来"
-      算失败，等于每次挪一下相机都要吃一个非 0 退出码。
-    - **整场一个 READY 都没有才是失败**。这次会话确实没产出任何可用的测量，
-      而 `EXIT_OK` 会让按 `$?` 判断的脚本拿到假通过。
+    - **有掉帧不是失败**（0 的判据是"至少有一帧 READY"）。调取景的途中码时有时无
+      （今天 ID23 就是），拿"有帧没解出来"算失败，等于每次挪一下相机都要吃一个非 0
+      退出码。
+    - **整场一帧都没解出来算失败**（1 的判据是"整场零 READY"）。这次会话确实没产出
+      任何可用的测量，而 `EXIT_OK` 会让按 `$?` 判断的脚本拿到假通过。
 
-    与 `run_headless` 的口径**刻意不同**：无窗口模式下每帧都是一次独立的采样，
-    任何一帧没解出来都不能当测量结果，所以有帧没解出来就是 1（与 `verify_vision`
-    "至少一张照片没解出来 → 1"一致）。这两种模式下同一语义方向相反，是用法决定的，
-    不是没想清楚 —— 所以退出码表里把两者分开写（见模块 docstring）。
+    与 `run_headless` **刻意不同**：无窗口模式下每帧都是一次独立的采样（`--frames N`
+    的字面意思就是要 N 帧），**任何一帧没解出来就是 1**，中途读帧失败也是 1，
+    0 的判据是"每一帧都 READY"。
+
+    **中途掉线走的是上面那条判据**：相机中途断开只是 `break` 出循环，已经解出来的那
+    几帧仍然是有效的测量，所以"两帧 READY 之后拔线"仍然给 0，而 `run_headless` 在
+    同一场景给 1。**这个差异写进了模块 docstring、`--help` 与 `run_headless` 的
+    docstring**，别当成笔误"统一"掉。
+
+    **Ctrl-C 也不打 traceback**：`except KeyboardInterrupt` 打一行"已退出（Ctrl-C）"
+    之后**落到下面那条同一个判据上**返回（有过 READY → 0，零 READY → 1）——
+    操作者在终端里随手 Ctrl-C 是很可能的交互，而本工具的出发点就是"别给操作者一屏
+    红字"。`finally` 里的 `destroyAllWindows()` 与 `run()` 里的 `cap.release()` 在
+    Ctrl-C 下同样执行（所以 `/dev/video0` 不会被占住）。
 
     窗口打不开时**不抛 traceback**：打一段说清怎么修的话，返回 `EXIT_USAGE`。
     那一层兜底只包**窗口调用**（`_window_call`）；少了它，无显示/无 GUI 编译的
@@ -945,6 +1009,11 @@ def run_window(cap, calib, args, bias_measured: bool) -> int:
                     # 磁盘满/权限不足/编码器不认识扩展名（cv2.imwrite 是抛 cv2.error，
                     # 不是返回 False）都归这里。报一行实话，预览继续跑。
                     print(f"快照存不了：{_first_line(exc)}", flush=True)
+    except KeyboardInterrupt:
+        # 操作者在终端里随手 Ctrl-C 很常见。打一行实话，然后**落到底下那条同一个判据**
+        # 上返回（有过 READY → 0 / 零 READY → 1）—— 不在这里随手 return EXIT_OK，
+        # 那会让"整场零 READY 却返回 0"这条假通过换个入口回来。
+        print("已退出（Ctrl-C）。", flush=True)
     except _DisplayUnavailable as exc:
         print(_display_problem(str(exc)), flush=True)
         return EXIT_USAGE
@@ -982,11 +1051,16 @@ def build_parser() -> argparse.ArgumentParser:
             "按键（只有开窗口时有效）：q / ESC 退出 | s 存快照 | g 网格开关（每 240 px）\n"
             "\n"
             "退出码（两种模式判据不同，见 live_field.py 的 run_window docstring）：\n"
-            "  0 = 会话跑完，且无窗口模式下每帧都 READY、窗口模式下至少有一帧 READY\n"
-            "      （窗口模式下整场一帧都没解出来算失败：否则按 $? 判断会拿到假通过）\n"
-            "  1 = 本轮没产出可用的解（有帧没解出来 / 读帧失败 / 标定文件读不出来）\n"
+            "  0 = 会话跑完了，且整场有过一帧 READY\n"
+            "      无窗口模式（--once / --frames N）：每一帧都 READY\n"
+            "      窗口模式：至少有一帧 READY —— 但整场一帧都没解出来算失败\n"
+            "          （否则按 $? 判断会拿到假通过）\n"
+            "  1 = 本轮没产出可用的解\n"
+            "      无窗口模式：有帧没解出来（任何一帧） / 中途读帧失败 / 标定文件读不出来\n"
+            "      窗口模式：整场零 READY 才算失败（中途掉线不算，已有 READY 仍给 0）\n"
             "  2 = 用法错误，或窗口打不开（没有显示环境 / 连不上显示服务器）\n"
-            "  4 = 相机打不开（被别的程序占着）\n"
+            "  4 = 相机打不开（被别的程序占着）—— 连相机都没打开\n"
+            "\n"
         ),
     )
     p.add_argument("--device", default=CAMERA_DEVICE,
