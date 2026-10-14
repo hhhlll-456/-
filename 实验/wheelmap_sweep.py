@@ -66,6 +66,22 @@
   必须有人在场地边看着，且高档位 1.2 s 就可能撞边界（0.5 m/s × 1.2 s ≈ 0.6 m）。
   脚本会在开始前打印每档的预估位移。往返成对下发可抵消净位移。
 
+五、R63 护栏：命令到位（R10）≠ 车真的动了（2026-10-15 现场踩坑后补）
+======================================================================
+- 编码器测的是"**轮子转了多少**"，不是"**车动了多少**"。车被架起来（悬空）或
+  轮子完全打滑时，编码器照转，测出来的是"空转速度"——今天落体验证在悬空状态下
+  给出 +25%/−49% 等一堆互相矛盾的偏差，一张好表差点被判死，根因就是"车根本没动"。
+- 所以 ground+pivot 步在 R10 之外再加一道判据：**测量窗口内（与轮速同一段样本）
+  |ΣΔyaw| 必须 ≥ --min-turn-deg（默认 3.0°）**。ΣΔyaw = IMU 偏航角逐样本
+  wrap（±180 回绕）累加，阈值来源见 DEFAULT_MIN_TURN_DEG 注释。不通过 → 该步
+  记 invalid（reason 写明"车没转/悬空"）→ 生成器拒绝消费（同 R10 精神）。
+- 车轮也没转的死区档**不启用**（ω 记 0 是真实值，不是空转骗人；标 invalid 会让
+  生成器把整张表拒收）。判据细节见 body_rotation_check()。
+- straight 模式该护栏**退化**：遥测里没有车体平动观测量（编码器是轮级的，rpy 是
+  姿态），悬空四轮同转与真实平移不可区分——脚本开跑前会打警告，采 straight 档
+  必须有人在场目视确认车真的在走。
+- air 模式车本来就悬空，不启用（否则必然全 invalid）。
+
 用法：
     # 架空（车抬起，四轮悬空）：逐轮单轮 M 扫
     python3 wheelmap_sweep.py --mode air
@@ -86,8 +102,8 @@
 （与 wheel_map.h invert[4]={T,F,T,F}、固件/历史/kpwm 的 FWD_SIGN={-1,+1,-1,+1} 一致）。
 ω < --min-omega（默认 0.5）记 0（死区内，与 brief 一致）；原始测值在网上
 用 --raw-out 存一份（报告用），表里只放 brief 规定的值。
-若出现任何 invalid 档位（实际 pwm≠请求 / 窗口样本不足 / 不稳定），JSON 会带上
-"invalid" 列表且退出码=2 —— 生成器拒绝消费，防止静默写错表（R10）。
+若出现任何 invalid 档位（实际 pwm≠请求 / 窗口样本不足 / 不稳定 / 车体没转（R63）），
+JSON 会带上 "invalid" 列表且退出码=2 —— 生成器拒绝消费，防止静默写错表（R10）。
 """
 
 import argparse
@@ -124,6 +140,23 @@ MODE_OUT = {"air": "wheelmap_airborne.json", "ground": "wheelmap_grounded.json"}
 R_WHEEL = 0.0335
 
 DATA_DIR = os.path.join(REPO, "固件", "exp", "data")
+
+# ---------------------------------------------------------------- R63 护栏阈值
+# ground+pivot 步的测量窗口里，|ΣΔyaw|（逐样本 wrap 累加，见 body_rotation_check）
+# 必须 ≥ 此值（度），否则该步按 invalid 处理。阈值来源（"两头夹"，2026-10-15 实测）：
+#
+#   下界（噪声底）：车悬空/静止（轮子 16~19 rad/s 空转、车体完全没动）时，
+#     逐样本 wrap 累加得到的"偏航率"多轮打印为 0.00 rad/s（两位小数；
+#     /tmp/opencode/a1 的 cond_test*.py 与 verify_step5*.py 现场记录）⇒ 0.6 s
+#     窗口内累计 |ΣΔyaw| ≲ 0.2°（IMU yaw 量化 0.01°，静止时读数常整段不变）。
+#     取 3.0° = 实测噪声底的 ≈15 倍。
+#   上界（理论转角）：落地表最低档 duty=110 实测轮速 ≈12.9 rad/s ⇒ 车体偏航率
+#     ω·R/LXY = 12.9 × 0.0335 / 0.12825 ≈ 3.4 rad/s ⇒ 0.6 s 窗内 ≈ 116°；
+#     即便按"低电/重打滑"缩水 10 倍（≈12°）仍留 4 倍余量。
+#   边界一致性：护栏只在"任一车轮窗口轮速 ≥ --min-omega（默认 0.5，即已出死区）"
+#     时启用；恰在边界（0.5 rad/s）理想无打滑的车体转角 ≈ 4.4°/0.6 s，仍高于
+#     3.0°（可容忍约 1/3 打滑），不会把合法的慢速转动误杀。
+DEFAULT_MIN_TURN_DEG = 3.0
 
 
 # ---------------------------------------------------------------- 链路
@@ -387,12 +420,72 @@ def measure_step(link, expect, dwell, first_match_timeout=1.5):
     return samples, meta
 
 
-def analyze(samples, wheel, expect, c1rev, t_ref, window_ms, min_omega):
+def _wrap180(d):
+    """角度差折到 [−180, 180)（±180 回绕）。用于逐样本偏航差分。"""
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def body_rotation_check(win, *, enforced, c1rev, min_omega=0.5,
+                        min_turn_deg=DEFAULT_MIN_TURN_DEG):
+    """R63 护栏：窗口内"车体是否真的转了"（纯函数，主机可测，不碰测量数学）。
+
+    判据（只在 ground+pivot 启用，即 enforced=True）：
+      1) 车轮确实在转（任一车轮窗口平均轮速 ≥ min_omega，即不属死区）时，
+         要求车体净转角 |ΣΔyaw| ≥ min_turn_deg，否则 ok=False；
+      2) 车轮也没转（真死区档）不启用 —— 此时 ω 记 0 是真实值，不是"编码器
+         空转骗人"；标 invalid 会让生成器把带死区档的整张表拒收；
+      3) ΣΔyaw 用**逐样本 wrap 累加**（不是首尾相减）：转角超过一圈、或 yaw 跨
+         ±180 回绕都能正确累计；窗口 ~60 样本，量化 0.01°，代价可忽略。
+
+    返回 dict（原样进 analyze 结果 / --raw-out）：
+      enforced          本应启用？（mode=ground 且 pattern=pivot）
+      ok                判据是否通过（未启用时恒 True）
+      turn_deg          窗口内 wrap 累加净偏航角（度，带符号）；None=样本不足
+      turn_rate_deg_s   turn_deg / 窗口时长（诊断用）
+      enc_max_omega     四轮窗口平均轮速的最大值（rad/s）——"轮子在转"的证据
+      wheels_turned     enc_max_omega ≥ min_omega
+      reason            ok=False 时的人话原因串（原样进 JSON invalid）
+    """
+    res = {"enforced": bool(enforced), "ok": True, "reason": None,
+           "turn_deg": None, "turn_rate_deg_s": None, "span_ms": None,
+           "enc_max_omega": None, "wheels_turned": False,
+           "min_turn_deg": min_turn_deg}
+    if len(win) < 2:
+        return res                     # 防御；上游 short_window 会先拦
+    span_s = (win[-1].t - win[0].t) / 1000.0
+    if span_s <= 0:
+        return res
+    res["span_ms"] = win[-1].t - win[0].t
+    turn = 0.0
+    for a, b in zip(win, win[1:]):
+        turn += _wrap180(b.rpy[2] - a.rpy[2])
+    res["turn_deg"] = turn
+    res["turn_rate_deg_s"] = turn / span_s
+    res["enc_max_omega"] = max(
+        abs(win[-1].enc[w] - win[0].enc[w]) * 2.0 * math.pi / c1rev[w] / span_s
+        for w in range(4))
+    res["wheels_turned"] = res["enc_max_omega"] >= min_omega
+    if not enforced or not res["wheels_turned"]:
+        return res
+    if abs(turn) < min_turn_deg:
+        res["ok"] = False
+        res["reason"] = (
+            "no_body_rotation: 车没转（悬空/打滑？或 IMU 未更新）—— 窗口 %.0fms "
+            "内 |ΣΔyaw|=%.2f° < %.1f°，但编码器在转（max %.1f rad/s）[R63]"
+            % (res["span_ms"], abs(turn), min_turn_deg, res["enc_max_omega"]))
+    return res
+
+
+def analyze(samples, wheel, expect, c1rev, t_ref, window_ms, min_omega,
+            *, mode=None, pattern=None, min_turn_deg=DEFAULT_MIN_TURN_DEG):
     """从一步样本里取窗口并算该轮稳态 ω（rad/s，无方向）。
 
     - 窗口 = (t_ref − window_ms, t_ref] 的样本；
     - 窗口内每一行都必须 pwm == expect（R10：实际≠请求 → 该档 invalid，
       不做任何"跳过坏行接着算"的桥接）；
+    - R63 车体转动护栏（ground+pivot）：窗口内 |ΣΔyaw| 必须 ≥ min_turn_deg，
+      否则该档 invalid（原因串写明"车没转/悬空"）。mode/pattern 不传 = 不启用
+      （air 与 straight 本来就无法/不需要用 yaw 证明车体运动，见模块 docstring 五）；
     - 半窗转速差 >25% → unstable（还没稳就别测）；
     - ω < min_omega → 记 0（死区内，实测原始值仍留在 omega_raw）。
     """
@@ -437,6 +530,17 @@ def analyze(samples, wheel, expect, c1rev, t_ref, window_ms, min_omega):
         return res
     res["omega_raw"] = omega
     res["dcnt"] = dcnt
+
+    # R63：命令到位（R10）≠ 车真的动了 —— 悬空/打滑时编码器照转（今天踩过的坑）。
+    # 判据与阈值来源见 body_rotation_check / DEFAULT_MIN_TURN_DEG 注释。
+    rot = body_rotation_check(
+        win, enforced=(mode == "ground" and pattern == "pivot"),
+        c1rev=c1rev, min_omega=min_omega, min_turn_deg=min_turn_deg)
+    res["rotation"] = rot
+    if not rot["ok"]:
+        res["status"] = "no_body_rotation"
+        res["reason"] = rot["reason"]
+        return res
 
     # 半窗稳定性：两半都至少有 15 个计数才判（避免低速量化噪声误报）。
     mid = (t_ref - window_ms + t_ref) / 2.0
@@ -525,7 +629,10 @@ class Sweeper:
                     continue
                 break
             res = {kk: (k, exp, analyze(samples, kk[0], exp, self.cfg.c1rev,
-                                        meta.get("t_ref"), window * 1000.0, self.cfg.min_omega))
+                                        meta.get("t_ref"), window * 1000.0,
+                                        self.cfg.min_omega,
+                                        mode=self.cfg.mode, pattern=self.cfg.pattern,
+                                        min_turn_deg=self.cfg.min_turn_deg))
                    for kk, (k, exp) in results_map.items()}
             bad = [kk for kk, (_, _, r) in res.items() if r["status"] != "ok"]
             if not bad:
@@ -556,13 +663,14 @@ class Sweeper:
                 self.invalid.pop(key, None)
                 value = r["omega"]
             else:
-                self.invalid[key] = r["status"]
+                # R63 等判据会给出人话 reason（如"车没转/悬空"）；没有则退回状态码。
+                self.invalid[key] = r.get("reason") or r["status"]
                 value = 0.0
             self.data["omega_fwd" if direction == "fwd" else "omega_bwd"][k][wheel] = value
             rec[f"{WHEEL_NAMES[wheel]}_{direction}"] = r
             self.log("  %s d=%3d %s: %s" % (
                 WHEEL_NAMES[wheel], self.cfg.duties[k], direction,
-                ("invalid(%s)" % r["status"]) if not ok else
+                ("invalid(%s)" % (r.get("reason") or r["status"])) if not ok else
                 ("ω=%.2f rad/s%s" % (value, "（死区记0，实测 %.2f）" % r["omega_raw"]
                                      if r["in_deadzone"] else
                                      "  (Δ%d cnt, 半窗 %.2f/%.2f)" % (r["dcnt"], r["half1"], r["half2"])))))
@@ -631,6 +739,9 @@ def sweep_ground(sw):
     if pattern == "straight":
         # 预估位移（用旧架空表的粗估量级给操作者一个感觉：高档很危险）。
         log("[!] straight 模式：车会真的行走。请确认场地够长、有人看着、随时能断电。")
+        log("    ★ R63 护栏在 straight 模式**退化**：遥测里没有车体平动观测量（编码器是轮级的、")
+        log("      rpy 是姿态）——悬空/打滑时四轮同转与真实平移不可区分。必须有人在场目视")
+        log("      确认车真的在走，否则采到的是悬空空转数据。")
         log("    参考：轮速 ~15–35 rad/s（对照旧数据）时车体 ~0.5–1.1 m/s，")
         log("    1.2 s 档期位移可达 0.6–1.3 m —— 场地只有 0.5 m 长，高档位请勿用 straight。")
     for k, duty in enumerate(sw.cfg.duties):
@@ -762,6 +873,9 @@ def parse_args():
                     help="输出 JSON（默认 固件/exp/data/wheelmap_{airborne|grounded}.json）")
     ap.add_argument("--raw-out", default=None, help="原始逐步记录 JSON（可选，报告用）")
     ap.add_argument("--min-omega", type=float, default=0.5, help="低于此值记 0（默认 0.5 rad/s）")
+    ap.add_argument("--min-turn-deg", type=float, default=DEFAULT_MIN_TURN_DEG,
+                    help="R63 护栏阈值：ground+pivot 步测量窗内 |ΣΔyaw| 的下限（度，默认 %.1f；"
+                         "来源见代码里 DEFAULT_MIN_TURN_DEG 的注释）" % DEFAULT_MIN_TURN_DEG)
     ap.add_argument("--done-timeout", type=float, default=15.0,
                     help="--run-check 等 DONE 的超时 s（默认 15；实测 DONE 延迟最多 10.87 s）")
     ap.add_argument("--run-check", default=None, metavar='"vx vy om ms"',
@@ -810,6 +924,8 @@ def main():
             f"window={cfg.window}s cooldown={cfg.cooldown}s")
         log(f"[cfg] duty={cfg.duties}")
         log(f"[cfg] c_1rev={cfg.c1rev}（固件/历史/kpwm 标定值；--c1rev 可覆盖）")
+        log(f"[cfg] R63 护栏：ground+pivot 步要求窗口内 |ΣΔyaw| ≥ {cfg.min_turn_deg}°"
+            f"（悬空/空转即 invalid；straight 与 air 不启用）")
 
         # 会话开始：STOP 清环 + 停车，STREAM 1 开流。
         # 回复可能丢/迟到（实测这条 TCP 会间歇卡顿）—— 不拿 OK 回复当门，
