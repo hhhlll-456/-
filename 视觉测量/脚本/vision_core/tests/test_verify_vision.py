@@ -634,10 +634,44 @@ def test_help_states_the_a2_gate_and_the_truth_ordering():
 
 
 def test_help_keeps_the_bias_conversion_on_its_own_lines():
-    """argparse 默认会把参数 help 重新折行，折掉的换算表就没法照着填了。"""
+    """`--help` 里的换算式必须是**正确的那一条**，而且要占住自己的一行。
+
+    这里曾经钉的是错 90° 的旧式子（`FWD·cos` / `−FWD·sin`），于是 --help 一屏之内
+    `--bias-body` 的公式与 `--bias-dx` 的换算互相矛盾：本车 dtheta=+90 时旧式子说
+    车左 55 → (55, 0)，而正确答案是 (0, 55) —— 正好差 90°，而这屏字就是操作者
+    拿着卷尺照着填的那一屏。所以除了"新式子在"，还必须断言"旧式子不在"。
+    """
+    text = verify_vision.build_parser().format_help()
+    stripped = [ln.strip() for ln in text.splitlines()]
+    assert "dx = FWD·sin(dtheta) − LEFT·cos(dtheta)" in stripped
+    assert "dy = FWD·cos(dtheta) + LEFT·sin(dtheta)" in stripped
+    # 错 90° 的旧式子不得以任何形式回来。
+    #
+    # **按整段文本做子串匹配**，不是"这一行是不是恰好等于它"：曾经写成
+    # `banned not in stripped`（列表成员判断），而 `stripped` 是**行**的列表 ——
+    # 于是旧式子只要被塞进任何一行（"（旧写法）dx = FWD·cos…"）就溜过去了。
+    # 用 mutation 检查钉住：把旧式子追加到正确式子后面，这条必须失败。
+    # 只禁**判别性**的写法：正确的 `dy = FWD·cos(dtheta) + LEFT·sin(dtheta)` 与错误的
+    # `dx = FWD·cos(dtheta) + LEFT·sin(dtheta)` 共用同一对子式，所以禁子式本身会误伤
+    # 正确的 dy 行 —— 要禁的是"cos 落在 dx 上"和"带负号的 sin 落在 dy 上"。
+    for banned in ("dx = FWD·cos",
+                   "dy = −FWD·sin",
+                   "dx = FWD·cos(dtheta) + LEFT·sin(dtheta)",
+                   "dy = −FWD·sin(dtheta) + LEFT·cos(dtheta)"):
+        assert banned not in text, f"--help 里又出现了错 90° 的旧公式：{banned}"
+
+
+def test_help_body_and_dx_sections_agree_at_plus_90():
+    """一屏之内不许自相矛盾：`--bias-body` 的公式在 dtheta=+90 上必须与 `--bias-dx`
+    写出来的换算给出同一个落点（车左 b → dy=±b，**不是** dx=±b）。"""
     stripped = [ln.strip() for ln in verify_vision.build_parser().format_help().splitlines()]
-    assert "dx = FWD·cos(dtheta) + LEFT·sin(dtheta)" in stripped
-    assert "dy = −FWD·sin(dtheta) + LEFT·cos(dtheta)" in stripped
+    dx_line = next(ln for ln in stripped if "车体「左」" in ln and "--bias-dx" in ln)
+    # 车左 55、dtheta=+90 → (dx, dy) = (0, 55)
+    fwd, left, d = 0.0, 55.0, 90.0
+    got = verify_vision.body_to_marker(fwd, left, d)
+    assert got == pytest.approx((0.0, 55.0), abs=1e-9)          # 代码
+    assert "--bias-dx 0,   --bias-dy ±b" in dx_line             # --bias-dx help
+    assert "--bias-dx ±b" not in dx_line                        # 旧说法不得复活
 
 
 def test_help_mentions_the_battery_verdict_is_human():
@@ -921,7 +955,8 @@ def test_bias_body_and_bias_dx_are_mutually_exclusive(tmp_path, capsys):
 
 
 def test_bias_body_and_dtheta_only_is_enough(tmp_path, capsys):
-    """只给 --bias-body（两项一起）就够了，dtheta=+90 时车左 120 → dx=120, dy=−30。"""
+    """只给 --bias-body（两项一起）就够了：dtheta=+90 时车头落码 +X、车左落码 +Y，
+    所以 (前 30, 左 120) → (dx 30, dy 120)。"""
     # dtheta=+90：车头→码 +X、车左→码 +Y，所以 (前 30, 左 120) → (30, 120)
     rc = verify_vision.main([PHOTO, "--bias-body", "30,120", "--bias-dtheta", "90",
                              "--calib", _calib_path(tmp_path)])

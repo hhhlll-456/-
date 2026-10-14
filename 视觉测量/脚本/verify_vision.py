@@ -39,8 +39,8 @@
   并说明这一轮解出来的 x/y 是"码的中心"而不是"车体原点"。`dy = 55.0` 只出现在
   `vision_core/field.py` 的测试夹具里，**不是测量结果**。
 - **R35 的可操作性**：`--bias-body FWD,LEFT` 让人按**车体系**（车头方向 / 车左方向）报数，
-  码规范轴向由 `body_to_marker` 换算（`dx = FWD·cos d + LEFT·sin d`、
-  `dy = −FWD·sin d + LEFT·cos d`）；`--explain-bias` 打印码的规范 ±X/±Y 在**图像**里朝哪，
+  码规范轴向由 `body_to_marker` 换算（`dx = FWD·sin d − LEFT·cos d`、
+  `dy = FWD·cos d + LEFT·sin d`）；`--explain-bias` 打印码的规范 ±X/±Y 在**图像**里朝哪，
   外加一张"车头朝 8 个方向 → dtheta 取多少"的对照表，让 ±90 的符号看得见、不用猜。
 - **R40** 写盘一律 `deep_merge`，而且**整轮只写一次**。`{**a, **b}` 会整段换掉 `bias`：
   `--bias-dy 77` 存下去之后，原有的 `dx_mm`/`dtheta_deg` 消失，而 `load_calib` 又拿默认值
@@ -323,7 +323,7 @@ def body_to_marker(bx_mm: float, by_mm: float, dtheta_deg: float) -> tuple[float
        `body_pose_in_field` 算 `yaw = heading_deg − dtheta`。
        所以 `dtheta = H_Y − yaw_body`，其中 `H_Y` 是码 +Y 的航向，车体航向是**车头**方向。
     2. 码规范 +X 相对 +Y 在**顺时针** 90°。实测（参考照片）：+Y 航向 +179.51°、
-       +X 航向 +89.59°，差 −90.1°；`markers.py` 里"正对相机"的码（+X 图像右、
+       +X 航向 +89.59°，差 **−89.92°**（约 −90°）；`markers.py` 里"正对相机"的码（+X 图像右、
        +Y 图像上）也是 +X 比 +Y 小 90°。
     3. 于是：一个方向在**码系**里的分量是 `(−sin φ, cos φ)`，其中 φ 是它相对码 +Y 的
        航向差。车头 `φ = −dtheta`，车左 `φ = −dtheta + 90`（逆时针为正，左 = 前 +90）。
@@ -762,8 +762,8 @@ def build_parser() -> argparse.ArgumentParser:
         "    FWD  = 沿**车头方向**的偏移（正 = 往车头方向）\n"
         "    LEFT = 沿**车左方向**的偏移（正 = 往左）\n"
         "这两个数是拿卷尺直接量得出来的，**不用管码怎么贴**；码规范轴向由工具换算：\n"
-        "    dx = FWD·cos(dtheta) + LEFT·sin(dtheta)\n"
-        "    dy = −FWD·sin(dtheta) + LEFT·cos(dtheta)\n"
+        "    dx = FWD·sin(dtheta) − LEFT·cos(dtheta)\n"
+        "    dy = FWD·cos(dtheta) + LEFT·sin(dtheta)\n"
         "不给 --bias-dtheta 时按标定文件里现有的 dtheta_deg 换算（并大嗓门说明），\n"
         "换出来的 dx/dy 与那个 dtheta 一起写入，三项始终自洽。符号用 --explain-bias 查表。\n"
         "与 --bias-dx/--bias-dy 互斥（同一个量的两套数，混起来以谁为准没有答案）。"))

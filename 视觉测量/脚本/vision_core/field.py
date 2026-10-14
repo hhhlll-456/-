@@ -366,7 +366,8 @@ def body_pose_in_field(ff: FieldFrame, pose, bias) -> tuple[float, float, float]
 
     1. `heading_deg` 取的是码的**规范 +Y** 的航向，`yaw = heading_deg − dtheta`
        ⇒ `dtheta = H_Y − yaw_body`，`yaw_body` 是**车头**方向的航向。
-    2. 码规范 +X 相对 +Y 在**顺时针** 90°（实测 +Y +179.51°、+X +89.59°）。
+    2. 码规范 +X 相对 +Y 在**顺时针** 90°（参考照片实测：+Y +179.51°、+X +89.59°，
+       差 **−89.92°**）。
     3. 于是车体方向在码系里的分量是 `(−sin φ, cos φ)`，φ = 相对码 +Y 的航向差；
        车头 φ = −dtheta，车左 φ = −dtheta + 90（逆时针为正，左 = 前 +90）。
     4. 代进去：车头 → `(sin d, cos d)`、车左 → `(−cos d, sin d)`。`dtheta = +90` 时
