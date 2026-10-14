@@ -1,0 +1,333 @@
+"""`run_all_experiments`（Task 12 批量入口）：计划起点 + 严格场地校验 + mock 批量循环。
+
+批量循环全部走假 harness（不连车、不开相机、不写真表）：
+- `FakeHarness` 记录 `drive_to` 的目标、`run_trial` 的 id 与完整事件顺序；
+- 工作簿一律由生成器在 `tmp_path` 里产出；
+- `--dry` 路径断言**任何**硬件会话工厂都不会被调用。
+
+需要真相机的项（一条真 RUN、真归位）不在这里 —— 计划的 Step 4 由人执行。
+"""
+from __future__ import annotations
+
+import importlib.util
+from contextlib import contextmanager
+from pathlib import Path
+
+import openpyxl
+import pytest
+
+import run_all_experiments as RA
+from vgt import matrix
+from vgt.harness import StopFailed
+
+REPO = Path(__file__).resolve().parents[3]
+BUILDER_PATH = REPO / "实验" / "实验数据记录_build.py"
+
+
+@pytest.fixture(scope="module")
+def builder():
+    spec = importlib.util.spec_from_file_location("实验数据记录_build", BUILDER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture()
+def xlsx(tmp_path, builder):
+    path = tmp_path / "实验数据记录.xlsx"
+    builder.write_workbook(path)
+    return path
+
+
+# ------------------------------------------------------------------ 假设备（无网络）
+
+class FakeCarLink:
+    """只记录 `stop()`（批量循环"每条结束 car.stop()"的验收点）。"""
+
+    def __init__(self, events):
+        self.events = events
+        self.stops = 0
+
+    def stop(self):
+        self.stops += 1
+        self.events.append(("stop",))
+        return "OK STOP"
+
+
+class FakeHarness:
+    def __init__(self, *, events=None, home_results=(), trial_results=(),
+                 raise_stop_failed=False):
+        self.events = [] if events is None else events
+        self.car_link = FakeCarLink(self.events)
+        self.home_results = list(home_results)
+        self.trial_results = list(trial_results)
+        self.raise_stop_failed = bool(raise_stop_failed)
+        self.drive_targets = []
+        self.trial_ids = []
+
+    def drive_to(self, x, y, **kw):
+        self.drive_targets.append((x, y))
+        self.events.append(("drive_to", (x, y)))
+        if self.home_results:
+            return dict(self.home_results.pop(0))
+        return {"reached": True, "reason": "converged"}
+
+    def run_trial(self, exp, **kw):
+        self.trial_ids.append(exp.id)
+        self.events.append(("run_trial", exp.id))
+        if self.raise_stop_failed:
+            raise StopFailed("fake：STOP 未确认，立即给车断电")
+        return self.trial_results.pop(0)
+
+
+def _probe(exp_id=1, action="straight", vx=0.2, vy=0.0, om=0.0,
+           duration_s=1.0, repeats=1):
+    return matrix.Experiment(exp_id, action, f"探针 #{exp_id}",
+                             vx, vy, om, duration_s, repeats)
+
+
+def _ok_trial(dist_mm=200.0):
+    return {
+        "ok": True, "reason": None,
+        "vision": {"start": (0.0, 0.0, 0.0), "mid": None,
+                   "end": (dist_mm, 0.0, 0.0)},
+        "vision_delta": {"dist_mm": dist_mm, "yaw_deg": 0.0,
+                         "dx_mm": dist_mm, "dy_mm": 0.0},
+        "odometry_delta": {"dist_mm": dist_mm, "yaw_deg": 0.0,
+                           "dx_mm": dist_mm, "dy_mm": 0.0},
+        "samples": [], "warnings": [],
+    }
+
+
+def _failed_trial(reason):
+    return {
+        "ok": False, "reason": reason,
+        "vision": {"start": None, "mid": None, "end": None},
+        "vision_delta": None, "odometry_delta": None,
+        "samples": [], "warnings": [],
+    }
+
+
+def _summary_rows(ws):
+    hdr = [cell.value for cell in ws[1]]
+    return [dict(zip(hdr, [cell.value for cell in ws[r]]))
+            for r in range(2, ws.max_row + 1)]
+
+
+# ------------------------------------------------------------------ 计划起点（R15）
+
+def test_plan_start_puts_the_sweep_midpoint_at_the_field_origin():
+    by_id = {e.id: e for e in matrix.EXPERIMENTS}
+    assert RA.plan_start_xy(by_id[1]) == pytest.approx((-100.0, 0.0))   # 前进 200
+    assert RA.plan_start_xy(by_id[2]) == pytest.approx((100.0, 0.0))    # 后退 200
+    assert RA.plan_start_xy(by_id[3]) == pytest.approx((-75.0, 0.0))    # 前进 150
+    assert RA.plan_start_xy(by_id[4]) == pytest.approx((75.0, 0.0))
+    assert RA.plan_start_xy(by_id[5]) == pytest.approx((0.0, -40.0))    # 左移 80
+    assert RA.plan_start_xy(by_id[6]) == pytest.approx((0.0, 40.0))     # 右移 80
+    e9 = by_id[9]                                                       # 斜行 120（45°）
+    assert RA.plan_start_xy(e9) == pytest.approx((-e9.vx * 500.0, -e9.vy * 500.0))
+    assert RA.plan_start_xy(by_id[15]) == (0.0, 0.0)                    # 原地旋转
+    assert RA.plan_start_xy(by_id[16]) == (0.0, 0.0)
+
+
+def test_planned_starts_engage_the_strict_branch_and_are_all_feasible():
+    """规划起点必须可执行，而且是真的走**严格分支**（不是静默落回宽松）。
+
+    两个断言缺一不可：
+    1. 平移类起点不许是 (0,0) —— 即使显式传 (0,0)，`assert_within_field` 也会
+       走宽松分支（它只看"换一个偏心起点放得下"），绝对扫掠校验根本不执行；
+    2. 把规划起点整体推向场外 200 mm 必须被拒 —— 证明这个显式起点真的吃进了
+       绝对扫掠校验（直行 200 的终点包络 200+135 > 252.5）。
+    """
+    for exp in matrix.EXPERIMENTS:
+        start_xy = RA.plan_start_xy(exp)
+        RA.check_experiment_feasible(exp, start_xy)                  # 不抛 = 通过
+        if exp.action != "rotate_in_place":
+            assert start_xy != (0.0, 0.0), (
+                f"#{exp.id} 的规划起点不许是名义中心：assert_within_field 对 (0,0) "
+                "走宽松分支，平移类会静默跳过绝对扫掠校验（Important 1）")
+        with pytest.raises(ValueError):
+            matrix.assert_within_field(
+                exp, start_xy=(start_xy[0] + 200.0, start_xy[1]))
+
+
+def test_missing_start_is_an_error_and_the_default_branch_is_a_real_trap():
+    """Important 1：`assert_within_field` 的默认 (0.0,0.0) 会静默走宽松分支。
+
+    本任务选"Task 12 侧显式传执行起点 + 缺起点报错"（不动 matrix.py，理由见
+    `run_all_experiments` 模块 docstring 与交付报告）。
+    """
+    e5 = next(e for e in matrix.EXPERIMENTS if e.id == 5)            # 左移 80
+
+    # 陷阱本身是真的：不传起点 → 宽松分支 → 下面这个越界的偏心起点"静默通过"
+    matrix.assert_within_field(e5)
+    # 同一个实验、显式起点走严格分支 → 立刻抓住"起点就贴在场外"
+    with pytest.raises(ValueError):
+        matrix.assert_within_field(e5, start_xy=(0.0, -60.0))
+    # Task 12 的堵法：缺起点是显式错误，绝不落回默认
+    with pytest.raises(ValueError, match="起点"):
+        RA.check_experiment_feasible(e5, None)
+    # 规划起点本体必须过
+    RA.check_experiment_feasible(e5, RA.plan_start_xy(e5))
+
+
+def test_iterate_trials_yields_every_repeat_and_only_filters_by_id():
+    trials = list(RA.iterate_trials(matrix.EXPERIMENTS))
+    assert len(trials) == sum(e.repeats for e in matrix.EXPERIMENTS) == 48
+    assert trials[0][0].id == 1 and trials[0][1] == 0
+
+    only3 = list(RA.iterate_trials(matrix.EXPERIMENTS, only=3))
+    assert [e.id for e, _rep in only3] == [3, 3, 3]
+    assert [rep for _e, rep in only3] == [0, 1, 2]
+    assert list(RA.iterate_trials(matrix.EXPERIMENTS, only=999)) == []
+
+
+# ------------------------------------------------------------------ 批量循环（mock）
+
+def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, builder, xlsx):
+    events = []
+    exp1 = _probe(1, repeats=2)
+    exp5 = _probe(5, action="strafe", vx=0.0, vy=0.08)
+    h = FakeHarness(events=events,
+                    trial_results=[_ok_trial(200.0), _ok_trial(200.0), _ok_trial(80.0)])
+    lines = []
+
+    def write(trial, exp, **kw):
+        events.append(("write", exp.id))
+
+    stats = RA.run_batch(h, experiments=[exp1, exp5], only=None, xlsx_path=xlsx,
+                         printer=lines.append, write=write, archive=False)
+
+    assert h.drive_targets == [(-100.0, 0.0), (-100.0, 0.0), (0.0, -40.0)]
+    assert h.trial_ids == [1, 1, 5]
+    assert events == [                                    # 计划要求的每条顺序
+        ("drive_to", (-100.0, 0.0)), ("run_trial", 1), ("write", 1), ("stop",),
+        ("drive_to", (-100.0, 0.0)), ("run_trial", 1), ("write", 1), ("stop",),
+        ("drive_to", (0.0, -40.0)), ("run_trial", 5), ("write", 5), ("stop",),
+    ]
+    assert h.car_link.stops == 3                          # 每条结束 car.stop()
+    assert stats == {"n_trials": 3, "n_ok": 3, "n_failed": 0,
+                     "n_homing_failed": 0, "archive_path": None}
+    assert len(lines) == 3 and all("OK" in ln for ln in lines)
+    assert any("200.0mm" in ln or "200.0 mm" in ln or "200.0" in ln for ln in lines)
+
+
+def test_batch_loop_records_a_failed_trial_and_keeps_going(tmp_path, builder, xlsx):
+    exp1 = _probe(1)
+    exp5 = _probe(5, action="strafe", vx=0.0, vy=0.08)
+    h = FakeHarness(trial_results=[_ok_trial(200.0), _failed_trial("boundary_moved")])
+    lines = []
+
+    stats = RA.run_batch(h, experiments=[exp1, exp5], xlsx_path=xlsx,
+                         printer=lines.append, archive=False)
+
+    assert h.trial_ids == [1, 5]                  # 失败不中断后续
+    assert stats["n_ok"] == 1 and stats["n_failed"] == 1
+    assert any("FAIL" in ln and "boundary_moved" in ln for ln in lines)
+
+    rows = _summary_rows(openpyxl.load_workbook(xlsx)["data"])
+    assert rows[0]["trial_ok"] is True
+    assert rows[1]["trial_ok"] is False
+    assert rows[1]["trial_reason"] == "boundary_moved"
+    assert rows[1]["vision_dist_mm"] is None
+
+
+def test_homing_failure_skips_the_trial_but_records_the_row(tmp_path, builder, xlsx):
+    """归位失败 = 车在哪不知道：不许开电机跑实验，但失败要留痕（trial_reason=homing_*）。"""
+    exp1 = _probe(1)
+    h = FakeHarness(home_results=[{"reached": False, "reason": "locate_failed"}])
+    lines = []
+
+    stats = RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                         printer=lines.append, archive=False)
+
+    assert h.trial_ids == []                      # 没跑实验
+    assert h.car_link.stops == 1                  # 但照常收尾停车
+    assert stats["n_failed"] == 1 and stats["n_homing_failed"] == 1
+    assert "homing_locate_failed" in lines[0]
+
+    rows = _summary_rows(openpyxl.load_workbook(xlsx)["data"])
+    assert len(rows) == 1
+    assert rows[0]["trial_ok"] is False
+    assert rows[0]["trial_reason"] == "homing_locate_failed"
+
+
+def test_stop_failed_aborts_the_whole_batch(tmp_path, builder, xlsx):
+    """StopFailed = 车可能还在开：中止整批（不许当 trial 级失败吞掉），收尾照样 stop。"""
+    exp1 = _probe(1)
+    exp5 = _probe(5, action="strafe", vx=0.0, vy=0.08)
+    h = FakeHarness(raise_stop_failed=True)
+
+    with pytest.raises(StopFailed):
+        RA.run_batch(h, experiments=[exp1, exp5], xlsx_path=xlsx,
+                     printer=lambda _s: None, archive=False)
+
+    assert h.trial_ids == [1]                     # 第二条不跑
+    assert h.car_link.stops == 1                  # finally 里停过
+    assert openpyxl.load_workbook(xlsx)["data"].max_row == 1     # 没写任何行
+
+
+def test_batch_archives_the_workbook_when_asked(tmp_path, builder, xlsx):
+    h = FakeHarness(trial_results=[_ok_trial(200.0)])
+    stats = RA.run_batch(h, experiments=[_probe(1)], xlsx_path=xlsx,
+                         printer=lambda _s: None, archive=True)
+    assert stats["archive_path"] is not None
+    archive = Path(stats["archive_path"])
+    assert archive.exists() and archive.parent == xlsx.parent
+    assert archive.name.startswith("实验数据记录_")
+
+
+# ------------------------------------------------------------------ CLI（--dry / --only）
+
+def test_dry_run_prints_every_trial_and_touches_no_hardware(monkeypatch):
+    def boom():
+        raise AssertionError("--dry 不许打开任何硬件会话")
+
+    monkeypatch.setattr(RA, "_open_real_session", boom)
+    lines = []
+    rc = RA.main(["--dry", "--only", "1"], printer=lines.append)
+
+    assert rc == 0
+    assert len(lines) == 4                        # #1 的 3 次 + 收尾一行
+    assert all("#01" in ln for ln in lines[:3])
+    assert all("起点" in ln for ln in lines[:3])
+    assert "DRY" in lines[-1]
+
+
+def test_unknown_only_id_is_rejected_without_side_effects():
+    lines = []
+    rc = RA.main(["--dry", "--only", "999"], printer=lines.append)
+    assert rc == 2
+    assert any("999" in ln for ln in lines)
+
+
+def test_main_runs_the_batch_through_the_injected_session(xlsx):
+    exp1 = _probe(1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0)] * 3)
+
+    @contextmanager
+    def factory():
+        yield h
+
+    lines = []
+    rc = RA.main(["--only", "1"], session_factory=factory,
+                 printer=lines.append, xlsx_path=xlsx)
+
+    assert rc == 0
+    assert h.trial_ids == [exp1.id] * 3           # 真矩阵里的 #1 是 repeats=3
+    assert h.car_link.stops == 3
+    assert openpyxl.load_workbook(xlsx)["data"].max_row == 4      # 3 个汇总行
+    assert any("完成" in ln for ln in lines)
+
+
+def test_main_returns_nonzero_when_a_trial_failed(xlsx):
+    h = FakeHarness(trial_results=[_ok_trial(200.0), _failed_trial("no_telemetry"),
+                                   _ok_trial(200.0)])
+
+    @contextmanager
+    def factory():
+        yield h
+
+    rc = RA.main(["--only", "1"], session_factory=factory,
+                 printer=lambda _s: None, xlsx_path=xlsx)
+    assert rc == 1                                # 有失败条目 → 退出码 1（表里留痕）

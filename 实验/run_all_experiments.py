@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Task 12 批量入口：矩阵 × repeats，逐条 归位 → 单次实验 → 对比入表 → 停止。
+
+    cd 实验
+    python3 run_all_experiments.py              # 全部 16 条 × 各自 repeats（真机！）
+    python3 run_all_experiments.py --only 1     # 只跑实验 #1（× 它的 repeats）
+    python3 run_all_experiments.py --dry        # 离线：只做场地校验、打印执行计划
+                                                #（不开相机、不连车、不写表）
+
+真机流程（每条）：`plan_start_xy(exp)` 算出执行起点 → `check_experiment_feasible`
+（**显式**起点，见下）→ `harness.drive_to(起点)` → 归位失败就不跑实验、只记一行
+`homing_*` 失败 → `harness.run_trial(exp)` → `compare.write_trial` 入表（失败也写）
+→ 打印一行"视觉 vs 里程计"对比 → 收尾 `car.stop()`。
+
+## Important 1：为什么起点必须显式传
+
+`matrix.assert_within_field(exp, start_xy=(0.0, 0.0))` 的默认值会**静默走宽松
+分支**（"全场可行性"），抓不住"这条实验在指定起点下其实放不下"。Task 9 复核给的
+两条路：① Task 12 传目标执行起点；② 把 matrix 的默认改成 `None` 哨兵。**本文件
+选①，且把"缺起点"封成显式错误**（`check_experiment_feasible(exp, None)` 直接
+`ValueError`），理由：
+
+- `实验/vgt/matrix.py` 的默认宽松分支是 brief 四条测试（默认起点、逐条不许抛）
+  的行为锁，改哨兵会当场全红；且该文件正被别的任务修改，Task 12 不去碰。
+- 宽松分支的合法用途（Task 9 的"换一个偏心起点一定放得下"）保留给 matrix 自己的
+  测试；**执行预约**只许走严格分支，起点从 `plan_start_xy` 来（位移的对称中点，
+  终点 = 起点 + 位移），旋转类起点就是中心 `(0, 0)`。
+
+## 安全语义（别把这两类失败混进"标注原因"）
+
+- `StopFailed` / `BoundaryMarkersMoved` 等**安全异常原样冒泡、中止整批** ——
+  "失败条目标注原因而非崩溃"说的是 trial 级失败（`run_trial` 返回 `ok=False`）。
+- 归位失败（`drive_to` 没到 `reached`）**不跑实验**：车在哪不知道，开电机等于盲开；
+  只写一行 `trial_reason="homing_*"` 的失败记录，继续下一条。
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import math
+import sys
+from pathlib import Path
+
+from vgt import compare, matrix
+
+
+def plan_start_xy(exp) -> tuple[float, float]:
+    """一条实验的**执行起点**（场地系 mm）：让行程以场地原点对称（R15）。
+
+    终点 = 起点 + 位移，取位移的对称中点：直行 200 → 起点 (−100, 0)；
+    横移左 80 → (0, −40)；斜行 → (∓42.4, ∓42.4)；原地旋转 → (0, 0)。
+    """
+    if exp.action == "rotate_in_place":
+        return (0.0, 0.0)
+    dx = float(exp.vx) * float(exp.duration_s) * 1000.0
+    dy = float(exp.vy) * float(exp.duration_s) * 1000.0
+    return (0.0 - dx / 2.0, 0.0 - dy / 2.0)      # `0.0 − x` 顺带消掉打印里的 −0.0
+
+
+def check_experiment_feasible(exp, start_xy) -> None:
+    """严格场地校验：起点**显式**给出，缺起点直接报错（不落回默认宽松分支）。
+
+    `start_xy=None` 是文档化错误：调用方不许拿"没归位"冒充"名义中心"。
+    """
+    if start_xy is None:
+        raise ValueError(
+            f"实验 #{exp.id}（{exp.desc}）：assert_within_field 必须显式传执行起点 —— "
+            "默认 (0.0, 0.0) 会静默走宽松分支（Task 9 复核 Important 1）。")
+    matrix.assert_within_field(exp, start_xy=start_xy)
+
+
+def iterate_trials(experiments=matrix.EXPERIMENTS, only=None):
+    """`(exp, repeat_index)` 生成器：矩阵 × 每条自己的 repeats；`only` 按 id 过滤。"""
+    for exp in experiments:
+        if only is not None and int(exp.id) != int(only):
+            continue
+        for rep in range(int(exp.repeats)):
+            yield exp, rep
+
+
+def _homing_failed_trial(reason: str) -> dict:
+    """归位失败时合成的"没跑过"的 trial 结果（形状与 `run_trial` 一致，全空）。"""
+    return {
+        "ok": False, "reason": reason,
+        "vision": {"start": None, "mid": None, "end": None},
+        "vision_delta": None, "odometry_delta": None,
+        "samples": [], "warnings": [],
+    }
+
+
+def format_trial_line(index: int, total: int, exp, rep: int, summary: dict) -> str:
+    """一行实时对比：`#id rep 描述：vision / odo / Δ% / yawΔ / 判定`。"""
+    def num(value, spec):
+        return "-" if value is None else format(value, spec)
+
+    verdict = "OK" if summary["trial_ok"] else f"FAIL {summary['trial_reason'] or '?'}"
+    return (
+        f"[{index:2d}/{total}] #{int(exp.id):02d} rep{rep + 1}/{int(exp.repeats)} {exp.desc}: "
+        f"vision {num(summary['vision_dist_mm'], '.1f')}mm / "
+        f"odo {num(summary['odo_dist_mm'], '.1f')}mm / "
+        f"Δ {num(summary['dist_diff_pct'], '+.1f')}% / "
+        f"yawΔ {num(summary['yaw_diff_deg'], '+.2f')}°  {verdict}")
+
+
+def _final_stop(harness, printer) -> None:
+    """每条结束 `car.stop()`（计划要求）；停了没停已由 harness 的收尾 STOP 兜底，
+    这里失败只大声提示，不覆盖 `StopFailed` 语义。"""
+    link = getattr(harness, "car_link", None)
+    stop = getattr(link, "stop", None)
+    if stop is None:
+        return
+    try:
+        stop()
+    except Exception as exc:                              # noqa: BLE001 - 提示性兜底
+        printer(f"⚠ 收尾 car.stop() 未成功：{type(exc).__name__}: {exc}"
+                "（run_trial 自身的收尾 STOP 已发；若两次都没确认，harness 会抛 StopFailed）")
+
+
+def run_batch(harness, *, experiments, only=None, xlsx_path,
+              printer=print, write=compare.write_trial, archive=True) -> dict:
+    """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
+
+    返回统计：`n_trials / n_ok / n_failed / n_homing_failed / archive_path`。
+    安全异常（`StopFailed`/`BoundaryMarkersMoved`）原样冒泡中止整批。
+    """
+    trials = list(iterate_trials(experiments, only=only))
+    stats = {"n_trials": len(trials), "n_ok": 0, "n_failed": 0,
+             "n_homing_failed": 0, "archive_path": None}
+
+    for index, (exp, rep) in enumerate(trials, start=1):
+        start_xy = plan_start_xy(exp)
+        check_experiment_feasible(exp, start_xy)          # 缺起点/越界：当场报错
+        try:
+            home = harness.drive_to(start_xy[0], start_xy[1])
+            if not home.get("reached"):
+                stats["n_homing_failed"] += 1
+                trial = _homing_failed_trial(
+                    f"homing_{home.get('reason') or 'unknown'}")
+            else:
+                trial = harness.run_trial(exp)
+            summary = compare.trial_summary(trial)
+            write(trial, exp, xlsx_path=xlsx_path)        # 失败也写（留痕）
+            printer(format_trial_line(index, len(trials), exp, rep, summary))
+        finally:
+            _final_stop(harness, printer)                 # 每条结束 car.stop()
+        if summary["trial_ok"]:
+            stats["n_ok"] += 1
+        else:
+            stats["n_failed"] += 1
+
+    if archive and trials:
+        try:
+            stats["archive_path"] = str(compare.archive_workbook(xlsx_path))
+        except Exception as exc:                          # noqa: BLE001 - 归档失败不毁数据
+            printer(f"⚠ 归档失败（数据已入表）：{type(exc).__name__}: {exc}")
+    return stats
+
+
+def dry_run(*, experiments=matrix.EXPERIMENTS, only=None, printer=print) -> int:
+    """`--dry`：不开相机、不连车 —— 只做场地校验并打印每条的执行计划。"""
+    trials = list(iterate_trials(experiments, only=only))
+    if not trials:
+        printer(f"没有匹配 --only {only} 的实验。")
+        return 2
+    for index, (exp, rep) in enumerate(trials, start=1):
+        start_xy = plan_start_xy(exp)
+        check_experiment_feasible(exp, start_xy)
+        dx = float(exp.vx) * float(exp.duration_s) * 1000.0
+        dy = float(exp.vy) * float(exp.duration_s) * 1000.0
+        dpsi = float(exp.om) * float(exp.duration_s) * 180.0 / math.pi
+        ms = int(round(float(exp.duration_s) * 1000.0))
+        printer(
+            f"[{index:2d}/{len(trials)}] #{int(exp.id):02d} rep{rep + 1}/{int(exp.repeats)} "
+            f"{exp.desc}: 起点 ({start_xy[0]:+.1f}, {start_xy[1]:+.1f}) → "
+            f"终点 ({start_xy[0] + dx:+.1f}, {start_xy[1] + dy:+.1f}) mm；"
+            f"净转 {dpsi:+.1f}°；RUN {float(exp.vx):.4f} {float(exp.vy):.4f} "
+            f"{float(exp.om):.4f} {ms}")
+    printer(f"DRY：{len(trials)} 条计划全部通过场地校验（未开相机、未连车、未写表）。")
+    return 0
+
+
+@contextlib.contextmanager
+def _open_real_session():
+    """真机会话（只有非 `--dry` 路径才会走到这里）：相机 + 链路 + harness。
+
+    依赖全部延迟 import —— 本模块在被测试导入时不许碰硬件入口。
+    """
+    from car_link import CarLink
+    from vision_core import load_calib
+
+    from vgt.camera import CameraSession
+    from vgt.harness import Harness
+
+    with CameraSession() as cam, CarLink() as car:
+        yield Harness(car, cam, load_calib())
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Task 12 批量：矩阵 × repeats，归位 → 实验 → 对比入表（--dry 离线预演）")
+    parser.add_argument("--only", type=int, default=None, metavar="ID",
+                        help="只跑指定 experiment_id（默认全部）")
+    parser.add_argument("--dry", action="store_true",
+                        help="不开相机/不连车：只做场地校验并打印执行计划")
+    return parser.parse_args(argv)
+
+
+def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> int:
+    """CLI 入口。返回 0 = 全部通过；1 = 有条目失败（已入表标注）；2 = 用法错误。"""
+    args = parse_args(argv)
+    known = {int(e.id) for e in matrix.EXPERIMENTS}
+    if args.only is not None and args.only not in known:
+        printer(f"没有实验 #{args.only}：矩阵只有 {sorted(known)}。")
+        return 2
+    if args.dry:
+        return dry_run(experiments=matrix.EXPERIMENTS, only=args.only, printer=printer)
+
+    xlsx = Path(xlsx_path) if xlsx_path is not None else compare.DEFAULT_XLSX
+    factory = session_factory if session_factory is not None else _open_real_session
+    n_trials = sum(1 for _ in iterate_trials(matrix.EXPERIMENTS, only=args.only))
+    printer(f"=== Task 12 批量：{n_trials} 次（{len(matrix.EXPERIMENTS)} 条矩阵 × repeats"
+            f"{'，--only ' + str(args.only) if args.only is not None else ''}）"
+            f"→ {xlsx} ===")
+    with factory() as harness:
+        stats = run_batch(harness, experiments=matrix.EXPERIMENTS, only=args.only,
+                          xlsx_path=xlsx, printer=printer)
+    if stats["archive_path"]:
+        printer(f"已归档：{stats['archive_path']}")
+    printer(f"完成：{stats['n_ok']}/{stats['n_trials']} 通过；{stats['n_failed']} 条失败"
+            f"（其中归位失败 {stats['n_homing_failed']} 条）—— 失败条目已入表并标注 "
+            "trial_reason，可筛除后重跑。")
+    return 0 if stats["n_failed"] == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
