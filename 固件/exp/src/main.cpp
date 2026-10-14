@@ -27,6 +27,14 @@
  *          所以 PC 侧"还在跑 / 跑完了 / 死了"三种状态的判据是：
  *          持续收到 D 行 = 还在跑；收到 DONE = 跑完；D 行断了又没有 DONE = 死了。
  *
+ * 复位原因回报：
+ *   非正常复位（上电 POWERON / 软复位 SW 之外的，如 brownout、panic、看门狗）后，
+ *   PING 与 ID 的回复末尾会多一行 'RESET <原因名> count=<brownout 累计>'
+ *   （例：RESET ESP_RST_BROWNOUT count=1）；正常启动时不发这一行。
+ *
+ * 掉电缓解：
+ *   RUN/M 之后四轮按轮序错峰抬升（stagger.h），不再同时起转 —— 详见 stagger.h 的说明。
+ *
  * 硬件：FL{13,15} FR{12,14} RL{27,26} RR{25,33}
  *       编码器 A 相 FL32 FR34 RL35 RR36（单相，只能计数不能辨向）
  *       IMU GY-25T  Serial2  RX=37  (TX=38 仅在 YAWZERO 时使用)  9600 8N1
@@ -37,7 +45,9 @@
 #include <ArduinoOTA.h>
 #include <math.h>
 #include <lwip/sockets.h>   // send()/MSG_DONTWAIT：非阻塞发送（见 flushRunBuf）
+#include <esp_system.h>     // esp_reset_reason()：复位原因回报
 #include "wheel_map.h"
+#include "stagger.h"        // 四轮错峰抬升（防 brownout）
 
 // ---------------- 网络 ----------------
 static const char*    WIFI_SSID = "B1222";
@@ -48,6 +58,60 @@ static const uint16_t UDP_PORT  = 8267;
 WiFiServer server(TCP_PORT);
 WiFiUDP    udp;
 WiFiClient client;
+
+// ---------------- 复位原因 / brownout 记录 ----------------
+// 用途：PC 侧重连后（PING/ID）即可知道"上一段运行是不是被掉电（brownout）打断的"。
+//
+// 两个变量、两种存储，别混淆：
+//   g_reset_reason_rtc —— 本次启动的 esp_reset_reason()，存 RTC_DATA_ATTR（brief 指定）。
+//     ESP32 上 brownout 走软件复位路径（brownout ISR 先 esp_reset_reason_set_hint() 再软复位），
+//     IDF 的 esp_reset_reason_init 会把 hint 还原成 ESP_RST_BROWNOUT —— 已核对 core 2.0.17
+//     自带 libesp_system.a 里 reset_reason.c 的反汇编：原始原因是 SW 时，
+//     hint ∈ {PANIC, INT_WDT, TASK_WDT, BROWNOUT} 会被采用。所以重连后读到的
+//     reason 字符串就是 ESP_RST_BROWNOUT，而不是被软复位掩盖掉的 ESP_RST_SW。
+//   g_brownout_count —— 累计 brownout 复位次数。**必须存 .rtc_noinit（RTC_NOINIT_ATTR）**：
+//     IDF v4.4 的 bootloader 在**任何非 deep-sleep 复位**（含 brownout）都会把
+//     .rtc.data/.rtc.bss 从镜像重新装载（bootloader_support/src/esp_image_format.c 的
+//     should_load()："Reload the RTC memory segments whenever a non-deepsleep reset is
+//     occurring"），所以带初值的 RTC_DATA_ATTR 计数器在 brownout 后会被打回初值、
+//     永远数不到 2。.rtc_noinit 段不进镜像、不会被重装载，才能真正跨复位累计。
+//     冷启动（首次上电/烧录）或掉电过深时 RTC 内存内容是随机的，用起始魔数判定有效性：
+//     魔数不符就清零重来 —— 所以计数是"已确认的下界"，不是绝对次数。
+#define RTC_DIAG_MAGIC 0x5243484DUL   // "MHCR"
+RTC_NOINIT_ATTR uint32_t g_rtc_diag_magic;
+RTC_NOINIT_ATTR uint32_t g_brownout_count;
+RTC_DATA_ATTR uint32_t   g_reset_reason_rtc = ESP_RST_UNKNOWN;
+
+static const char* resetReasonName(uint32_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "ESP_RST_POWERON";
+    case ESP_RST_EXT:       return "ESP_RST_EXT";
+    case ESP_RST_SW:        return "ESP_RST_SW";
+    case ESP_RST_PANIC:     return "ESP_RST_PANIC";
+    case ESP_RST_INT_WDT:   return "ESP_RST_INT_WDT";
+    case ESP_RST_TASK_WDT:  return "ESP_RST_TASK_WDT";
+    case ESP_RST_WDT:       return "ESP_RST_WDT";
+    case ESP_RST_DEEPSLEEP: return "ESP_RST_DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "ESP_RST_BROWNOUT";
+    case ESP_RST_SDIO:      return "ESP_RST_SDIO";
+    default:                return "ESP_RST_UNKNOWN";
+  }
+}
+
+// 正常复位 = 上电 / esp_restart() 软复位；其余（brownout、panic、看门狗…）都要报告。
+static bool resetIsAbnormal() {
+  return g_reset_reason_rtc != ESP_RST_POWERON && g_reset_reason_rtc != ESP_RST_SW;
+}
+
+// setup() 里尽早调用一次：读本次复位原因、维护跨复位的 brownout 计数。
+static void initResetDiag() {
+  if (g_rtc_diag_magic != RTC_DIAG_MAGIC) {     // 冷启动/掉电过深：内容不可信，重开计数
+    g_rtc_diag_magic = RTC_DIAG_MAGIC;
+    g_brownout_count = 0;
+  }
+  g_reset_reason_rtc = (uint32_t)esp_reset_reason();
+  if (g_reset_reason_rtc == ESP_RST_BROWNOUT) g_brownout_count++;
+}
 
 // ---------------- 电机 ----------------
 const int MOTOR_PINS[4][2] = {{13, 15}, {12, 14}, {27, 26}, {25, 33}};
@@ -165,9 +229,32 @@ uint32_t next_sample_us = 0;
 
 // 起步 kick：RUN 开始时先给一段大 PWM 突破静摩擦，之后回落到正常映射值
 static const int      KICK_DUTY = 105;   // 脉冲目标幅值（可在 100~115 微调）
-static const uint32_t KICK_MS   = 150;   // 脉冲时长(ms)
-bool     kicking      = false;
-uint32_t kick_until_us = 0;
+static const uint32_t KICK_MS   = 150;   // 脉冲时长(ms)，从**各轮自己的放行时刻**起算
+
+// 错峰抬升窗口（stagger.h）：RUN/M 之后四轮按轮序每 STAGGER_STEP_MS 放行一个，
+// 放行后先给 kick 幅值、KICK_MS 后再回落到目标 duty。窗口内每次 loop 迭代重算并下发；
+// 窗口结束（最后一个轮子 kick 也到时）收敛到目标值并关闭。
+// STAGGER_ENABLED=false 时放行延迟全为 0，等价于旧行为（四轮立即 kick、KICK_MS 后一起回落）。
+bool     ramp_active    = false;
+uint32_t ramp_t0_us     = 0;
+int      ramp_target[4] = {0, 0, 0, 0};   // 各轮最终目标 duty
+int      ramp_kick[4]   = {0, 0, 0, 0};   // 各轮 kick 阶段幅值（M 直接驱动时 = 目标值）
+
+// 错峰抬升窗口的当前输出：第 i 个轮子在放行延迟之前保持 0；放行后前 KICK_MS 给 kick 幅值，
+// 之后回落到目标 duty。放行延迟来自 stagger.h（开关关闭时全为 0，apply_stagger 也是空操作）。
+void applyRamp() {
+  uint32_t elapsed_ms = (uint32_t)((micros() - ramp_t0_us) / 1000);
+  int duty[4];
+  for (int i = 0; i < 4; i++) {
+    int32_t rel = (int32_t)elapsed_ms - (int32_t)staggerDelayMs(i);   // 该轮自己的进度(ms)
+    duty[i] = (rel < (int32_t)KICK_MS) ? ramp_kick[i] : ramp_target[i];
+  }
+  apply_stagger(duty, ramp_t0_us);       // 还没轮到放行的轮位在这里被清零
+  for (int i = 0; i < 4; i++) setMotor(i, duty[i]);
+}
+
+// 错峰抬升窗口的总时长：最后一个轮子放行 + 它自己的 kick 结束。
+static uint32_t rampSpanMs() { return staggerDelayMs(3) + KICK_MS; }
 
 // ---------------- 输出 ----------------
 // （sendLine 定义移到了 run 环形缓冲之后：它现在走 ring + 非阻塞 flush）
@@ -194,9 +281,16 @@ uint32_t kick_until_us = 0;
 // 【环形缓冲的坑】回绕时绝不能盖掉还没发出去的数据。
 //   run_head —— 已写入总字节数（绝对游标，写入位 = run_head % CAP）
 //   run_tail —— 已 flush 总字节数（绝对游标，发出位 = run_tail % CAP）
-//   两者之差就是"还没发出去的字节数"。RUN / STOP / M 换指令时必须**两个游标一起归零**：
-//   只清一个，另一个还是上一轮的值，run_head - run_tail 会以 size_t 下溢成一个巨大数，
-//   缓冲立刻被判满，之后所有样本被静默丢弃 —— 这是本改动最容易埋的雷。
+//   两者之差就是"还没发出去的字节数"。RUN / STOP / M 换指令时必须**两个游标一起归零**。
+//   【只清一个的后果 —— 曾写反过，勿再写反】举 head=5、tail=11（只清了 head，tail 还留着上一轮的值）：
+//   ESP32 的 size_t 是 32 位，run_head - run_tail = 2^32-6 = 4294967290；
+//   判满式 RUN_BUF_CAP - (run_head - run_tail) 在无符号回绕后 = 32768+6 = 32774，
+//   **大于任何一行需要的空间** ⇒ 缓冲被判成"还有空间"，写入继续推进、回绕后
+//   **覆盖还没发出去的老数据**（不是"被判满、静默丢弃"—— 那个说法是反的）。
+//   （64 位主机上同一算术会得到 2^64-6 ≈ 1.8e19 —— 那是主机侧的演示值，ESP32 上不是它。）
+//   "只清 run_pending" 本身不会下溢（tail ≤ head 的不变式没被破坏）；
+//   下溢只来自**两个游标的不对称复位**——所以复位一律走 resetRunBuf()。
+//   回归锁：固件/exp/host_test/（把这段逻辑拷去主机跑，含不对称复位的变异自检）。
 #define RUN_BUF_CAP     32768
 #define RUN_FLUSH_LINES 5        // 攒够几行 flush 一批（改它只改"每批几行"，周期随之线性变化）
 static char   run_buf[RUN_BUF_CAP];
@@ -267,6 +361,15 @@ void sendLine(const String& s) {
   flushRunBuf();                        // 非阻塞，发得出去就发
 }
 
+// 非正常复位时，在 PING/ID 回复末尾补一行复位原因；正常启动不发（PC 侧解析不用改）。
+static void sendResetLine() {
+  if (!resetIsAbnormal()) return;
+  char b[80];
+  snprintf(b, sizeof(b), "RESET %s count=%lu", resetReasonName(g_reset_reason_rtc),
+           (unsigned long)g_brownout_count);
+  sendLine(b);
+}
+
 // tag: "D"=实验运行样本(时间=相对RUN起点)  "I"=空闲样本(时间=millis)
 void streamSample(const char* tag, uint32_t t_ms) {
   long e[4]; readEncoders(e);
@@ -294,8 +397,8 @@ void handleLine(String line) {
   line.trim();
   if (!line.length()) return;
 
-  if (line.equalsIgnoreCase("PING")) { sendLine("PONG"); return; }
-  if (line.equalsIgnoreCase("ID"))   { sendLine("MECANUM-ESP32 " + WiFi.localIP().toString()); return; }
+  if (line.equalsIgnoreCase("PING")) { sendLine("PONG"); sendResetLine(); return; }
+  if (line.equalsIgnoreCase("ID"))   { sendLine("MECANUM-ESP32 " + WiFi.localIP().toString()); sendResetLine(); return; }
   if (line.equalsIgnoreCase("CHIP")) {
     sendLine("chip=" + String(ESP.getChipModel()) + " cores=" + String(ESP.getChipCores())
              + " rev=" + String(ESP.getChipRevision()));
@@ -305,7 +408,7 @@ void handleLine(String line) {
     sendLine("PING|ID|CHIP|M f f f f|STOP|ZENC|RUN vx vy om ms|STREAM 0/1|SNIFF|IMU <rxpin> [baud]");
     return;
   }
-  if (line.equalsIgnoreCase("STOP")) { running = false; kicking = false; resetRunBuf(); stopAll(); sendLine("OK STOP"); return; }
+  if (line.equalsIgnoreCase("STOP")) { running = false; ramp_active = false; resetRunBuf(); stopAll(); sendLine("OK STOP"); return; }
   if (line.equalsIgnoreCase("YAWZERO")) { sendLine("ERR TX pin unavailable (RX-only); zero yaw in software"); return; }
   if (line.equalsIgnoreCase("ZENC")) { zeroEncoders(); sendLine("OK ZENC"); return; }
   if (line.startsWith("IMU ")) {
@@ -336,8 +439,13 @@ void handleLine(String line) {
   if (line.startsWith("M ")) {
     int d[4] = {0, 0, 0, 0};
     if (sscanf(line.c_str(), "M %d %d %d %d", &d[0], &d[1], &d[2], &d[3]) == 4) {
-      running = false; kicking = false; resetRunBuf();
-      for (int i = 0; i < 4; i++) setMotor(i, d[i]);
+      running = false;
+      resetRunBuf();
+      // 直接驱动：kick 幅值 = 目标值（无 kick 语义），但同样走错峰放行（brownout 也来自 M 四轮同驱）
+      for (int i = 0; i < 4; i++) { ramp_target[i] = d[i]; ramp_kick[i] = d[i]; }
+      ramp_t0_us = micros();
+      ramp_active = true;
+      applyRamp();          // 立即放行第 0 个轮子（其余轮子由 loop 的窗口块按点放行）
       sendLine("OK M");
     } else sendLine("ERR need 4 ints");
     return;
@@ -356,7 +464,8 @@ void handleLine(String line) {
       zeroEncoders();
       resetRunBuf();        // 环形缓冲的读写游标必须一起归零（run_pending 也在这里清）
       bodyToPWM(vx, vy, om, run_wheel_pwm);
-      // 起步 kick：每个转动轮的幅值至少抬到 KICK_DUTY，方向与正常一致；停转轮保持 0
+      // 起步 kick：每个转动轮的幅值至少抬到 KICK_DUTY，方向与正常一致；停转轮保持 0。
+      // 错峰抬升开启时，各轮的 kick 从**它自己的放行时刻**起算（见 applyRamp/rampSpanMs）。
       for (int i = 0; i < 4; i++) {
         int base = run_wheel_pwm[i];
         int kick = 0;
@@ -365,13 +474,15 @@ void handleLine(String line) {
           if (mag < KICK_DUTY) mag = KICK_DUTY;
           kick = (base < 0) ? -mag : mag;
         }
-        setMotor(i, kick);
+        ramp_kick[i]   = kick;
+        ramp_target[i] = base;
       }
-      run_t0_us = micros();
+      run_t0_us  = micros();
       run_dur_us = (uint32_t)ms * 1000UL;
-      kick_until_us = run_t0_us + (uint32_t)KICK_MS * 1000UL;
-      kicking = true;
+      ramp_t0_us = run_t0_us;
+      ramp_active = true;
       running = true;
+      applyRamp();          // 立即放行第 0 个轮子（其余轮子由 loop 的窗口块按点放行）
       char b[112];
       snprintf(b, sizeof(b), "OK RUN pwm=%d,%d,%d,%d ms=%ld kick=%dms/%d",
                run_wheel_pwm[0], run_wheel_pwm[1], run_wheel_pwm[2], run_wheel_pwm[3], ms,
@@ -388,6 +499,7 @@ void setup() {
   stopAll();              // 且会污染编码器计数
   setupEncoders();
   zeroEncoders();
+  initResetDiag();        // 尽早：读复位原因、维护 brownout 计数（RESET 行与启动日志都用它）
 
   Serial.begin(115200);
   // 经典 ESP32 的 GPIO38 是「只输入」，不能当 UART TX（会 panic）。
@@ -397,6 +509,9 @@ void setup() {
 
   Serial.println("\n=== MECANUM experiment FW ===");
   Serial.printf("chip=%s cores=%d\n", ESP.getChipModel(), ESP.getChipCores());
+  Serial.printf("reset_reason=%s brownouts=%lu stagger=%s step=%ums\n",
+                resetReasonName(g_reset_reason_rtc), (unsigned long)g_brownout_count,
+                STAGGER_ENABLED ? "on" : "off", (unsigned)STAGGER_STEP_MS);
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -422,10 +537,16 @@ void loop() {
   ArduinoOTA.handle();
   imuPump();
 
-  // 起步 kick 到时 -> 回落到正常映射 PWM
-  if (kicking && (int32_t)(micros() - kick_until_us) >= 0) {
-    kicking = false;
-    for (int i = 0; i < 4; i++) setMotor(i, run_wheel_pwm[i]);
+  // 错峰抬升窗口：每次迭代重算四轮输出；最后一轮放行且它的 kick 到时后，
+  // 收敛到目标值并关闭窗口（此后轮子保持目标 PWM，不再重算）。
+  if (ramp_active) {
+    uint32_t elapsed_ms = (uint32_t)((micros() - ramp_t0_us) / 1000);
+    if (elapsed_ms >= rampSpanMs()) {
+      ramp_active = false;
+      for (int i = 0; i < 4; i++) setMotor(i, ramp_target[i]);
+    } else {
+      applyRamp();
+    }
   }
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -470,7 +591,7 @@ void loop() {
       streamSample("D", runElapsedMs());
       if ((micros() - run_t0_us) >= run_dur_us) {
         running = false;
-        kicking = false;
+        ramp_active = false;      // 跑得比错峰窗口还短的 RUN：收窗口，别让 ramp 再把轮子点起来
         stopAll();
         streamSample("D", runElapsedMs());   // 停车后的最后一个样本，仍用相对时间
         flushRunBuf();                        // 把末尾不足一批的残余样本发出去（流式之后这里只清尾账）
