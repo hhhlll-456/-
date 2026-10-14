@@ -65,6 +65,76 @@ rad/s（换算车速 ≈0.4 m/s）。也就是说 400 ms 脉冲的最小位移�
   **重开一个 `Harness`**（没有重置基线的接口，故意的）；
 - `drive_to` 里 `locate()` 抛出的异常立即向上冒泡 = "立即中止"。
 
+## run_trial（Task 11）：单次实验编排
+
+    # 一条实验的完整时序（真机用法）：
+    cd 实验
+    python3 -c "
+    from vgt.harness import Harness
+    from vgt.camera import CameraSession
+    from vgt import matrix
+    from vision_core import load_calib
+    from car_link import CarLink
+    with CameraSession() as cam, CarLink() as car:
+        h = Harness(car, cam, load_calib(), home_xy=(0.0, 0.0))
+        res = h.run_trial(matrix.EXPERIMENTS[0])
+        print(res['ok'], res['reason'], res['vision_delta'], res['odometry_delta'])
+    "
+
+时序（每步的"为什么"都在代码注释里）：
+
+1. 开场 PING（链路探活 + RESET 基线）→ STOP（清环 + 兜底停车）→ 等 0.3 s；
+2. `locate()` 抓**起点**帧（缺边界码/漂移 → `boundary_moved`；解不出 ID29 →
+   `no_vehicle_marker`）；
+3. 下发 `RUN vx vy om ms`，同一时刻开始读流式 `D` 行；
+4. 第一条 `t_ms ≥ ms/2` 的样本到达时抓**中点**帧 —— **抓失败不致命**，降级为
+   起/终两点（Review Focus #1），失败原因进 `warnings`；
+5. 收到 `DONE`（**只认 DONE**，R56：实测墙钟延迟最多 10.87 s，所以判完超时 ≥15 s）
+   → 等 0.4 s → 抓**终点**帧；
+6. 没有 `DONE`（超时/静默/断链）→ 失控保护（STOP；不确认就重连 + STOP）→
+   **强制重连 + 查 RESET 行**再定性（R56）：查到**新的** RESET 文本 = `board_reset`，
+   没有 = `deadline_timeout`。不能"超时即判 brownout"（环满时 `DONE` 本身会被丢）；
+7. 收尾**无条件** `STOP`（异常/中断路径同样执行，见 `run_trial` 的 finally）。
+
+**抓帧新鲜度**：三个关键帧都走 `locate()` 里的 `camera.grab()` **默认 `fresh=True`**
+（R54/C1）："等 0.3/0.4 s 沉降再抓帧"本身**不保鲜** —— 驱动队列会在这段静置里囤下
+运动中的老帧，`vision_delta` 会静默算错。测试用 `camera.calls == [True, True, True]`
+钉死这条。
+
+**有符号判据（Task 9 复核 Important 3 的硬要求）**：`vision_delta` 与
+`odometry_delta` 只比 `dist_mm`（标量）抓不住"平移符号整体翻转" —— 量级对、方向反时
+相对差仍 ≈ 0，会静默通过第一次上机验收。所以 `run_trial` 把里程计的（车体系）位移用
+起点 yaw 转到场地系（`body_delta_to_field`），算 `dot(vision_Δxy, odometry_Δxy)`：
+
+- 两向量模长都 ≥ `SIGN_MIN_NORM_MM`（5 mm）且点积 ≤ 0 → `ok=False,
+  reason="sign_mismatch"`，`sign_ok=False` 落进结果；
+- 任一向量太短（原地旋转的漂移、没动的实验）→ `sign_ok=None` = "判不出方向"，
+  既不算通过也不算失败（不冤枉合法数据）。
+
+**`ok=False` 的 `reason` 词表**（`TRIAL_REASONS`；比 plan 的 brief 多几个，都是实现里
+真的会遇到、且必须有名有姓才能让 Task 12 标注行 / 事后分诊的失败）：
+
+| reason | 含义 |
+|---|---|
+| `boundary_moved` | 起点/终点帧缺边界码、建不出场地系，或 R18 漂移超限 |
+| `no_vehicle_marker` | 起点/终点帧解不出 ID29 |
+| `deadline_timeout` | `done_timeout_s` 内没等到 `DONE`，且重连后没有**新的** RESET 证据 |
+| `board_reset` | 同上，但查到了新的 `RESET` 行（brownout/panic/看门狗） |
+| `run_rejected` | `RUN` 被固件回 `ERR` 拒了（没有在跑） |
+| `no_telemetry` | `DONE` 到了但 `D` 样本 < 2，里程计无法积分（不能拿 0 当"没动"） |
+| `camera_failed` | 关键帧抓帧失败（`CameraUnavailable`，R39 同句柄不重试） |
+| `sign_mismatch` | 有符号判据不过（见上） |
+| `trial_error` | 未预期异常（原文进 `warnings`） |
+
+`mid_capture_failed` **不在** `reason` 里 —— brief 的 Step 2 明确要求中点失败
+`ok=True`；它只作为 `result["mid_capture_failed"]` 与 `warnings` 的标注。
+
+**停止安全性（R58 未修缺陷的兜底）**：任何一次必要的 `STOP` 无法确认、且本次实验
+已经发过 `RUN`、又没有"DONE 已停车"或已确认 `OK STOP` 的证据时，抛 `StopFailed`
+（消息含"立即给车断电"）。收到 `DONE` 本身是停车证据（固件在发 `DONE` 前执行
+`stopAll()`），此时收尾 STOP 未确认只记 `stop_confirmed=False` + 警告，不虚报
+`StopFailed`。
+
 ## 链路协议侧（全是踩过的坑）
 
 - **RESET-aware（R58 复核 Important 4）**：板子非正常复位后，每条 `PING`/`ID`
@@ -113,6 +183,10 @@ from vision_core.markers import detect_markers
 from verify_vision import REASON_BOUNDARY_MOVED, REASON_NO_VEHICLE
 
 from . import matrix
+from . import odometry
+# `CameraUnavailable` 只在 run_trial 的收尾归类里用到；import 它不会开相机
+# （打开设备只发生在 CameraSession.__enter__）。
+from .camera import CameraUnavailable
 
 # ---- 常量（每个都不是随手取的，出处见模块 docstring 与各自注释） --------------------
 
@@ -138,6 +212,46 @@ DEFAULT_HANDSHAKE_TIMEOUT_S = 8.0
 # 单次 locate() 解不出（掉码/反光）时的重试次数（每次重抓一帧）。
 DEFAULT_LOCATE_TRIES = 3
 _LOCATE_RETRY_PAUSE_S = 0.05
+
+# ---- run_trial（Task 11）的时序与判据常量 ------------------------------------------
+
+# 起点/终点抓帧前的沉降等待（plan 的 0.3 s / 0.4 s）。⚠ 它**不负责**帧新鲜度 ——
+# 驱动队列会在这段等待里囤运动中的老帧（R54），新鲜度由 grab(fresh=True) 负责。
+DEFAULT_START_SETTLE_S = 0.3
+DEFAULT_AFTER_DONE_SETTLE_S = 0.4
+# 中点抓帧的触发线：`D` 行的 `t_ms` 首次 ≥ `ms · 该系数`（固件 D 行的时间就是
+# 相对 RUN 起点的 ms，main.cpp:373-374）。
+DEFAULT_MID_FRACTION = 0.5
+# PONG 之后补收 RESET 行的短暂 drain：固件把 `RESET …` 单独一行发在 PONG **后面**
+# （main.cpp:400-401），同一 recv 批次可能读不到，漏了就会把上一轮的证据弄脏。
+_PROBE_TAIL_DRAIN_S = 0.2
+
+# 里程计标定常量（Task 9 的 `integrate_encoders` 要求显式传参；真机默认值在这）。
+# 出处：`c_1rev` = `固件/exp/data/wheelmap_{airborne,grounded}.json` 的实测值；
+# `sign` = spec §2.3 的 forward 符号；`LXY=(轴距+轮距)/2=128.25 mm` 是**固件值**
+# （R47；实测 128.5，差 0.25 mm，别当轴距用）；`r_eff` 见 Task 9 的标定口径。
+ODOM_C_1REV = (1276.0, 1270.0, 1276.0, 1274.0)
+ODOM_SIGN = (-1.0, 1.0, -1.0, 1.0)
+ODOM_R_EFF_MM = 33.5
+ODOM_LXY_OVER_R = 0.12825 / 0.0335
+
+# 有符号判据的门槛：两个位移向量的模长都 ≥ 5 mm 才谈方向（矩阵里最短的横移是
+# 50 mm，5 mm 以下是噪声/漂移，不判）；yaw 同理，1° 以下不判。
+SIGN_MIN_NORM_MM = 5.0
+YAW_SIGN_MIN_DEG = 1.0
+
+# run_trial 的 ok=False 词表（模块 docstring 有逐条说明）。
+TRIAL_REASONS = (
+    "boundary_moved",
+    "no_vehicle_marker",
+    "deadline_timeout",
+    "board_reset",
+    "run_rejected",
+    "no_telemetry",
+    "camera_failed",
+    "sign_mismatch",
+    "trial_error",
+)
 
 # P 控制参数：v_cmd = clamp(KP · |err|, v_min, v_max)，单位 m/s。
 # KP=0.001 的含义：100 mm 误差 → 0.1 m/s（与实验矩阵 0.05–0.2 m/s 同量级）。
@@ -215,6 +329,59 @@ def body_command(err_x_mm, err_y_mm, yaw_deg, *,
     c, s = math.cos(th), math.sin(th)
     ux, uy = ex / d, ey / d
     return (speed * (ux * c - uy * s), speed * (-ux * s - uy * c))
+
+
+def body_delta_to_field(dx_mm, dy_mm, yaw_deg):
+    """车体系位移 `(前, 左)` → 场地系位移 `(x, y)`（mm），用起点 yaw 旋转。
+
+    与 `body_command` 同一条符号链（见模块 docstring）：`X_body=(cosθ,−sinθ)`、
+    `Y_body=(−sinθ,−cosθ)`，于是
+
+        field = dx·X_body + dy·Y_body = (dx·cosθ − dy·sinθ, −dx·sinθ − dy·cosθ)
+
+    `odometry.integrate_encoders` 的轨迹就落在**起点的车体系**里；要和视觉的
+    场地系位移比方向（有符号判据），必须先转过来。
+    """
+    th = math.radians(float(yaw_deg))
+    c, s = math.cos(th), math.sin(th)
+    dx, dy = float(dx_mm), float(dy_mm)
+    return (dx * c - dy * s, -dx * s - dy * c)
+
+
+def translation_sign_ok(vision_dxy, odometry_field_dxy, *, min_norm_mm=SIGN_MIN_NORM_MM):
+    """有符号判据（Task 9 复核 Important 3）：两个位移向量同向 → True，反向 → False。
+
+    只比 `dist_mm`（标量）抓不住"平移符号整体翻转"：量级对、方向反时相对差 ≈ 0，
+    第一次上机验收（`dist_diff_pct < 20%`）会**静默通过**。这里额外钉住方向：
+    两个向量都在场地系里，点积 `dot > 0` 才叫同向。
+
+    任一向量模长 < `min_norm_mm` 时方向无意义（原地旋转的漂移、没动的实验），
+    返回 None = "判不出"：既不算通过也不算失败，不许拿噪声冤枉合法数据。
+    """
+    vx, vy = float(vision_dxy[0]), float(vision_dxy[1])
+    ox, oy = float(odometry_field_dxy[0]), float(odometry_field_dxy[1])
+    if math.hypot(vx, vy) < min_norm_mm or math.hypot(ox, oy) < min_norm_mm:
+        return None
+    return (vx * ox + vy * oy) > 0.0
+
+
+def _yaw_sign_ok(vision_yaw_deg, odometry_yaw_deg, *, min_deg=YAW_SIGN_MIN_DEG):
+    """yaw 净转角的方向一致性（信息性字段，**不**参与 `ok`）。
+
+    转角太小（任一 < `min_deg`）时返回 None。平移有专门的判据；yaw 的翻转会以
+    `yaw_diff_deg ≈ ±90°` 的形式在 Task 12 的表里大声暴露，不需要在这里升级成
+    失败，但并排记下来对分诊有用。
+    """
+    v, o = float(vision_yaw_deg), float(odometry_yaw_deg)
+    if abs(v) < min_deg or abs(o) < min_deg:
+        return None
+    return (v > 0.0) == (o > 0.0)
+
+
+def _wrap180_deg(deg):
+    """归一到 (−180, 180]（与 `vision_core.field._wrap180` 同口径；不跨包 import 私有名）。"""
+    wrapped = (float(deg) + 180.0) % 360.0 - 180.0
+    return 180.0 if wrapped == -180.0 else wrapped
 
 
 def _split_glue(line: str) -> list[str]:
@@ -565,26 +732,364 @@ class Harness:
                 time.sleep(_LOCATE_RETRY_PAUSE_S)
         return None
 
+    # ---- 实验编排：单次 trial（Task 11） --------------------------------------------
+
+    def run_trial(self, exp, *, mid_fraction=DEFAULT_MID_FRACTION,
+                  settle_before_start_s=DEFAULT_START_SETTLE_S,
+                  settle_after_done_s=DEFAULT_AFTER_DONE_SETTLE_S,
+                  c_1rev=ODOM_C_1REV, sign=ODOM_SIGN,
+                  l_xy_over_r=ODOM_LXY_OVER_R, r_eff_mm=ODOM_R_EFF_MM):
+        """跑一条实验（`vgt.matrix.Experiment`）：起/中/终三点视觉真值 + 流式遥测 + 里程计。
+
+        返回字典（`ok=False` 的 `reason` 词表见模块 docstring）：
+
+            {"ok", "reason", "exp_id", "run_line", "run_ms",
+             "vision": {"start", "mid", "end"},          # None = 该帧没解出来
+             "vision_delta": {"dist_mm", "yaw_deg", "dx_mm", "dy_mm"} | None,
+             "odometry_delta": {"dist_mm", "yaw_deg", "dx_mm", "dy_mm"} | None,
+             "samples", "n_samples", "mid_capture_failed",
+             "sign_ok", "sign_dot_mm2", "yaw_sign_ok",     # 有符号判据（Important 3）
+             "stop_confirmed", "events", "reset_lines", "warnings"}
+
+        **失败不抛**（标 `reason` 交给批处理继续）；例外只有三类：
+
+        1. 必要 STOP 无法确认且没有停车证据 → `StopFailed`（收到它请**给车断电**）；
+        2. `exp`/参数非法 → `ValueError`（连开场 STOP 都不发）；
+        3. `KeyboardInterrupt` 等原样冒泡 —— 但收尾 STOP 已经在 finally 里发过。
+
+        任何一次 RUN 之后都有停车证据链：`DONE`（固件先 `stopAll()` 再发，
+        main.cpp:592-598）或确认过的 `OK STOP`；两者都没有、收尾 STOP 也发不出去时，
+        本方法**只能**抛 `StopFailed` —— 不许静默把"不知道停没停"当成功。
+
+        时序与抓帧新鲜度（R54）见模块 docstring 的 `run_trial` 一节。
+        `c_1rev/sign/l_xy_over_r/r_eff_mm` 直接透传给 `odometry.integrate_encoders`。
+        """
+        ms = int(round(float(exp.duration_s) * 1000.0))
+        if ms < 1:
+            raise ValueError(
+                f"实验 #{getattr(exp, 'id', '?')} 的 duration_s={exp.duration_s!r} 取整后 "
+                f"是 {ms} ms：固件 RUN 的 ms 必须 ≥ 1。")
+        frac = float(mid_fraction)
+        if not (0.0 < frac < 1.0):
+            raise ValueError(f"mid_fraction 必须在 (0,1) 里，实际 {mid_fraction!r}")
+        settle_start = float(settle_before_start_s)
+        settle_done = float(settle_after_done_s)
+        if settle_start < 0.0 or settle_done < 0.0:
+            raise ValueError(
+                f"沉降等待不能为负：settle_before_start_s={settle_start!r}、"
+                f"settle_after_done_s={settle_done!r}")
+
+        run_line = "RUN {:.4f} {:.4f} {:.4f} {}".format(
+            float(exp.vx), float(exp.vy), float(exp.om), ms)
+        cfg = {"mid_fraction": frac, "settle_before_start_s": settle_start,
+               "settle_after_done_s": settle_done}
+
+        events: list[dict] = []
+        warns: list[str] = []
+        samples: list[dict] = []
+        # state 记录"做到哪一步了"，收尾时据此判断 StopFailed 的严重度：
+        #   run_sent      —— 已经给车发过 RUN（发之前车不会有我们造成的运动）；
+        #   stop_evidence —— RUN 之后有停车证据（DONE 或确认过的 OK STOP）；
+        #   baseline_resets —— 开场时的 RESET 文本快照（R56 定性用）。
+        state = {"run_sent": False, "stop_evidence": False,
+                 "baseline_resets": frozenset()}
+
+        result = {
+            "ok": False,
+            "reason": None,
+            "exp_id": int(getattr(exp, "id", -1)),
+            "run_line": run_line,
+            "run_ms": ms,
+            "vision": {"start": None, "mid": None, "end": None},
+            "vision_delta": None,
+            "odometry_delta": None,
+            "samples": samples,
+            "n_samples": 0,
+            "mid_capture_failed": False,
+            "sign_ok": None,
+            "sign_dot_mm2": None,
+            "yaw_sign_ok": None,
+            "stop_confirmed": False,
+            "events": events,
+            "reset_lines": [],
+            "warnings": warns,
+        }
+
+        pending = None
+        try:
+            self._trial_body(exp, cfg, state, result, run_line, ms)
+        except StopFailed as exc:
+            pending = exc                       # 已经是最严重的状态，别包装
+        except CameraUnavailable as exc:
+            result["reason"] = "camera_failed"
+            warns.append(f"关键帧抓帧失败（{type(exc).__name__}）：{exc}")
+        except BoundaryMarkersMoved as exc:
+            result["reason"] = "boundary_moved"
+            result["boundary_error"] = str(exc)
+            warns.append(f"边界码漂移超限：{exc}")
+        except Exception as exc:
+            result["reason"] = "trial_error"
+            warns.append(f"未预期异常 {type(exc).__name__}：{exc}")
+        except BaseException as exc:            # KeyboardInterrupt 等：停车后再冒泡
+            pending = exc
+        finally:
+            # 硬要求：实验结束**无论如何**都发 STOP（异常/中断路径也走到这里）。
+            stopped = self._try_stop(self.car_link)
+            result["stop_confirmed"] = stopped
+            events.append({"event": "final_stop", "ok": stopped})
+            if not stopped:
+                msg = ("收尾兜底 STOP 未确认：链路可能已死/固件卡住，不能从本次编排"
+                       "推断车已停（R58：WiFi 掉线时固件不执行 RUN 的到时停车）。")
+                warns.append(msg)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+
+        if pending is not None:
+            if isinstance(pending, StopFailed):
+                raise pending
+            if not result["stop_confirmed"] and state["run_sent"] and not state["stop_evidence"]:
+                exc = StopFailed(
+                    "run_trial 异常收尾时 STOP 未确认，且没有 DONE/OK STOP 的停车证据"
+                    f"（本次已发过 RUN）。车可能还在开 —— 立即给车断电。"
+                    f"（同时还有一个异常在冒泡：{type(pending).__name__}: {pending}）")
+                exc.events = list(events)
+                raise exc from pending
+            raise pending
+
+        # 收尾 STOP 之后统一算指标：失败条目也带上能算的证据（Task 12 要标注行）。
+        self._trial_metrics(result, samples, c_1rev=c_1rev, sign=sign,
+                            l_xy_over_r=l_xy_over_r, r_eff_mm=r_eff_mm)
+        if result["reason"] is None and result["sign_ok"] is False:
+            # 有符号判据：量级对、方向反 —— 只比 dist_mm 会静默通过的那一类。
+            result["reason"] = "sign_mismatch"
+        result["ok"] = result["reason"] is None
+        result["reset_lines"] = list(self.reset_lines)
+
+        if not result["stop_confirmed"] and state["run_sent"] and not state["stop_evidence"]:
+            exc = StopFailed(
+                "run_trial 收尾 STOP 未确认，且没有收到 DONE（固件没有执行到停车）："
+                "车可能还在开 —— 立即给车断电。")
+            exc.events = list(events)
+            raise exc
+        return result
+
+    def _trial_body(self, exp, cfg, state, result, run_line, ms):
+        """`run_trial` 的主时序：开场 → 起点 → RUN → 中点 → 终点。
+
+        只负责"做到哪里算哪里"并填 `result`；异常按语义留给 `run_trial` 归类
+        （`StopFailed`/`CameraUnavailable`/`BoundaryMarkersMoved` 原样冒泡）。
+        """
+        events = result["events"]
+        warns = result["warnings"]
+        samples = result["samples"]
+
+        # ① 开场：PING 探活（同时拿到 RESET 基线）→ STOP（清环 + 兜底停车）。
+        #    开场就确认不了"链路活着且车已停"就别开实验 —— 上一轮若在失控保护上
+        #    漏网，车可能还在开，起点帧和 RUN 都会发生在错误的状态上。
+        if self._probe_resets() is None:
+            self._reconnect_or_raise(events, "open_probe")
+        if not self._try_stop(self.car_link):
+            self._reconnect_or_raise(events, "open_stop")
+        self._drain_pending(self.car_link)
+        # RESET 基线：此刻已经见过的文本（R58 的 RESET 行每次 PING/ID 都重发，
+        # 只有**新的**文本才是本段实验里的新复位证据）。
+        state["baseline_resets"] = frozenset(text for _wall, text in self.reset_lines)
+
+        # ② 起点：等车静止再抓帧。等待不保鲜（R54），新鲜度在 locate() 里。
+        time.sleep(max(0.0, float(cfg["settle_before_start_s"])))
+        start = self._locate_retry()
+        if start is None:
+            result["reason"] = self.last_locate_reason or "no_vehicle_marker"
+            return
+        result["vision"]["start"] = tuple(start)
+
+        # ③ 下发 RUN；从流式遥测里触发中点抓帧（非致命）。
+        mid_state = {"attempted": False}
+
+        def on_sample(sample):
+            if mid_state["attempted"] or sample["t_ms"] < ms * cfg["mid_fraction"]:
+                return
+            mid_state["attempted"] = True
+            try:
+                pos = self.locate()
+            except Exception as exc:            # Review Focus #1：中点失败不致命
+                result["mid_capture_failed"] = True
+                warns.append(f"mid_capture_failed: {type(exc).__name__}: {exc}")
+                return
+            if pos is None:
+                result["mid_capture_failed"] = True
+                warns.append(f"mid_capture_failed: {self.last_locate_reason}"
+                             "（降级为起/终两点）")
+                return
+            result["vision"]["mid"] = tuple(pos)
+
+        try:
+            self._send_line(self.car_link, run_line)
+        except Exception as exc:
+            # 整行没发出去 = 固件不会执行（它按行读）：但链路状态未知，按"等待失败"兜底。
+            outcome, stats = "closed", _empty_stats(
+                f"发送失败：{type(exc).__name__}: {exc}")
+        else:
+            state["run_sent"] = True
+            outcome, stats = self._wait_done(self.car_link, samples=samples,
+                                             on_sample=on_sample)
+
+        rec = {"event": "run_wait", "outcome": outcome,
+               "run_reply": stats.get("run_reply"), "n_d": stats.get("n_d", 0),
+               "n_reset": stats.get("n_reset", 0), "n_other": stats.get("n_other", 0)}
+        if stats.get("errors"):
+            rec["errors"] = list(stats["errors"])
+        if stats.get("detail"):
+            rec["detail"] = stats["detail"]
+        events.append(rec)
+        result["run_reply"] = stats.get("run_reply")
+        result["run_outcome"] = outcome
+
+        if outcome == "error":
+            # 固件回了 ERR：RUN 被拒（不可能在跑），不做失控保护，但绝不静默当成功。
+            result["reason"] = "run_rejected"
+            return
+
+        if outcome != "done":
+            # ④ 无 DONE：失控保护（STOP；不确认就重连 + STOP），再按 R56 定性。
+            reset_done = self._recover_after_failed_run(outcome, stats, events, rec)
+            state["stop_evidence"] = True       # 走到这里 = STOP 已在某条链路上确认
+            if not reset_done:
+                # 当前链路 STOP 确认了（链路活着）—— R56 仍要求强制重连 + 查 RESET，
+                # 不拿"超时"直接当 brownout。
+                new_link, why = self._try_reconnect()
+                if new_link is not None:
+                    self.car_link = new_link
+                    events.append({"event": "timeout_diagnosis", "ok": True})
+                else:
+                    events.append({"event": "timeout_diagnosis", "ok": False,
+                                   "detail": why})
+                    warns.append(f"超时定性用的强制重连失败（{why}）；"
+                                 "车已在恢复阶段 STOP 确认，实验仍判无效。")
+            new_resets = [text for _wall, text in self.reset_lines
+                          if text not in state["baseline_resets"]]
+            if new_resets:
+                result["new_reset_lines"] = new_resets
+                result["reason"] = "board_reset"
+            else:
+                result["reason"] = "deadline_timeout"
+            return
+
+        # ⑤ DONE：固件在发 DONE 前已 stopAll（main.cpp:592-598）—— 这是停车证据。
+        state["stop_evidence"] = True
+        time.sleep(max(0.0, float(cfg["settle_after_done_s"])))
+        end = self._locate_retry()
+        if end is None:
+            result["reason"] = self.last_locate_reason or "no_vehicle_marker"
+            return
+        result["vision"]["end"] = tuple(end)
+
+        if len(samples) < 2:
+            # 收到 DONE 却没有样本流：不能拿"0 位移"当"没动"（静默假数据）。
+            result["reason"] = "no_telemetry"
+            return
+
+    def _probe_resets(self):
+        """在当前链路上 PING 一次（探活），并把回复连同 RESET 行收干净。
+
+        返回本次回复里收集到的 RESET 文本集合；发不出去/等不到 PONG → None。
+        固件把 `RESET …` 单独一行发在 PONG **之后**（main.cpp:400-401），
+        同一 recv 批次可能读不到，所以等到 PONG 后再补一次短 drain —— 漏了它，
+        它会淌到下一轮读取里，把后面的证据弄脏。
+        """
+        marker = len(self.reset_lines)
+        try:
+            self._send_line(self.car_link, "PING")
+        except Exception:
+            return None
+        reply, _noise = self._wait_reply(self.car_link, "PONG", self.reply_timeout_s)
+        if reply is None:
+            return None
+        try:
+            self._drain(self.car_link, _PROBE_TAIL_DRAIN_S)
+        except ConnectionError:
+            pass
+        return {text for _wall, text in self.reset_lines[marker:]}
+
+    def _reconnect_or_raise(self, events, phase):
+        """STOP 未确认时的强制恢复：关旧链路 → 重连（握手 + STOP）。失败抛 `StopFailed`。
+
+        与 `_recover_after_failed_run` 的区别：这里**没有**"RUN 失败"这个前提
+        （开场探活就失败也走这里），异常消息按 `phase` 交代是哪一步。
+        """
+        new_link, why = self._try_reconnect()
+        if new_link is None:
+            exc = StopFailed(
+                f"{phase}：STOP 未确认，重连/再 STOP 也失败（{why}）。"
+                "无法确认车已停 —— 固件在 WiFi 掉线时不执行 RUN 的到时停车（R58），"
+                "若有残留 RUN，车可能还在开；立即给车断电。")
+            exc.events = list(events) + [{"event": phase, "ok": False, "detail": why}]
+            raise exc
+        self.car_link = new_link
+        events.append({"event": phase, "ok": True, "reconnected": True})
+
+    def _trial_metrics(self, result, samples, *, c_1rev, sign, l_xy_over_r, r_eff_mm):
+        """把样本积成里程计位移，并算净位移/净转角与有符号判据（纯计算，不碰 I/O）。"""
+        result["n_samples"] = len(samples)
+        odo_last = None
+        if len(samples) >= 2:
+            try:
+                traj = odometry.integrate_encoders(
+                    samples, c_1rev=c_1rev, sign=sign,
+                    l_xy_over_r=l_xy_over_r, r_eff_mm=r_eff_mm)
+            except ValueError as exc:
+                result["warnings"].append(f"里程计积分失败：{exc}")
+            else:
+                odo_last = (float(traj[-1][0]), float(traj[-1][1]), float(traj[-1][2]))
+                result["odometry_delta"] = {
+                    "dist_mm": math.hypot(odo_last[0], odo_last[1]),
+                    "yaw_deg": odo_last[2],
+                    "dx_mm": odo_last[0],
+                    "dy_mm": odo_last[1],
+                }
+
+        start = result["vision"]["start"]
+        end = result["vision"]["end"]
+        if start is None or end is None:
+            return
+        vdx, vdy = end[0] - start[0], end[1] - start[1]
+        vyaw = _wrap180_deg(end[2] - start[2])
+        result["vision_delta"] = {
+            "dist_mm": math.hypot(vdx, vdy),
+            "yaw_deg": vyaw,
+            "dx_mm": vdx,
+            "dy_mm": vdy,
+        }
+        if odo_last is None:
+            return
+        # 里程计的位移在**起点的车体系**里；比方向先转到场地系（同一条符号链）。
+        fdx, fdy = body_delta_to_field(odo_last[0], odo_last[1], start[2])
+        result["sign_dot_mm2"] = vdx * fdx + vdy * fdy
+        result["sign_ok"] = translation_sign_ok((vdx, vdy), (fdx, fdy))
+        result["yaw_sign_ok"] = _yaw_sign_ok(vyaw, odo_last[2])
+
     # ---- 失控保护 ------------------------------------------------------------------
 
-    def _recover_after_failed_run(self, outcome, stats, events, rec) -> None:
+    def _recover_after_failed_run(self, outcome, stats, events, rec) -> bool:
         """RUN 等待失败后的失控保护；恢复不了抛 `StopFailed`。
 
         先试当前链路 STOP：确认 `OK STOP` 就**不重连** —— 链路活着、车已停，缺的
         DONE 很可能只是固件环形缓冲满时被丢（R58 的已知现象），重连只会白折腾。
         没确认（链路死/固件卡）才关旧链路、重连、第一件事 STOP 再确认。
+
+        返回 **True = 重连换过链路**（R56 的定性证据要从新链路的握手/查 RESET 里拿）；
+        False = 当前链路 STOP 已确认（链路没换）。
         """
         stopped = self._try_stop(self.car_link)
         rec["stop_after_failure"] = stopped
         events.append({"event": "run_wait_failed", "outcome": outcome,
                        "detail": stats.get("detail"), "stopped_on_current_link": stopped})
         if stopped:
-            return
+            return False
         new_link, why = self._try_reconnect()
         if new_link is not None:
             self.car_link = new_link
             events.append({"event": "link_reset", "ok": True})
-            return
+            return True
         events.append({"event": "link_reset", "ok": False, "detail": why})
         exc = StopFailed(
             f"RUN 等待失败（{outcome}）后：当前链路 STOP 未确认，重连/STOP 也失败（{why}）。"
@@ -742,7 +1247,7 @@ class Harness:
             time.sleep(0.002)
         return None, noise
 
-    def _wait_done(self, link):
+    def _wait_done(self, link, *, samples=None, on_sample=None):
         """发完 RUN 后等 `DONE`（判"跑完"只认 DONE，R56）。
 
         返回 `(outcome, stats)`：
@@ -754,6 +1259,11 @@ class Harness:
         - `"closed"`：socket 断了。
 
         `stats`：`run_reply` / `n_d` / `errors` / `n_other` / `n_reset`（+可选 detail）。
+
+        `samples` / `on_sample`（Task 11）：每条 `D` 行经 `odometry.parse_telemetry`
+        解析后 append 进 `samples`、再喂给 `on_sample`（中点抓帧的触发器）。`DONE`
+        之前的最后一条样本（固件停车后补发、跟着才发 DONE）在同一 recv 批次里排在
+        DONE **前面**，不会漏。
         """
         deadline = time.monotonic() + self.done_timeout_s
         last_rx = time.monotonic()
@@ -774,6 +1284,12 @@ class Harness:
                     return "done", stats
                 if ln.startswith("D "):
                     stats["n_d"] += 1
+                    if samples is not None or on_sample is not None:
+                        for sample in odometry.parse_telemetry([ln]):
+                            if samples is not None:
+                                samples.append(sample)
+                            if on_sample is not None:
+                                on_sample(sample)
                 elif ln.startswith("OK RUN"):
                     stats["run_reply"] = ln
                 elif ln.startswith("ERR"):
@@ -798,6 +1314,14 @@ __all__ = [
     "BoundaryMarkersMoved",
     "Harness",
     "HarnessError",
+    "ODOM_C_1REV",
+    "ODOM_LXY_OVER_R",
+    "ODOM_R_EFF_MM",
+    "ODOM_SIGN",
+    "SIGN_MIN_NORM_MM",
     "StopFailed",
+    "TRIAL_REASONS",
     "body_command",
+    "body_delta_to_field",
+    "translation_sign_ok",
 ]

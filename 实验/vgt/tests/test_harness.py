@@ -27,6 +27,7 @@ import pytest
 
 from car_link import CarLink
 from vgt import harness as H
+from vgt import matrix
 from vgt.camera import CameraSession, CameraUnavailable
 from vision_core import load_calib
 from vision_core.markers import MarkerPose
@@ -161,19 +162,21 @@ def scene(vehicle_xy=None, yaw_rvec=R_FACING, px_shift=(0.0, 0.0), drop=()) -> d
     return poses
 
 
-def _make(poses_list=(), replies=None, link_factory=None, frames=(), **kw):
+def _make(poses_list=(), replies=None, link_factory=None, frames=(), camera=None, **kw):
     """造一套假设备：返回 `(harness, camera, detect, sock)`。
 
     `detect` 是脚本化的 `detect_markers` 替身（逐帧 pop `poses_list`，用完给 {}）；
     由每个测试自己 `monkeypatch.setattr(H, "detect_markers", detect)`。
     时序参数压小，让所有等待路径都在毫秒级跑完。
+
+    `camera`：要注入特殊相机（比如抓帧会抛的）时传进来，默认 `FakeCamera(frames)`。
     """
     timeouts = dict(done_timeout_s=1.0, silence_timeout_s=0.05,
                     reply_timeout_s=0.05, handshake_timeout_s=0.5,
                     locate_tries=1)
     timeouts.update(kw)
     sock = FakeSock(replies)
-    camera = FakeCamera(frames)
+    camera = camera if camera is not None else FakeCamera(frames)
     h = H.Harness(make_car_link(sock), camera, dict(CALIB),
                   link_factory=link_factory, **timeouts)
     script = list(poses_list)
@@ -684,3 +687,583 @@ def test_locate_on_the_live_camera_never_blows_up():
             assert h.last_locate_reason in ("boundary_moved", "no_vehicle_marker")
     finally:
         camera.close()
+
+
+# ===================================================== Task 11：run_trial 编排
+#
+# 这些测试不碰网络、不碰相机、不开车：
+# - `FakeSock` 按命令前缀回脚本，遥测（D 行）与 DONE 的先后关系和真机一致；
+# - 相机是假的，但录下每次 `grab(fresh=…)` 的有效值 —— R54 的"默认要清流"靠它钉死；
+# - `detect_markers` 脚本化，但 `build_field_frame` / `body_pose_in_field` 走真管线；
+# - 时序参数全部压到毫秒级。
+#
+# 需要真相机的项（一条真 RUN、断链演练、真 RESET 行）不在这里 —— 见 Task 11 报告的
+# 「待真机验证清单」。
+
+# 固件三种 pwm 模式（odometry 用 pwm 极性定方向，E13/R13）：
+PWM_FWD = [-150, 150, -150, 150]       # 前进：odometry 读成 +x
+PWM_BWD = [150, -150, 150, -150]       # 后退：odometry 读成 −x
+PWM_ROT_CCW = [150, 150, 150, 150]     # 原地逆时针：odometry 读成 +yaw
+
+
+def _yaw_rvec(yaw_deg):
+    """俯视相机下让车载码解出 field yaw = yaw_deg 的 rvec（与 R_YAW0 同族）。
+
+    R_YAW0 = (0,0,−π/2) → yaw 0；绕 z 再减 deg 弧度 → yaw = +deg（已实测核对）。
+    """
+    return (0.0, 0.0, -math.pi / 2.0 - math.radians(yaw_deg))
+
+
+def _counts_for(dist_mm):
+    """四轮各滚 `dist_mm` 所需的原始计数（按 harness 的里程计默认常量反推）。"""
+    return [int(round(dist_mm * c1 / (2.0 * math.pi * H.ODOM_R_EFF_MM)))
+            for c1 in H.ODOM_C_1REV]
+
+
+def _trial_pose(x, y, yaw_deg=0.0):
+    """车载码在场地系 (x, y)、yaw_deg 的一帧。"""
+    return scene(vehicle_xy=(float(x), float(y)), yaw_rvec=_yaw_rvec(yaw_deg))
+
+
+def _d_line(t_ms, enc, pwm=PWM_FWD):
+    """一行合法的固件 D 样本（13 字段：t / 4×pwm / 4×enc / 3×rpy）。"""
+    return ("D {:d} {:d} {:d} {:d} {:d} {:d} {:d} {:d} {:d} 0.00 0.00 0.00\n"
+            .format(t_ms, pwm[0], pwm[1], pwm[2], pwm[3],
+                    enc[0], enc[1], enc[2], enc[3]))
+
+
+def _trial_run_script(enc_end, *, pwm=PWM_FWD, with_done=True,
+                      samples_at=(10, 510, 990)):
+    """一次 RUN 的脚本回复：OK RUN + 三条 D 样本（+可选 DONE）。
+
+    中间那条（默认 t=510 ≥ 1000/2）就是中点抓帧的触发器 —— 顺序与固件一致：
+    `OK RUN` 先回，样本按时间流式到达，最后才 `DONE`。
+    """
+    mid = [c // 2 for c in enc_end]
+    enc_by_t = {samples_at[0]: [0, 0, 0, 0], samples_at[1]: mid, samples_at[2]: enc_end}
+    group = [b"OK RUN pwm=-110,110,-110,110 ms=1000 kick=150ms/105\n"]
+    for t in sorted(enc_by_t):
+        group.append(_d_line(t, enc_by_t[t], pwm).encode())
+    if with_done:
+        group.append(b"DONE\n")
+    return group
+
+
+def _stop_replies(n):
+    return [[b"OK STOP\n"] for _ in range(n)]
+
+
+class FailingGrabCamera(FakeCamera):
+    """第 `fail_on` 次 `grab()` 抛 `CameraUnavailable`（模拟运动模糊/USB 抖动）。"""
+
+    def __init__(self, fail_on=2):
+        super().__init__()
+        self.fail_on = int(fail_on)
+
+    def grab(self, fresh=True):
+        self.calls.append(bool(fresh))
+        if len(self.calls) == self.fail_on:
+            raise CameraUnavailable(f"fake：第 {self.fail_on} 次抓帧失败")
+        return b"frame"
+
+
+# --------------------------------------------------- 有符号判据（纯函数，Important 3）
+
+
+def test_body_delta_to_field_matches_the_symbol_chain():
+    """车体系(前,左) → 场地系：θ=0 前进=+X；θ=90° 前进=−Y、左=−X（与 body_command 同链）。"""
+    assert H.body_delta_to_field(100.0, 0.0, 0.0) == pytest.approx((100.0, 0.0))
+    assert H.body_delta_to_field(0.0, 100.0, 0.0) == pytest.approx((0.0, -100.0))
+    assert H.body_delta_to_field(100.0, 0.0, 90.0) == pytest.approx((0.0, -100.0))
+    assert H.body_delta_to_field(0.0, 100.0, 90.0) == pytest.approx((-100.0, 0.0))
+
+
+def test_translation_sign_ok_says_yes_no_and_judge_not():
+    ok = H.translation_sign_ok
+    assert ok((100.0, 0.0), (95.0, 3.0)) is True          # 同向
+    assert ok((100.0, 0.0), (-95.0, 3.0)) is False        # 反向（正是要抓的）
+    assert ok((0.0, 80.0), (3.0, 79.0)) is True
+    assert ok((0.0, 80.0), (3.0, -79.0)) is False
+    # 模长门槛以下不判（噪声/漂移/没动），不许冤枉合法数据：
+    assert ok((4.0, 0.0), (-100.0, 0.0)) is None
+    assert ok((100.0, 0.0), (3.0, -3.0)) is None
+    # 恰好垂直（点积 0）不算同向：
+    assert ok((10.0, 0.0), (0.0, -10.0)) is False
+
+
+# --------------------------------------------------- run_trial 正常路径与降级
+
+
+def test_run_trial_happy_path_end_to_end(monkeypatch):
+    """直行 200 mm：起/中/终三点 + 三条样本 + DONE，全程对得上。"""
+    counts = _counts_for(200.0)
+    h, cam, detect, sock = _make(
+        poses_list=[_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0), _trial_pose(200.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]],
+                 "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts)]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True and res["reason"] is None
+    assert res["vision"]["start"] == pytest.approx((0.0, 0.0, 0.0))
+    assert res["vision"]["mid"] == pytest.approx((100.0, 0.0, 0.0))
+    assert res["vision"]["end"] == pytest.approx((200.0, 0.0, 0.0))
+    assert res["vision_delta"] == pytest.approx({"dist_mm": 200.0, "yaw_deg": 0.0,
+                                                 "dx_mm": 200.0, "dy_mm": 0.0})
+    assert res["odometry_delta"]["dist_mm"] == pytest.approx(200.0, abs=1.0)
+    assert res["odometry_delta"]["yaw_deg"] == pytest.approx(0.0, abs=0.5)
+    assert res["n_samples"] == 3
+    assert res["mid_capture_failed"] is False
+    assert res["sign_ok"] is True and res["sign_dot_mm2"] > 0
+    assert res["yaw_sign_ok"] is None               # 两边转角都 < 1°，不判
+    assert res["run_reply"].startswith("OK RUN")
+    assert res["stop_confirmed"] is True
+    assert res["warnings"] == []
+    # R54：三个关键帧都走 grab() 的默认路径（fresh=True，读前丢队列老帧）
+    assert cam.calls == [True, True, True]
+    assert sock.sent == ["PING\n",                                   # 开场探活
+                         "STOP\n",                                   # 开场兜底停车
+                         "RUN 0.2000 0.0000 0.0000 1000\n",
+                         "STOP\n"]                                   # 收尾兜底
+
+
+def test_run_trial_mid_capture_failure_degrades_to_two_points(monkeypatch):
+    """brief Step 2 / Review Focus #1：中点抓帧失败**不致命**，降级为起/终两点。"""
+    counts = _counts_for(200.0)
+    cam = FailingGrabCamera(fail_on=2)                  # 第 2 次 grab = 中点
+    h, _, detect, _ = _make(
+        poses_list=[_trial_pose(0.0, 0.0), _trial_pose(200.0, 0.0)],  # 中点的 detect 不会被调用
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts)]},
+        camera=cam)
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True and res["reason"] is None
+    assert res["vision"]["mid"] is None
+    assert res["mid_capture_failed"] is True
+    assert any("mid_capture_failed" in w for w in res["warnings"])
+    assert res["vision_delta"]["dist_mm"] == pytest.approx(200.0)   # 两点照样算净值
+    assert res["odometry_delta"]["dist_mm"] == pytest.approx(200.0, abs=1.0)
+    assert res["sign_ok"] is True
+    assert cam.calls == [True, True, True]                           # 失败那次也是 fresh=True
+
+
+def test_run_trial_mid_boundary_drift_is_not_fatal(monkeypatch):
+    """中点帧撞上边界码漂移（>15 px）也只降级，不许把实验判死。"""
+    counts = _counts_for(200.0)
+    h, _, detect, _ = _make(
+        poses_list=[_trial_pose(0.0, 0.0),
+                    scene(vehicle_xy=(100.0, 0.0), yaw_rvec=_yaw_rvec(0.0),
+                          px_shift=(16.0, 0.0)),                     # 漂移帧
+                    _trial_pose(200.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts)]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True
+    assert res["vision"]["mid"] is None
+    assert any("mid_capture_failed" in w for w in res["warnings"])
+    assert any("BoundaryMarkersMoved" in w for w in res["warnings"])
+
+
+def test_run_trial_end_boundary_drift_fails_the_trial(monkeypatch):
+    """终点帧撞上漂移超限：实验判 boundary_moved（起/终是**关键帧**）。"""
+    counts = _counts_for(200.0)
+    h, _, detect, sock = _make(
+        poses_list=[_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0),
+                    scene(vehicle_xy=(200.0, 0.0), yaw_rvec=_yaw_rvec(0.0),
+                          px_shift=(16.0, 0.0))],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts)]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "boundary_moved"
+    assert "BoundaryMarkersMoved" in res["boundary_error"] or "ID" in res["boundary_error"]
+    assert sock.sent[-1] == "STOP\n"                    # 收尾兜底照发
+
+
+def test_run_trial_start_failures_send_no_run(monkeypatch):
+    """起点帧失败：没解出 ID29 / 缺边界码 —— 都不发 RUN，但收尾 STOP 照发。"""
+    for poses, expect in ((scene(vehicle_xy=None), "no_vehicle_marker"),
+                          (scene(vehicle_xy=(0.0, 0.0), drop=(22,)), "boundary_moved")):
+        sock = FakeSock({"PING": [[b"PONG\n"]], "STOP": _stop_replies(2)})
+        cam = FakeCamera()
+        h = H.Harness(make_car_link(sock), cam, dict(CALIB), locate_tries=1,
+                      done_timeout_s=1.0, silence_timeout_s=0.05,
+                      reply_timeout_s=0.05, handshake_timeout_s=0.5)
+        monkeypatch.setattr(H, "detect_markers", lambda frame, c, p=poses: p)
+
+        res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                          settle_after_done_s=0.0)
+
+        assert res["ok"] is False and res["reason"] == expect, expect
+        assert res["vision"]["start"] is None
+        assert res["vision_delta"] is None and res["odometry_delta"] is None
+        assert [s for s in sock.sent if s.startswith("RUN")] == []
+        assert sock.sent == ["PING\n", "STOP\n", "STOP\n"]      # 探活 + 开场 + 收尾
+
+
+# --------------------------------------------------- 有符号判据（整条链路）
+
+
+def test_run_trial_signed_check_catches_translation_flip(monkeypatch):
+    """复核 Important 3 的正面用例：量级对、方向反 —— 只比 dist 会静默通过。
+
+    视觉说 +X 200 mm，编码器说 −X 200 mm：`dist_diff_pct ≈ 0`，
+    旧的"<20%"验收会放行；`dot(vision, odometry) < 0` 必须把这条判死。
+    """
+    counts = _counts_for(200.0)
+    h, _, detect, _ = _make(
+        poses_list=[_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0), _trial_pose(200.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts, pwm=PWM_BWD)]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "sign_mismatch"
+    assert res["sign_ok"] is False and res["sign_dot_mm2"] < 0
+    # 这正是"标量距离看不出来"的那类失败：两个量级几乎相等。
+    vd = res["vision_delta"]["dist_mm"]
+    od = res["odometry_delta"]["dist_mm"]
+    assert od == pytest.approx(200.0, abs=1.0)
+    assert abs(vd - od) / vd < 0.05
+    # 两个方向确实一正一负：
+    assert res["vision_delta"]["dx_mm"] > 0 and res["odometry_delta"]["dx_mm"] < 0
+
+
+def test_run_trial_rotate_in_place_is_not_judged_by_the_sign_check(monkeypatch):
+    """原地旋转：平移两边都≈0 → `sign_ok=None`（判不出，不冤枉）；yaw 同向记下。"""
+    roll_mm = H.ODOM_LXY_OVER_R * H.ODOM_R_EFF_MM * (math.radians(45.0))   # LXY·45°
+    counts = _counts_for(roll_mm)
+    exp = next(e for e in matrix.EXPERIMENTS if e.id == 15)                # 逆时针 45°
+    h, _, detect, _ = _make(
+        poses_list=[_trial_pose(0.0, 0.0, 0.0), _trial_pose(0.0, 0.0, 22.5),
+                    _trial_pose(0.0, 0.0, 45.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts, pwm=PWM_ROT_CCW)]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(exp, settle_before_start_s=0.0, settle_after_done_s=0.0)
+
+    assert res["ok"] is True and res["reason"] is None
+    assert res["vision_delta"]["yaw_deg"] == pytest.approx(45.0)
+    assert res["odometry_delta"]["yaw_deg"] == pytest.approx(45.0, abs=0.2)
+    assert res["sign_ok"] is None                       # 平移太小：不判方向
+    assert res["yaw_sign_ok"] is True                   # 同向的 yaw 是记下来的
+
+
+# --------------------------------------------------- 超时 / RESET 定性（R56/R58）
+
+
+def _timeout_scenario(*, sock2_ping_extra=b""):
+    """造一个"RUN 后无 DONE"的场景，返回 (h, detect, sock1, sock2, calls)。"""
+    counts = _counts_for(200.0)
+    sock2 = FakeSock({"PING": [[b"PONG\n", sock2_ping_extra] if sock2_ping_extra else [b"PONG\n"]],
+                      "STOP": _stop_replies(2)})
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return make_car_link(sock2)
+
+    replies = {"PING": [[b"PONG\n"]],
+               "STOP": _stop_replies(2),                 # 开场 + 恢复阶段
+               "RUN": [_trial_run_script(counts, with_done=False)]}
+    h, _, detect, sock1 = _make(
+        [ _trial_pose(0.0, 0.0) ],
+        replies=replies, link_factory=factory,
+        done_timeout_s=0.05, silence_timeout_s=10.0)
+    return h, detect, sock1, sock2, calls
+
+
+def test_run_trial_timeout_reconnects_and_checks_reset_before_concluding(monkeypatch):
+    """R56：超时不许即判 brownout —— 强制重连 + 查 RESET，没有新证据才判 deadline。"""
+    h, detect, sock1, sock2, calls = _timeout_scenario()
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "deadline_timeout"
+    assert res["vision"]["end"] is None
+    assert res["n_samples"] == 3                       # 样本留着当证据
+    assert calls == [1]                                # 定性时确实强制重连了一次
+    assert any(ev.get("event") == "timeout_diagnosis" and ev["ok"]
+               for ev in res["events"])
+    assert res["stop_confirmed"] is True
+    assert sock2.sent == ["PING\n", "STOP\n", "STOP\n"]   # 握手 + 重连 STOP + 收尾
+
+
+def test_run_trial_timeout_with_new_reset_line_is_board_reset(monkeypatch):
+    """重连的 PING 带回一条**新的** RESET 行（brownout）→ 判 board_reset。"""
+    h, detect, _sock1, _sock2, calls = _timeout_scenario(
+        sock2_ping_extra=b"RESET ESP_RST_BROWNOUT count=1\n")
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "board_reset"
+    assert res["new_reset_lines"] == ["RESET ESP_RST_BROWNOUT count=1"]
+    assert any("count=1" in text for _wall, text in res["reset_lines"])
+
+
+def test_run_trial_preexisting_reset_line_does_not_false_positive(monkeypatch):
+    """开场就存在的 RESET 行（旧复位，每次 PING 都重发）不算本次证据 → deadline_timeout。
+
+    没有这条，开机后就再没复位过的板子会永远被超时判成 brownout。
+    """
+    counts = _counts_for(200.0)
+    sock2 = FakeSock({"PING": [[b"PONG\n", b"RESET ESP_RST_PANIC count=1\n"]],
+                      "STOP": _stop_replies(2)})
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return make_car_link(sock2)
+
+    h, _, detect, sock1 = _make(
+        [_trial_pose(0.0, 0.0)],
+        replies={"PING": [[b"PONG\n", b"RESET ESP_RST_PANIC count=1\n"]],   # 开场基线
+                 "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts, with_done=False)]},
+        link_factory=factory, done_timeout_s=0.05, silence_timeout_s=10.0)
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "deadline_timeout"
+    assert "new_reset_lines" not in res                # 同样的文本，不算新
+
+
+def test_run_trial_reset_line_and_glued_reply_do_not_shift_the_stream(monkeypatch):
+    """R58：RUN 流里混着 RESET 行 + 粘连的 OK RUN —— 回复不许错位、DONE 照认。"""
+    counts = _counts_for(200.0)
+    glued = (b"I 2410259 0 0 0 0 0 0 0OK RUN pwm=-110,110,-110,110 "
+             b"ms=1000 kick=150ms/105\n")
+    group = [b"RESET ESP_RST_BROWNOUT count=2\n", glued,
+             _d_line(10, [0, 0, 0, 0]).encode(),
+             _d_line(510, [c // 2 for c in counts]).encode(),
+             _d_line(990, counts).encode(),
+             b"DONE\n"]
+    h, _, detect, _ = _make(
+        [_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0), _trial_pose(200.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2), "RUN": [group]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True
+    assert res["run_reply"].startswith("OK RUN")        # 粘连拆开、没错位
+    run_wait = next(ev for ev in res["events"] if ev.get("event") == "run_wait")
+    assert run_wait["n_reset"] == 1
+    assert any("count=2" in text for _wall, text in res["reset_lines"])
+
+
+# --------------------------------------------------- 停止安全性（R58 未修缺陷兜底）
+
+
+def test_run_trial_run_rejected_is_reported(monkeypatch):
+    h, _, detect, sock = _make(
+        [_trial_pose(0.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [[b"ERR RUN vx vy om ms\n"]]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "run_rejected"
+    assert res["n_samples"] == 0 and res["odometry_delta"] is None
+    assert sock.sent[-1] == "STOP\n"
+
+
+def test_run_trial_no_telemetry_rejects_the_trial(monkeypatch):
+    """DONE 到了但没有 D 样本：不能拿 0 当"没动" —— 判 no_telemetry。"""
+    h, _, detect, _ = _make(
+        [_trial_pose(0.0, 0.0), _trial_pose(200.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [[b"OK RUN pwm=-110,110,-110,110 ms=1000 kick=150ms/105\n",
+                          b"DONE\n"]]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "no_telemetry"
+    assert res["n_samples"] == 0
+    assert res["odometry_delta"] is None
+
+
+def test_run_trial_stop_failure_after_run_raises_stop_failed(monkeypatch):
+    """超时 + 当前链路 STOP 不确认 + 重连也失败 = 车可能还在开：必须抛，不能静默。"""
+    def factory():
+        raise RuntimeError("发现不了小车")
+
+    h, _, detect, sock1 = _make(
+        [_trial_pose(0.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]],
+                 "STOP": [[b"OK STOP\n"], []],          # 开场确认；恢复阶段不确认
+                 "RUN": [_trial_run_script(_counts_for(200.0), with_done=False)]},
+        link_factory=factory, done_timeout_s=0.05, silence_timeout_s=10.0)
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    with pytest.raises(H.StopFailed, match="断电") as excinfo:
+        h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                    settle_after_done_s=0.0)
+
+    events = excinfo.value.events
+    assert any(ev.get("event") == "run_wait_failed" and not ev["stopped_on_current_link"]
+               for ev in events)
+    assert any(ev.get("event") == "link_reset" and ev["ok"] is False for ev in events)
+    assert sock1.closed is True                             # 重连前先关旧链路
+
+
+def test_run_trial_final_stop_with_done_is_warning_not_stop_failed(monkeypatch):
+    """收了 DONE（固件先 stopAll 再发）= 有停车证据：收尾 STOP 没确认只警告，不虚报。"""
+    counts = _counts_for(200.0)
+    h, _, detect, _ = _make(
+        [_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0), _trial_pose(200.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]],
+                 "STOP": [[b"OK STOP\n"]],              # 只够开场那次
+                 "RUN": [_trial_run_script(counts)]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True
+    assert res["stop_confirmed"] is False                   # 如实记录
+    assert any("STOP 未确认" in w for w in res["warnings"])
+
+
+def test_run_trial_final_stop_without_run_evidence_does_not_raise(monkeypatch):
+    """起点帧就失败（没发过 RUN）：收尾 STOP 没确认也只是如实标注，不抛 StopFailed。"""
+    h, _, detect, _ = _make(
+        [scene(vehicle_xy=None)],
+        replies={"PING": [[b"PONG\n"]], "STOP": [[b"OK STOP\n"]]})   # 收尾那次没回复
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "no_vehicle_marker"
+    assert res["stop_confirmed"] is False
+    assert any("STOP 未确认" in w for w in res["warnings"])
+
+
+def test_run_trial_open_probe_failure_reconnects_then_proceeds(monkeypatch):
+    """开场探活失败（链路死）→ 重连成功 → 实验照跑（新链路完成全部时序）。"""
+    counts = _counts_for(200.0)
+    sock2 = FakeSock({"PING": [[b"PONG\n"]], "STOP": _stop_replies(3),
+                      "RUN": [_trial_run_script(counts)]})
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return make_car_link(sock2)
+
+    h, _, detect, sock1 = _make(
+        [_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0), _trial_pose(200.0, 0.0)],
+        replies={},                                    # 旧链路：什么都没回
+        link_factory=factory)
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True
+    assert calls == [1] and sock1.closed is True
+    assert sock2.sent == ["PING\n", "STOP\n", "STOP\n",
+                          "RUN 0.2000 0.0000 0.0000 1000\n", "STOP\n"]
+    assert any(ev.get("event") == "open_probe" and ev.get("reconnected")
+               for ev in res["events"])
+
+
+def test_run_trial_validates_arguments_before_any_io():
+    sock = FakeSock({})
+    h = H.Harness(make_car_link(sock), FakeCamera(), dict(CALIB))
+    bad = matrix.Experiment(99, "straight", "坏实验", 0.1, 0.0, 0.0, 0.0001, 1)
+
+    with pytest.raises(ValueError, match="ms"):
+        h.run_trial(bad)
+    with pytest.raises(ValueError, match="mid_fraction"):
+        h.run_trial(matrix.EXPERIMENTS[0], mid_fraction=1.5)
+    with pytest.raises(ValueError, match="沉降"):
+        h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=-1.0)
+    assert sock.sent == []                       # 连开场 PING/STOP 都不发
+
+
+def test_run_trial_silent_wait_reconnects_once_and_reports_brownout(monkeypatch):
+    """RUN 中链路断（silent）：当前链路 STOP 发不出去 → 重连一次就够，别再重连。
+
+    重连的握手 PING 带回新 RESET（brownout）→ `board_reset`；
+    恢复阶段已经换过链路，就**不**再打一次"定性专用"的重连。
+    """
+    counts = _counts_for(200.0)
+    sock2 = FakeSock({"PING": [[b"PONG\n", b"RESET ESP_RST_BROWNOUT count=4\n"]],
+                      "STOP": _stop_replies(2)})
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return make_car_link(sock2)
+
+    h, _, detect, sock1 = _make(
+        [_trial_pose(0.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]],
+                 "STOP": [[b"OK STOP\n"]],              # 只有开场那次；恢复阶段发不出去
+                 "RUN": [_trial_run_script(counts, with_done=False)]},
+        link_factory=factory, done_timeout_s=10.0, silence_timeout_s=0.05)
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is False and res["reason"] == "board_reset"
+    assert res["run_outcome"] == "silent"
+    assert calls == [1]                                 # 只重连一次
+    assert not any(ev.get("event") == "timeout_diagnosis" for ev in res["events"])
+    assert any(ev.get("event") == "link_reset" and ev["ok"] is True
+               for ev in res["events"])
+    assert res["stop_confirmed"] is True
+    assert res["new_reset_lines"] == ["RESET ESP_RST_BROWNOUT count=4"]
+
+
+def test_run_trial_twice_on_one_session_keeps_state_separate(monkeypatch):
+    """同一 Harness 连跑两条（Task 12 的批量模式）：samples/基线/相机调用都不串。"""
+    counts = _counts_for(200.0)
+    poses = [_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0), _trial_pose(200.0, 0.0)] * 2
+    h, cam, detect, sock = _make(
+        poses_list=poses,
+        replies={"PING": [[b"PONG\n"], [b"PONG\n"]],
+                 "STOP": _stop_replies(4),
+                 "RUN": [_trial_run_script(counts), _trial_run_script(counts)]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    first = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                        settle_after_done_s=0.0)
+    second = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                         settle_after_done_s=0.0)
+
+    assert first["ok"] is True and second["ok"] is True
+    assert first["samples"] is not second["samples"]
+    assert first["n_samples"] == 3 and second["n_samples"] == 3
+    assert cam.calls == [True] * 6
+    assert sock.sent == ["PING\n", "STOP\n", "RUN 0.2000 0.0000 0.0000 1000\n", "STOP\n"] * 2
