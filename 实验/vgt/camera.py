@@ -17,6 +17,22 @@
   同样"打不开给一句人话、不 traceback"的口径，但没有实时循环、没有叠加层，
   供 Task 10–12 的 harness 在整个会话里反复 `grab()`/`save()`。
 
+## ⚠ 驱动队列会囤老帧：每次 `grab()` 都要清流（C1）
+
+常驻句柄与"每张照片重开设备"的性质**不同**：V4L2 驱动在没有人读的时候把画面堆在它的
+队列里（上界 = `CAP_PROP_BUFFERSIZE` = 4，实测填了 3–4 帧），**停手多久，队列里最老
+的那几帧就有多旧**。实测（2026-10-14，`/dev/video0`、cv2 4.6.0、MJPG 1920x1080、
+29.8 fps，静置 3 s）：
+
+    read0  pos=+36ms   read1  +68ms   read2  +100ms   read3  +3068ms  ...
+
+即前 3 帧是静置刚开始时拍的（约 2.9 s 旧），第 4 帧才是实时帧；静置 0.5 s 时间样成立。
+所以"开场丢一次帧"（`settle()`）**不能跨静置保鲜** —— 而计划里 Task 10 的
+"RUN → 等 0.5 s → 重新 `locate()`"、Task 11 的"等车静止 0.3 s → 抓 start 帧"、
+"等 DONE → 等 0.4 s 沉降 → 抓 end 帧"全是"等一段真实时间再单次抓帧"：
+不丢就会把**还在运动/减速时**的画面当成静止后的测量，`vision_delta` 静默算错（R39
+明确要防的那件事）。`grab(fresh=True)`（默认）因此每次读前先丢掉 ≥ 队列深度那么多帧。
+
 ## ⚠ 不锁曝光、不锁对焦（SDD 台账 R49/R53，与计划原文冲突，以实测为准）
 
 计划给的接口是 `__enter__` 关闭自动曝光/自动对焦并写死 `EXPOSURE=166`、`FOCUS=275`
@@ -67,6 +83,18 @@ CAMERA_DEV = CAMERA_DEVICE
 LOCKED_EXPOSURE = 166
 LOCKED_FOCUS = 275
 
+# `grab(fresh=True)` 每次读前丢这么多帧，把驱动队列里排队的老帧清掉（C1）。
+#
+# 依据（2026-10-14 实测，/dev/video0、cv2 4.6.0、MJPG 1920x1080、29.8 fps）：
+# 静置 3 s 后连读，`CAP_PROP_POS_MSEC` 相对静置前最后一帧的增量是 +36/+68/+100/+3068 ms
+# —— 前 3 帧是静置刚开始时就已经排在队列里的旧帧（约 2.9 s 旧），第 4 帧才是实时帧；
+# 静置 0.5 s 时同样是 3 帧旧；复核者在同一台相机上量到过 4 帧。
+# 队列深度的**上界**是 `CAP_PROP_BUFFERSIZE`（`camera_props.json`: 4），所以取 4+1 帧。
+#
+# 两个方向的代价不对称：**丢少了会静默返回旧帧**（少丢 1 帧 = 错用 2.9 s 前的画面，
+# R39 的正面事故）；丢多了只多花 ~33 ms。默认因此站在多丢这边。
+FRESH_DISCARD_FRAMES = 5
+
 
 class CameraUnavailable(RuntimeError):
     """相机打不开，或已打开的会话中途读帧失败、无法继续。
@@ -115,15 +143,29 @@ def open_capture(device: str = CAMERA_DEV):
     return cap
 
 
-def settle(cap, frames: int = DEFAULT_SETTLE_FRAMES) -> None:
-    """丢 `frames` 个缓冲帧，等自动对焦收敛（R39，帧数取 `verify_vision` 的默认值）。
+def discard(cap, frames: int = FRESH_DISCARD_FRAMES) -> None:
+    """丢掉 `frames` 个**已经排在驱动队列里**的帧（`cap.grab()`：只推进不解码）。
 
-    只在**刚打开**设备之后跑一次：USB 相机的头几帧往往是上一次推流残留在驱动里的画面，
-    自动对焦也要时间收敛；不等的话第一批 `grab()` 会拿到糊的/旧的帧，码检不出来，
-    而调用方看到的现象是"相机坏了"。持续会话里不再每帧丢帧 —— 那正是常驻句柄的意义。
+    两个调用点，两种理由、同一件事（所以只有这一份实现）：
+
+    - 开场：`settle()` 丢 `DEFAULT_SETTLE_FRAMES` 帧，等自动对焦收敛。
+    - 每次读前：`grab(fresh=True)` 丢 `FRESH_DISCARD_FRAMES` 帧，清掉静置期间囤下的老帧（C1）。
     """
     for _ in range(max(0, int(frames))):
         cap.grab()
+
+
+def settle(cap, frames: int = DEFAULT_SETTLE_FRAMES) -> None:
+    """**开场预热**：丢 `frames` 个缓冲帧，等自动对焦收敛（R39，帧数取 `verify_vision` 的默认值）。
+
+    只在**刚打开**设备之后跑一次：USB 相机的头几帧往往是上一次推流残留在驱动里的画面，
+    自动对焦也要时间收敛；不等的话第一批 `grab()` 会拿到糊的/旧的帧，码检不出来，
+    而调用方看到的现象是"相机坏了"。
+
+    ⚠ **它不能跨静置保鲜**（C1）：停手 0.5 s 以上，驱动队列里就会囤下静置刚开始时拍的老帧
+    —— 那是 `grab(fresh=True)` 每读前清流的事，不是这里。
+    """
+    discard(cap, frames)
 
 
 class CameraSession:
@@ -141,6 +183,12 @@ class CameraSession:
       会被占住，下一个工具（`live_field.py` / `verify_vision.py`）直接打不开。
     - 没进上下文（或已退出）时 `grab()`/`save()` 立刻抛 `CameraUnavailable`。
 
+    ## 新鲜度由 `grab()` 负责，不由 `settle()` 负责（C1）
+
+    常驻句柄要跨"等 0.3–0.5 s 再抓一帧"这种稀疏读，而驱动队列会在这段静置里囤下
+    老帧（实测 3–4 帧、约等于静置时长）。所以默认 `grab(fresh=True)` **每次**读前
+    先丢 `fresh_discard_frames` 帧，见那个方法的 docstring。
+
     ## 读帧失败不重试
 
     `grab()` 读不到就抛：设备热插拔/被抢走之后，**同一根句柄上的 `read()` 会一直失败**
@@ -148,9 +196,11 @@ class CameraSession:
     """
 
     def __init__(self, device: str = CAMERA_DEV,
-                 settle_frames: int = DEFAULT_SETTLE_FRAMES):
+                 settle_frames: int = DEFAULT_SETTLE_FRAMES,
+                 fresh_discard_frames: int = FRESH_DISCARD_FRAMES):
         self.device = str(device)
         self.settle_frames = max(0, int(settle_frames))
+        self.fresh_discard_frames = max(0, int(fresh_discard_frames))
         self.cap = None
 
     @property
@@ -189,9 +239,28 @@ class CameraSession:
                 "__enter__，不会在 grab()/save() 里悄悄发生。")
         return self.cap
 
-    def grab(self) -> np.ndarray:
-        """读**一帧新鲜**的 BGR 图（`cv2.VideoCapture.read`）；失败抛 `CameraUnavailable`。"""
+    def grab(self, fresh: bool = True) -> np.ndarray:
+        """读一帧 BGR 图（`cv2.VideoCapture.read`）；读不到抛 `CameraUnavailable`。
+
+        ## `fresh=True`（默认）：先把排队的老帧丢掉再读
+
+        驱动队列在没人读的时候会囤帧（实测 3–4 帧，见 `FRESH_DISCARD_FRAMES`），
+        **停手多久，丢出来的就是多久以前的画面**：静置 3 s 后直接连读，前 3 帧是
+        静置刚开始时拍的（约 2.9 s 旧）。默认路径因此每次先丢 `self.fresh_discard_frames`
+        帧，保证返回的帧是**本次调用开始之后**相机采到的。代价实测约 0.13–0.24 s
+        （帧间隔 ~33 ms；静置越久队列越满，清流耗时越接近队列深度 × 帧间隔），
+        远小于重开设备 + 60 帧预热的 ~2 s。
+
+        ## `fresh=False`：只在刚读过一帧时用
+
+        连拍/验证帧率这类"上一帧刚消费掉、队列是空的"场景，丢掉帧只是白等。
+        **隔了一段真实时间（哪怕只 0.5 s）再抓帧的调用方一律用默认值**——
+        Task 10 的"等 0.5 s 重新 locate"、Task 11 的"等 DONE → 0.4 s 后抓 end 帧"
+        都是这样的稀疏单次抓帧，拿到旧帧不会报任何错，只会静默算错 `vision_delta`（R39）。
+        """
         cap = self._require_open()
+        if fresh:
+            discard(cap, self.fresh_discard_frames)
         ok, frame = cap.read()
         if not ok or frame is None:
             raise CameraUnavailable(

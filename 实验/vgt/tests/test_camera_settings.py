@@ -3,7 +3,7 @@
 全部用例不需要硬件：设备句柄用 `FakeCap` 替身，开设备的唯一入口
 `vgt.camera.open_capture`（以及它内部的 `cv2.VideoCapture`）由 monkeypatch 换掉。
 
-钉住的三件事：
+钉住的四件事：
 
 1. **R53 反过来钉的那条测试**：`apply_locked_settings` 只写 FOURCC/宽/高
    （值与 `verify_vision.grab_frame` 逐字一致），**不写** FOCUS / AUTOFOCUS /
@@ -11,9 +11,12 @@
    （`AUTO_EXPOSURE=0` 写不进去、`FOCUS=275` 把 ID20 检出率打到 7%），
    所以这里反过来钉 —— 见 `vgt/camera.py` 的模块 docstring。
 2. **失败路径**：打不开、读不到帧、没进上下文 → `CameraUnavailable`
-   （`RuntimeError` 子类，一句人话，不是 traceback）。
+   （`RuntimeError` 子类，一句人话，不是 traceback）；存盘失败 → `RuntimeError`。
 3. **句柄生命周期**：开设备只发生在 `__enter__`；`__exit__` 一定 `release()`
    —— 漏掉它 `/dev/video0` 会被占住，下一个工具直接打不开。
+4. **C1 的新鲜度**：`grab()` 在**读到返回值之前**先丢 `FRESH_DISCARD_FRAMES` 帧
+   （≥ 实测队列深度 4）。"丢了几帧、丢在读之前"是可测的，而"返回的到底是新帧还是
+   队列里的老帧"需要真实静置才能造 —— 防线就钉在计数与顺序上。
 """
 from __future__ import annotations
 
@@ -62,15 +65,26 @@ _FORBIDDEN_PROPS = (
     (cv2.CAP_PROP_EXPOSURE, "CAP_PROP_EXPOSURE", LOCKED_EXPOSURE),
 )
 
+# C1 的实测队列深度（/dev/video0、cv2 4.6.0、MJPG 1920x1080、29.8 fps）：
+# 本机静置 3.0 s / 0.5 s 后连读，前 3 帧的采集时刻都只比静置开始时晚 36/68/100 ms
+# （即最老约 2.9 s 旧），第 4 帧才是实时帧；复核者在同一台相机上量到 4 帧。
+# 深度的**上界**是 `CAP_PROP_BUFFERSIZE`（camera_props.json: 4）。
+C1_MEASURED_QUEUE_DEPTH = 4
+
 
 class FakeCap:
-    """`cv2.VideoCapture` 的替身：记录**每一次** `set`（列表，不是字典 —— 重复写也要看见），
-    按给定顺序吐帧，帧用完就返回 `(False, None)`。"""
+    """`cv2.VideoCapture` 的替身：**按调用顺序**记下每一次 `grab`/`read`（`events`），
+    以及每一次 `set`（`props` 列表）；按给定顺序吐帧，帧用完就返回 `(False, None)`。
+
+    `events` 是给 C1 的"丢了几帧、丢在读之前还是之后"用的；`props` 的断言用
+    set/dict 看"写了哪些属性"，重复写本来就不是那两个断言的关注点。
+    """
 
     def __init__(self, frames=(), opened=True):
         self.frames = list(frames)
         self.opened = opened
         self.props = []             # [(prop, value), ...] 按调用顺序
+        self.events = []            # ["grab" / "read", ...] 按调用顺序
         self.grabbed = 0
         self.reads = 0
         self.released = 0
@@ -83,10 +97,12 @@ class FakeCap:
         return True
 
     def grab(self):
+        self.events.append("grab")
         self.grabbed += 1
         return True
 
     def read(self):
+        self.events.append("read")
         self.reads += 1
         if not self.frames:
             return False, None
@@ -209,6 +225,52 @@ def test_grab_failure_raises_runtime_error(monkeypatch):
     assert "读帧失败" in str(excinfo.value)
 
 
+# --- 3b. C1：读之前先清流 --------------------------------------------------------
+
+
+def test_grab_discards_the_measured_queue_depth_before_every_read(monkeypatch):
+    """C1：每次 `grab()` 都要**先丢** ≥实测队列深度 的帧，再读。
+
+    丢少了会静默返回静置开始时拍的旧帧（本机实测最老约 2.9 s）；丢多了只多花 ~33 ms。
+    """
+    assert camera.FRESH_DISCARD_FRAMES >= C1_MEASURED_QUEUE_DEPTH, (
+        "队列深度实测 3–4 帧（上界 CAP_PROP_BUFFERSIZE=4）；丢帧数少于它，"
+        "静置后第一次 grab() 就会把老帧当成本次测量返回，而且不报错")
+
+    fake = FakeCap(frames=[_frame(), _frame()])
+    session = _session(monkeypatch, fake, settle_frames=0)
+
+    with session as cam:
+        cam.grab()
+        cam.grab()
+
+    expected = (["grab"] * camera.FRESH_DISCARD_FRAMES + ["read"]) * 2
+    assert fake.events == expected, "每一次 grab 都要先清流、再读"
+
+
+def test_grab_fresh_false_reads_without_discarding(monkeypatch):
+    """显式逃生门：刚读过一帧、队列是空的连拍场景才用（docstring 写明要慎用）。"""
+    fake = FakeCap(frames=[_frame()])
+    session = _session(monkeypatch, fake, settle_frames=0)
+
+    with session as cam:
+        frame = cam.grab(fresh=False)
+
+    assert fake.events == ["read"]
+    assert frame.shape == (8, 12, 3)
+
+
+def test_session_discard_count_is_configurable(monkeypatch):
+    """清流帧数走实例属性（换相机/测试可调），不是 `grab()` 里写死的常量。"""
+    fake = FakeCap(frames=[_frame()])
+    session = _session(monkeypatch, fake, settle_frames=0, fresh_discard_frames=2)
+
+    with session as cam:
+        cam.grab()
+
+    assert fake.events == ["grab", "grab", "read"]
+
+
 def test_grab_outside_the_context_never_opens_the_device(monkeypatch):
     opened = []
     monkeypatch.setattr(camera, "open_capture", lambda device: opened.append(device))
@@ -218,12 +280,14 @@ def test_grab_outside_the_context_never_opens_the_device(monkeypatch):
         session.grab()
     assert opened == [], "没进上下文时 grab() 不许偷偷开设备"
 
-    monkeypatch.setattr(camera, "open_capture", lambda device: FakeCap(frames=[_frame()]))
+    monkeypatch.setattr(camera, "open_capture",
+                        lambda device: opened.append(device) or FakeCap(frames=[_frame()]))
     with session:
         session.grab()
+    assert opened == [CAMERA_DEV], "__enter__ 开这一次；grab() 自己不许再开"
     with pytest.raises(CameraUnavailable):
         session.grab()
-    assert opened == [], "退出之后同样不许偷偷重开"
+    assert opened == [CAMERA_DEV], "退出之后同样不许偷偷重开"
 
 
 def test_exit_releases_the_device_even_when_the_body_raises(monkeypatch):
@@ -291,6 +355,32 @@ def test_save_resolves_relative_paths_against_the_repo_root(monkeypatch):
     assert Path(out).is_absolute()
     assert Path(out).relative_to(calib_store.REPO_ROOT) == Path(
         "视觉测量/结果/captures/.task8_path_probe.jpg")
+
+
+def test_save_reports_an_imwrite_false_instead_of_pretending_success(monkeypatch, tmp_path):
+    """`imwrite` 返回 False（磁盘满/权限不足）不许静默当成功 —— docstring 的承诺。"""
+    session = _session(monkeypatch, FakeCap(frames=[_frame()]), settle_frames=0)
+    monkeypatch.setattr(camera.cv2, "imwrite", lambda path, img, params: False)
+
+    with session as cam, pytest.raises(RuntimeError) as excinfo:
+        cam.save(tmp_path / "nope.jpg")
+
+    assert "存图失败" in str(excinfo.value)
+
+
+def test_save_wraps_cv2_errors_from_imwrite(monkeypatch, tmp_path):
+    """未知扩展名时 `imwrite` 是**抛** `cv2.error`（`live_field.py` 踩过），要收成一句人话。"""
+    session = _session(monkeypatch, FakeCap(frames=[_frame()]), settle_frames=0)
+
+    def boom(path, img, params):
+        raise cv2.error("could not find a writer")
+
+    monkeypatch.setattr(camera.cv2, "imwrite", boom)
+
+    with session as cam, pytest.raises(RuntimeError) as excinfo:
+        cam.save(tmp_path / "nope.zzz")
+
+    assert "存图失败" in str(excinfo.value)
 
 
 # --- 5. 导入/构造不许碰设备 -------------------------------------------------------
