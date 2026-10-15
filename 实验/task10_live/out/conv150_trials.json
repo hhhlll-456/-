@@ -1,0 +1,338 @@
+{
+ "tag": "conv150",
+ "pulse_ms": 150.0,
+ "tol_mm": 12.0,
+ "n_rounds": 3,
+ "n_measured": 3,
+ "reached_count": 3,
+ "final_dist_mm": [
+  6.7,
+  11.0,
+  11.4
+ ],
+ "final_dist_mean_mm": 9.7,
+ "final_dist_max_mm": 11.4,
+ "iters": [
+  9,
+  7,
+  8
+ ],
+ "stop_confirmed_all": true,
+ "any_out_of_field": false,
+ "min_edge_clear_seen": 122.0,
+ "warnings": [],
+ "trials": [
+  {
+   "round": 1,
+   "scatter_target": [
+    -60.0,
+    20.0
+   ],
+   "home_target": [
+    0.0,
+    0.0
+   ],
+   "start": [
+    -54.1,
+    18.4,
+    -24.7
+   ],
+   "start_edge_clear": [
+    198.4,
+    107.5
+   ],
+   "start_err_mm": 57.2,
+   "reached": true,
+   "reason": "converged",
+   "iters": 9,
+   "stop_confirmed": true,
+   "final": [
+    -4.4,
+    3.8,
+    -23.9
+   ],
+   "final_dist_mm": 5.8,
+   "verify_pos": [
+    -5.4,
+    3.9,
+    -24.1
+   ],
+   "verify_dist_mm": 6.7,
+   "end_edge_clear": [
+    247.1,
+    122.0
+   ],
+   "trace_dist_series": [
+    57.5,
+    48.1,
+    44.2,
+    40.2,
+    35.2,
+    28.1,
+    24.4,
+    16.0,
+    12.3
+   ],
+   "trace_outcomes": [
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done"
+   ],
+   "trace_cmds": [
+    [
+     0.0417,
+     0.0395,
+     150
+    ],
+    [
+     0.0343,
+     0.0338,
+     150
+    ],
+    [
+     0.0309,
+     0.0317,
+     150
+    ],
+    [
+     0.0278,
+     0.029,
+     150
+    ],
+    [
+     0.0245,
+     0.0253,
+     150
+    ],
+    [
+     0.0204,
+     0.022,
+     150
+    ],
+    [
+     0.0205,
+     0.0219,
+     150
+    ],
+    [
+     0.0198,
+     0.0226,
+     150
+    ],
+    [
+     0.0174,
+     0.0244,
+     150
+    ]
+   ],
+   "warnings": []
+  },
+  {
+   "round": 2,
+   "scatter_target": [
+    -60.0,
+    20.0
+   ],
+   "home_target": [
+    0.0,
+    0.0
+   ],
+   "start": [
+    -52.6,
+    16.2,
+    -24.4
+   ],
+   "start_edge_clear": [
+    199.9,
+    109.7
+   ],
+   "start_err_mm": 55.0,
+   "reached": true,
+   "reason": "converged",
+   "iters": 7,
+   "stop_confirmed": true,
+   "final": [
+    -11.0,
+    2.9,
+    -23.5
+   ],
+   "final_dist_mm": 11.3,
+   "verify_pos": [
+    -10.7,
+    2.9,
+    -23.5
+   ],
+   "verify_dist_mm": 11.0,
+   "end_edge_clear": [
+    241.8,
+    123.0
+   ],
+   "trace_dist_series": [
+    53.9,
+    46.0,
+    39.1,
+    33.0,
+    27.5,
+    22.7,
+    15.3
+   ],
+   "trace_outcomes": [
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done"
+   ],
+   "trace_cmds": [
+    [
+     0.0408,
+     0.0353,
+     150
+    ],
+    [
+     0.0338,
+     0.0313,
+     150
+    ],
+    [
+     0.0295,
+     0.0256,
+     150
+    ],
+    [
+     0.0247,
+     0.0219,
+     150
+    ],
+    [
+     0.0233,
+     0.0189,
+     150
+    ],
+    [
+     0.0228,
+     0.0195,
+     150
+    ],
+    [
+     0.0234,
+     0.0188,
+     150
+    ]
+   ],
+   "warnings": []
+  },
+  {
+   "round": 3,
+   "scatter_target": [
+    -60.0,
+    20.0
+   ],
+   "home_target": [
+    0.0,
+    0.0
+   ],
+   "start": [
+    -54.2,
+    14.4,
+    -24.2
+   ],
+   "start_edge_clear": [
+    198.3,
+    111.5
+   ],
+   "start_err_mm": 56.1,
+   "reached": true,
+   "reason": "converged",
+   "iters": 8,
+   "stop_confirmed": true,
+   "final": [
+    -11.6,
+    1.7,
+    -24.1
+   ],
+   "final_dist_mm": 11.7,
+   "verify_pos": [
+    -11.2,
+    1.6,
+    -24.1
+   ],
+   "verify_dist_mm": 11.4,
+   "end_edge_clear": [
+    241.3,
+    124.3
+   ],
+   "trace_dist_series": [
+    56.4,
+    47.6,
+    41.8,
+    37.3,
+    31.0,
+    26.8,
+    22.5,
+    15.7
+   ],
+   "trace_outcomes": [
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done"
+   ],
+   "trace_cmds": [
+    [
+     0.0435,
+     0.0359,
+     150
+    ],
+    [
+     0.0361,
+     0.031,
+     150
+    ],
+    [
+     0.0319,
+     0.027,
+     150
+    ],
+    [
+     0.0284,
+     0.0242,
+     150
+    ],
+    [
+     0.0242,
+     0.0193,
+     150
+    ],
+    [
+     0.024,
+     0.018,
+     150
+    ],
+    [
+     0.0243,
+     0.0176,
+     150
+    ],
+    [
+     0.0248,
+     0.0169,
+     150
+    ]
+   ],
+   "warnings": []
+  }
+ ]
+}

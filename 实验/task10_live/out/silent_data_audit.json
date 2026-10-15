@@ -1,0 +1,52 @@
+{
+ "cases": [
+  {
+   "case": "已在容差窗口内直接归位",
+   "reached": true,
+   "reason": "converged",
+   "iters": 0,
+   "final": [
+    3.0,
+    4.0,
+    90.0
+   ],
+   "PASS": true
+  },
+  {
+   "case": "中途视觉失明",
+   "reached": false,
+   "reason": "locate_failed",
+   "iters": 1,
+   "final": [
+    -300.0,
+    0.0,
+    90.0
+   ],
+   "last_locate_reason": "boundary_moved",
+   "契约": "`final` 的定义是**最后一次成功 locate** 的位姿（模块 docstring），所以它停在**脉冲之前**的 (-300,0)，而不是脉冲之后的真实位置 —— 这是诚实的'我不知道'，不是编造；但调用方若拿 final 算误差，算到的是**上一轮**的误差。",
+   "PASS": true
+  },
+  {
+   "case": "边界码漂移超限（40px > 15px）",
+   "raised": "BoundaryMarkersMoved",
+   "PASS": true
+  },
+  {
+   "case": "目标越出场地",
+   "raised": "ValueError",
+   "commands_sent": [],
+   "PASS": true
+  },
+  {
+   "case": "车没动过但已在窗口内",
+   "reached": true,
+   "reason": "converged",
+   "iters": 0,
+   "n_RUN": 0,
+   "语义": "reached 只表示'几何上在 tol 窗口内'，不表示'车动过'。调用方必须自己看 iters/trace。",
+   "PASS": null
+  }
+ ],
+ "n_hard": 4,
+ "all_hard_cases_pass": true
+}
