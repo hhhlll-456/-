@@ -9,3 +9,6 @@ __pycache__/
 
 # Task 12 复核脚本的派生整理集（由 build.py 现场生成）
 实验/t12_stats/dataset.json
+
+# 参数测量清单管线的历史快照（阶段输入 v2_stage.xlsx 已入库，无需备份副本）
+交付物/.麦轮小车参数测量清单.ref/*_备份*.xlsx
