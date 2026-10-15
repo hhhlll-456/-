@@ -147,12 +147,20 @@ def check_experiment_feasible(exp, start_xy) -> None:
     matrix.assert_within_field(exp, start_xy=start_xy)
 
 
-def iterate_trials(experiments=matrix.EXPERIMENTS, only=None):
-    """`(exp, repeat_index)` 生成器：矩阵 × 每条自己的 repeats；`only` 按 id 过滤。"""
+def iterate_trials(experiments=matrix.EXPERIMENTS, only=None, trial_filter=None):
+    """`(exp, repeat_index)` 生成器：矩阵 × 每条自己的 repeats；`only` 按 id 过滤。
+
+    `trial_filter(exp, rep) -> bool`（可选，默认 `None` = 全要）：再按**具体条目**过滤，
+    用于"只补跑上一轮失败的那几条"。`only` 只能筛到 id 粒度（一条实验的 repeats 是
+    一个整体），补跑场景需要 rep 粒度，故留这个口子。默认 `None` 时行为与从前**完全
+    相同**（`vgt/tests/test_run_all_experiments.py` 锁的就是那个行为）。
+    """
     for exp in experiments:
         if only is not None and int(exp.id) != int(only):
             continue
         for rep in range(int(exp.repeats)):
+            if trial_filter is not None and not trial_filter(exp, rep):
+                continue
             yield exp, rep
 
 
@@ -244,11 +252,45 @@ def _yaw_gate(harness, exp, stats, yaw_tol_deg):
             "to_yaw": None if res["final_yaw"] is None else round(res["final_yaw"], 2)}
 
 
+def trials_spec_to_filter(spec):
+    """`"7:1,7:3"` → `(exp, rep) -> bool`（**rep 序号 1 起**，表里/命令里都 1 起）。
+
+    内部 `iterate_trials` 的 `rep` 是 0 起的下标，这里做一次显式换算并拒绝越界 ——
+    写错成 `7:4`（repeats=3）时立刻报错，而不是悄悄一条都不跑（那会被读成"跑过了"）。
+    """
+    want = set()
+    for item in str(spec).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        exp_id, sep, rep = item.partition(":")
+        if not sep:
+            raise ValueError(f"--trials 条目 {item!r} 缺 ':'，格式是 ID:REP")
+        exp_id, rep = int(exp_id), int(rep)
+        if exp_id not in {int(e.id) for e in matrix.EXPERIMENTS}:
+            raise ValueError(f"--trials 里的实验 #{exp_id} 不在矩阵里")
+        exp = exp_by_id(exp_id)
+        if not 1 <= rep <= int(exp.repeats):
+            raise ValueError(f"--trials 条目 {item!r}：#{exp_id} 只有 "
+                             f"{int(exp.repeats)} 个 repeat，rep 必须是 1..{exp.repeats}")
+        want.add((exp_id, rep))
+    if not want:
+        raise ValueError(f"--trials {spec!r} 解析不出任何条目")
+    return lambda exp, rep: (int(exp.id), int(rep) + 1) in want
+
+
+def exp_by_id(exp_id):
+    for exp in matrix.EXPERIMENTS:
+        if int(exp.id) == int(exp_id):
+            return exp
+    raise KeyError(f"矩阵里没有实验 #{exp_id}")
+
+
 def run_batch(harness, *, experiments, only=None, xlsx_path,
               printer=print, write=compare.write_trial, archive=True,
               pulse_ms=DEFAULT_PULSE_MS, coarse_pulse_ms=None,
               yaw_tol_deg=DEFAULT_YAW_TOL_DEG, tol_mm=DEFAULT_TOL_MM,
-              max_iter=DEFAULT_MAX_ITER) -> dict:
+              max_iter=DEFAULT_MAX_ITER, trial_filter=None) -> dict:
     """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
 
     返回统计：`n_trials / n_ok / n_failed / n_homing_failed / n_homing_zero_pulse /
@@ -272,8 +314,12 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
     （`harness.align_yaw`，只发带时长的 `RUN 0 0 ±om ms`）。`0` = 不摆。摆头失败就把
     本条记成 `homing_yaw_<reason>` 的失败行、**不开电机**跑实验；摆了几步会在汇总行
     的 `notes` 里留 `yaw_corrected` 痕迹。
+
+    `trial_filter`（可选，默认 `None`）：`(exp, rep) -> bool`，按**条目**过滤，用来
+    只补跑上一轮失败的那几条（`only` 只能筛到 id 粒度，一条实验的 repeats 是一个
+    整体）。默认 `None` 时 `iterate_trials` 的行为与从前一字不差。
     """
-    trials = list(iterate_trials(experiments, only=only))
+    trials = list(iterate_trials(experiments, only=only, trial_filter=trial_filter))
     stats = {"n_trials": len(trials), "n_ok": 0, "n_failed": 0,
              "n_homing_failed": 0, "n_homing_zero_pulse": 0,
              "n_yaw_failed": 0, "n_yaw_corrected": 0, "archive_path": None}
@@ -331,9 +377,10 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
     return stats
 
 
-def dry_run(*, experiments=matrix.EXPERIMENTS, only=None, printer=print) -> int:
+def dry_run(*, experiments=matrix.EXPERIMENTS, only=None, printer=print,
+            trial_filter=None) -> int:
     """`--dry`：不开相机、不连车 —— 只做场地校验并打印每条的执行计划。"""
-    trials = list(iterate_trials(experiments, only=only))
+    trials = list(iterate_trials(experiments, only=only, trial_filter=trial_filter))
     if not trials:
         printer(f"没有匹配 --only {only} 的实验。")
         return 2
@@ -379,6 +426,10 @@ def parse_args(argv=None):
         description="Task 12 批量：矩阵 × repeats，归位 → 实验 → 对比入表（--dry 离线预演）")
     parser.add_argument("--only", type=int, default=None, metavar="ID",
                         help="只跑指定 experiment_id（默认全部）")
+    parser.add_argument("--trials", default=None, metavar="ID:REP[,ID:REP...]",
+                        help="只跑指定的 (实验 id, 第几条 repeat，**1 起**) —— "
+                             "补跑上一轮失败的那几条时用（--only 只能筛到 id 粒度）。"
+                             "例：`--trials 7:1,7:3` = #07 的 rep2 与 rep3")
     parser.add_argument("--dry", action="store_true",
                         help="不开相机/不连车：只做场地校验并打印执行计划")
     parser.add_argument("--pulse-ms", type=float, default=DEFAULT_PULSE_MS, metavar="MS",
@@ -407,20 +458,35 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
     `--pulse-ms` 只改**归位脉冲宽度**（默认 400 ms = `harness.DEFAULT_PULSE_MS`，行为不变）；
     实验本身的 `RUN` 参数来自 `matrix.EXPERIMENTS`，不受它影响。真机跑全量必须显式
     给 `--pulse-ms 150`（理由见 `run_batch` 的 docstring）。
+
+    `--trials "ID:REP,..."`（可选）：补跑用，只跑指定的 (实验 id, 第几条 repeat，1 起)。
+    与 `--only` 可同时给（`--only` 粗筛、`--trials` 细筛）；`--dry` 同样尊重它。
     """
     args = parse_args(argv)
+    try:
+        trial_filter = trials_spec_to_filter(args.trials) if args.trials else None
+    except ValueError as exc:
+        printer(f"--trials 写法有问题：{exc}")
+        return 2
     known = {int(e.id) for e in matrix.EXPERIMENTS}
     if args.only is not None and args.only not in known:
         printer(f"没有实验 #{args.only}：矩阵只有 {sorted(known)}。")
         return 2
     if args.dry:
-        return dry_run(experiments=matrix.EXPERIMENTS, only=args.only, printer=printer)
+        return dry_run(experiments=matrix.EXPERIMENTS, only=args.only,
+                       printer=printer, trial_filter=trial_filter)
 
     xlsx = Path(xlsx_path) if xlsx_path is not None else compare.DEFAULT_XLSX
     factory = session_factory if session_factory is not None else _open_real_session
-    n_trials = sum(1 for _ in iterate_trials(matrix.EXPERIMENTS, only=args.only))
+    n_trials = sum(1 for _ in iterate_trials(matrix.EXPERIMENTS, only=args.only,
+                                            trial_filter=trial_filter))
+    if n_trials == 0:
+        printer(f"--only {args.only} / --trials {args.trials} 筛下来一条都没有 —— "
+                "没跑、也没写表。")
+        return 2
     printer(f"=== Task 12 批量：{n_trials} 次（{len(matrix.EXPERIMENTS)} 条矩阵 × repeats"
             f"{'，--only ' + str(args.only) if args.only is not None else ''}"
+            f"{'，--trials ' + str(args.trials) if args.trials else ''}"
             f"，归位脉冲 {args.pulse_ms:g} ms"
             f"{' / 粗 ' + format(args.coarse_ms, 'g') + ' ms' if args.coarse_ms else ''}"
             f"，车头容差 {args.yaw_tol_deg:g}°，归位容差 {args.tol_mm:g} mm/"
@@ -430,7 +496,7 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
                           xlsx_path=xlsx, printer=printer, pulse_ms=args.pulse_ms,
                           coarse_pulse_ms=args.coarse_ms,
                           yaw_tol_deg=args.yaw_tol_deg, tol_mm=args.tol_mm,
-                          max_iter=args.max_iter)
+                          max_iter=args.max_iter, trial_filter=trial_filter)
     if stats["archive_path"]:
         printer(f"已归档：{stats['archive_path']}")
     printer(f"完成：{stats['n_ok']}/{stats['n_trials']} 通过；{stats['n_failed']} 条失败"

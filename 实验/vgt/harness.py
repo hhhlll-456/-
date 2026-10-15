@@ -291,6 +291,24 @@ REASON_TOO_FAR = "homing_too_far"
 # R72/B：连续几次脉冲实测位移 < `STUCK_STEP_MM`（推不动：起步死区/打滑）——
 # 不是"迭代不够"，所以不能混进 `max_iter`。
 REASON_STUCK = "homing_stuck"
+# R73：一个脉冲让车**离目标更远**（`gained_mm <= -STUCK_STEP_MM`）。**立刻停，别升级脉冲。**
+#
+# 实测（2026-10-15 Task 12 Step 4 补跑 #07 rep3，真机）：车头 yaw 只有 −3.4°、场地中心
+# 附近，`drive_to` 的三个脉冲是 `d=14,8,26 | ms=160,191,480`。第二个脉冲让误差从 8 mm
+# **涨到** 26 mm（`gained = −18 mm`）—— 车往反方向走了；而 `gained < STUCK_STEP_MM`
+# 在 R72/B 的分类里落进 `else` 分支，被当成"推不动"，于是下一发**放大** 1.5 倍到
+# 480 ms。这一发把车送出 187 mm、直接停在边界码 ID20 上压住它 ⇒ `locate()` 彻底失败
+# （视觉死锁，必须人工搬车）。
+#
+# 也就是说：R72/B 的 `else`（`|gained| < 2 mm` 的起步死区）把"**反方向走了 18 mm**"
+# 误分类成"推不动"，并用脉冲升级把失控**放大**。本条把两件事分开：
+#   `gained <= -STUCK_STEP_MM` → 方向反了 → `wrong_way`，**当场收手**；
+#   `-STUCK_STEP_MM < gained < STUCK_STEP_MM` → 真的没动 → 才算 `homing_stuck` 并升级。
+#
+# ⚠ 这是**兜底护栏，不是已查明的修法**。为什么反向，根因仍未查明（候选：命令方向与
+# 实际轮向不一致 / 视觉在大车体角解错位姿 / MIN_DUTY 钳位）。这里只保证"一旦发现车
+# 往反方向走了，就不要再发更大的脉冲把它推得更远"。
+REASON_WRONG_WAY = "homing_wrong_way"
 DRIVE_REASONS = (
     "converged",
     REASON_ALREADY_AT_TARGET,
@@ -299,6 +317,7 @@ DRIVE_REASONS = (
     "run_rejected",
     REASON_TOO_FAR,
     REASON_STUCK,
+    REASON_WRONG_WAY,
 )
 
 # ---- 归位步长模型（R70）------------------------------------------------------------
@@ -1007,6 +1026,20 @@ class Harness:
                 new_dist = math.hypot(x_t - pos[0], y_t - pos[1])
                 gained = prev_dist - new_dist
                 rec["gained_mm"] = round(gained, 1)
+                if gained <= -STUCK_STEP_MM:
+                    # R73：一个脉冲把车推**离目标更远**。当场收手、给名字 ——
+                    # 绝不能让它掉进下面的 `else`（"推不动"）去触发脉冲升级：
+                    # 实测就是这样 160 → 191 → 480 ms，最后一发送出 187 mm 并压住
+                    # 边界码 ID20，视觉死锁。**根因未查明，这只是护栏。**
+                    reason = REASON_WRONG_WAY
+                    rec["wrong_way"] = True
+                    warnings.warn(
+                        f"drive_to: 第 {iters} 个脉冲让车**离目标更远** "
+                        f"（gained={gained:+.1f} mm，脉冲 {use_ms} ms，"
+                        f"误差 {prev_dist:.1f} → {new_dist:.1f} mm）—— 已收手，"
+                        "不再发更大的脉冲。命令方向与实际轮向不一致的根因仍未查明。",
+                        RuntimeWarning, stacklevel=2)
+                    break
                 if gained >= STUCK_STEP_MM:
                     measured = gained / float(use_ms)
                     rate_mm_per_ms = (measured if rate_mm_per_ms is None

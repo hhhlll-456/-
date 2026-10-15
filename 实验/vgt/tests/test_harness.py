@@ -763,6 +763,42 @@ def test_drive_to_flags_a_stuck_car_with_its_own_reason(monkeypatch):
     assert widths == sorted(widths), f"推不动就该把脉冲加长：{widths}"
 
 
+def test_drive_to_aborts_when_a_pulse_moves_the_car_away(monkeypatch):
+    """R73：`gained_mm <= -STUCK_STEP_MM` ⇒ `homing_wrong_way`，**当场收手、绝不升级脉冲**。
+
+    真机症状（Task 12 Step 4 补跑 #07 rep3，车头 yaw 只有 −3.4°、场地中心附近）：
+    `d=14,8,26 | ms=160,191,480`。第二个脉冲让误差从 8 mm **涨到** 26 mm
+    （`gained = −18 mm`，车往反方向走），可 `gained < STUCK_STEP_MM` 在 R72/B 的分类里
+    落进 `else` 被当成"推不动"，于是下一发**放大** 1.5 倍到 480 ms —— 那一发把车送出
+    187 mm、停在边界码 ID20 上压住它，`locate()` 彻底失败（视觉死锁，需人工搬车）。
+
+    根因仍未查明；这里锁的是**护栏语义**：反向位移必须有自己的名字，且不许再发更大的脉冲。
+    """
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20}, locate_tries=1)
+    # 第一次脉冲朝目标走 6 mm；第二次脉冲把车推**离**目标 18 mm。
+    positions = [(14.0, 0.0, 0.0), (8.0, 0.0, 0.0), (26.0, 0.0, 0.0), (400.0, 0.0, 0.0)]
+    h.locate = lambda: positions.pop(0)
+
+    # ⚠ `tol_mm=4` 必须显式给：默认容差 12 mm 会把第二个位置 (8, 0) 直接判成收敛 ——
+    # 这条测试第一版就是这么假绿的（`DID NOT WARN`，反向脉冲根本轮不到）。
+    # 4 mm 与 Task 12 真机跑批的 `--tol-mm 4` 同口径。
+    with pytest.warns(RuntimeWarning, match="离目标更远"):
+        res = h.drive_to(0.0, 0.0, tol_mm=4.0, pulse_ms=120, coarse_pulse_ms=320,
+                         settle_s=0.0)
+
+    assert res["reached"] is False and res["reason"] == H.REASON_WRONG_WAY
+    assert res["reason"] in H.DRIVE_REASONS
+    # 关键：**只发两个脉冲**，第三个（升级后的 480 ms）绝不许发出去。
+    assert res["iters"] == 2, f"反向脉冲后必须立刻收手，实测 iters={res['iters']}"
+    widths = [t["cmd"][2] for t in res["trace"]]
+    assert max(widths) <= 320, f"不许把脉冲放大：{widths}"
+    assert res["trace"][-1]["gained_mm"] == pytest.approx(-18.0, abs=0.5)
+    assert res["trace"][-1].get("wrong_way") is True
+    # 反向 ≠ 推不动：两者必须能分开数
+    assert H.REASON_WRONG_WAY != H.REASON_STUCK
+
+
 def test_drive_to_trace_records_the_measured_step_and_rate(monkeypatch):
     """R72：trace 里要有"这一轮实测走了多少"和更新后的速率（分诊的依据）。"""
     h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],

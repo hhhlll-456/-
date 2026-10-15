@@ -27,6 +27,8 @@
 2. `drive_to` 不判断"车停稳了没有"。上一次的 RUN 还在滑行时就发下一条脉冲，
    位移会叠加。`align_yaw` 每步都 STOP + 沉降 + 重新 `locate()`，比 `drive_to`
    的沉降长；这里在两者之间额外睡 `settle_s`。
+3. **零脉冲归位算成功**（R67 的第三档，见下面 `zero_pulse` 那段）。车实测离目标
+   2.5 mm 就是"已经在安全位置"，判成失败会把整批补跑卡死 —— 这个坑本轮真踩了。
 
 参数与 Task 12 Step 4 全量跑批用的那组一致（`--pulse-ms 120 --coarse-ms 320
 --tol-mm 4 --max-iter 24`），归位容差放宽到 6 mm：中心附近余量充足，
@@ -94,6 +96,25 @@ def main(argv=None):
              "outcome": t.get("outcome"), "stuck_run": t.get("stuck_run")}
             for t in (home.get("trace") or [])]
         out["home"]["ok"] = bool(home.get("reached") and home.get("moved"))
+        # R67 的第三档「零脉冲」：**车实测就在容差内**，一条 RUN 都没发。
+        # `drive_to` 报 `reached=False, reason="already_at_target", at_target=True`。
+        # 本脚本的用途是"把车摆到一个已知安全的位置（场地中心 + 车头摆正）"，
+        # **零脉冲恰恰说明这个目的已经达成** —— 车实测离目标 2.5 mm，没有比跑几个脉冲
+        # 更安全的位置。所以它**算成功**，但绝不能混进"归位真的动过"里（`moved` 仍是
+        # False、`iters=0` 都原样留着，另加 `zero_pulse` 标记）。
+        # ⚠ 这里踩过一次坑：本脚本原来只用 `reached and moved` 判成功，于是车明明在
+        # 中心 2.1 mm 处，`rc=1` 把 **#07 的 3 条补跑全判成"归位未收敛"**、一条没跑。
+        # （#02 跑完后归位到中心的那次也是零脉冲。）判据与 `run_all_experiments.
+        # classify_homing` 的 `zero_pulse` 档对齐，两者现在说同一件事。
+        out["home"]["zero_pulse"] = bool(
+            home.get("at_target") and not home.get("reached"))
+        if out["home"]["zero_pulse"]:
+            start = home.get("start_dist_mm")
+            out["home"]["ok"] = True
+            print(f"  ⚠ 零脉冲归位：起点实测离目标 "
+                  f"{'?' if start is None else format(float(start), '.1f')} mm ≤ 容差 "
+                  f"{TOL_MM:g} mm，本次归位没执行过任何动作（车确实在位，但不计为"
+                  "「归位真的动过」）")
         car.stop()
     print(json.dumps(out, ensure_ascii=False, indent=2))
     LOG.open("a").write(json.dumps(out, ensure_ascii=False) + "\n")

@@ -234,6 +234,50 @@ def test_iterate_trials_yields_every_repeat_and_only_filters_by_id():
     assert list(RA.iterate_trials(matrix.EXPERIMENTS, only=999)) == []
 
 
+def test_trials_spec_to_filter_selects_reps_one_based():
+    # 补跑用：只挑 #07 的 rep1 与 rep3（命令行口径 **1 起**）
+    f = RA.trials_spec_to_filter("7:1,7:3")
+    got = [(int(e.id), rep + 1) for e, rep in RA.iterate_trials(matrix.EXPERIMENTS,
+                                                               trial_filter=f)]
+    assert got == [(7, 1), (7, 3)]
+    # 跨实验
+    f2 = RA.trials_spec_to_filter("13:2,16:1")
+    got2 = [(int(e.id), rep + 1) for e, rep in RA.iterate_trials(matrix.EXPERIMENTS,
+                                                                 trial_filter=f2)]
+    assert got2 == [(13, 2), (16, 1)]
+    # 与 --only 叠加：粗筛 id + 细筛 rep
+    f3 = RA.trials_spec_to_filter("7:2")
+    got3 = [(int(e.id), rep + 1) for e, rep in RA.iterate_trials(matrix.EXPERIMENTS, only=7,
+                                                                 trial_filter=f3)]
+    assert got3 == [(7, 2)]
+
+
+def test_trials_spec_rejects_bad_input_instead_of_silently_running_nothing():
+    with pytest.raises(ValueError, match="格式"):
+        RA.trials_spec_to_filter("7")            # 缺 ':'
+    with pytest.raises(ValueError, match="不在矩阵里"):
+        RA.trials_spec_to_filter("99:1")         # 没有的实验 id
+    with pytest.raises(ValueError, match="rep 必须是"):
+        RA.trials_spec_to_filter("7:4")          # repeats=3，rep 越界
+    with pytest.raises(ValueError, match="rep 必须是"):
+        RA.trials_spec_to_filter("7:0")          # 1 起的口径：0 越界
+    with pytest.raises(ValueError, match="解析不出"):
+        RA.trials_spec_to_filter(", ,")
+
+
+def test_cli_trials_zero_trials_refuses_to_write_anything(tmp_path):
+    """筛下来一条都没有时必须**报错退出**，不许"安静地什么都不做"。"""
+    lines = []
+    # --only 与 --trials 一致时：只出 1 条
+    rc = RA.main(["--trials", "7:2", "--only", "7", "--dry"], printer=lines.append)
+    assert rc == 0
+    assert len(lines) == 2 and "[ 1/1] #07 rep2/3" in lines[0]
+    # 两个筛选互相矛盾（--only 3 但 --trials 只要 #07）→ 一条都没有 → 退出码 2
+    lines.clear()
+    assert RA.main(["--trials", "7:2", "--only", "3", "--dry"], printer=lines.append) == 2
+    assert RA.main(["--only", "999"], printer=lines.append) == 2
+
+
 # ------------------------------------------------------------------ 批量循环（mock）
 
 def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, builder, xlsx):

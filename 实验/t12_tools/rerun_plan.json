@@ -1,0 +1,71 @@
+{
+  "xlsx": "/home/hanli/麦轮小车pid/实验/实验数据记录.xlsx",
+  "from_row": 24,
+  "missing": [
+    {
+      "experiment_id": 2,
+      "repeat": 1,
+      "previous_reason": "homing_locate_failed"
+    },
+    {
+      "experiment_id": 7,
+      "repeat": 0,
+      "previous_reason": "homing_stuck"
+    },
+    {
+      "experiment_id": 7,
+      "repeat": 1,
+      "previous_reason": "homing_locate_failed"
+    },
+    {
+      "experiment_id": 7,
+      "repeat": 2,
+      "previous_reason": "homing_yaw_locate_failed"
+    },
+    {
+      "experiment_id": 12,
+      "repeat": 1,
+      "previous_reason": "homing_stuck"
+    },
+    {
+      "experiment_id": 13,
+      "repeat": 0,
+      "previous_reason": "homing_locate_failed"
+    },
+    {
+      "experiment_id": 13,
+      "repeat": 2,
+      "previous_reason": "homing_locate_failed"
+    },
+    {
+      "experiment_id": 15,
+      "repeat": 0,
+      "previous_reason": "homing_locate_failed"
+    },
+    {
+      "experiment_id": 15,
+      "repeat": 1,
+      "previous_reason": "homing_locate_failed"
+    },
+    {
+      "experiment_id": 15,
+      "repeat": 2,
+      "previous_reason": "homing_locate_failed"
+    },
+    {
+      "experiment_id": 16,
+      "repeat": 0,
+      "previous_reason": null
+    },
+    {
+      "experiment_id": 16,
+      "repeat": 1,
+      "previous_reason": null
+    },
+    {
+      "experiment_id": 16,
+      "repeat": 2,
+      "previous_reason": null
+    }
+  ]
+}
