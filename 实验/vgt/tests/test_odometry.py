@@ -189,6 +189,35 @@ def test_pure_strafe_pattern_gives_lateral_only():
     assert abs(out[-1][1] - expected_y) < 1e-6
 
 
+def test_yaw_and_translation_scale_with_the_same_c1():
+    """**偏航与平移吃同一个 c1/R** —— R66 能靠偏航腿独立判死"c1 标错了"的前提。
+
+    原地旋转时运动学要求 `d = (−a,+a,−a,+a)`，于是偏航里的四项带符号距离**同号**，
+    `dψ = (−d0+d1−d2+d3)/(4·LXY)` 化简成
+
+        dψ = (2πR / (4·LXY)) · Σ_i (Δc_i / c1_i)
+
+    即"总计数 → 偏航角"是一条**只被 1/c1 缩放**的直线。所以 c1 若真错了 k 倍，
+    偏航也必然差 k 倍 —— 平移腿和偏航腿互相独立，却指向同一个 c1。
+
+    真机依据（`实验/rotcheck/`）：偏航腿解出的 `c1_flat` 均值 1275.2（标称 1274，
+    偏差 +0.09%），尺度因子 `s = 1.0009`；直行腿独立解出的 `c1` 同样围着 1274。
+    两者都不是 1274/2.7 或 1274×2.7 ⇒ "少报 2.7×"不是尺度问题。
+    """
+    counts = 1000
+    out = _integrate(_ramp(counts), PWM_ROT_CCW)
+    closed = (2 * math.pi * R_EFF / (4 * LXY_MM)) * (4 * counts / C_1REV)
+
+    assert abs(math.radians(out[-1][2]) - closed) < 1e-9      # 闭式 == 积分器
+    assert abs(out[-1][0]) < 0.5 and abs(out[-1][1]) < 0.5   # 纯旋转：不平移
+
+    # c1 翻倍 ⇒ 同样的计数只转出一半的偏航。两条腿因此共用一个尺度常数。
+    half = odometry.integrate_encoders(
+        _samples(_ramp(counts), PWM_ROT_CCW), c_1rev=2 * C_1REV, sign=SIGN,
+        l_xy_over_r=LXY_R, r_eff_mm=R_EFF)
+    assert abs(half[-1][2] - out[-1][2] / 2) < 1e-9
+
+
 def test_reversed_pwm_drives_backward():
     out = _integrate(_ramp(400), [-v for v in PWM_FWD])
     assert out[-1][0] < 0
