@@ -28,17 +28,28 @@ Global Constraints 的四条动作上限，加上 brief 要求的覆盖：
 `ms_for_mm()` / `ms_for_deg()` 反解时长并**向下取整到 1 ms**（量化误差 < 0.6 mm，
 保证真实行程不超过上限）。
 
+⚠ **R72：上表那个 `V_STEADY = 0.56` 只对纵向通道成立。** 横向（麦轮横移）四个实测点
+(187 ms, 11.7) (285, 31.6) (285, 28.2) (300, 41.1) 拟出 **0.223 m/s / 死区 138 ms**，
+所以"横移 80 mm"的 285 ms 真机只走 ≈31.6 mm。矩阵的**目标行程**（brief 规定）仍是
+80 mm、时长也照 80 mm 反解并锁死，但 `expected_travel_mm` 的**期望到达**按横向通道算
+—— 起点对中必须对在"真机会走的那一段"上：按 79.5 mm 对中会让起点坐在 ±39.8 mm 处，
+车头偏 3° 车体就压在边界线上（真机 `after_5_r1` 实测越界 14.9 mm，标了 OUT）。
+斜行仍走纵向模型（保守），理由见 `expected_travel_mm` 的 docstring。
+
 ⚠ 于是"命令量"和"目标行程"**故意不相等**，两者都要看得懂：
 
 - `expected_travel_mm(exp)` / `expected_delta_mm(exp)` / `expected_yaw_deg(exp)`
-  = **真实会走**多少（= 目标，见上表）；`expected_start_xy(exp)` = 把它对中后的起点；
+  = **真实会走**多少（纵向/旋转类 = 上表的目标；横移类按横向通道模型，见 R72 那段）；
+  `expected_start_xy(exp)` = 把它对中后的起点；
 - `compare._command_param_1` 记进表的"计划距离"是 `v·T` = **命令量**（#01 = 100 mm，
   它的 desc 与目标却是 200 mm）——固件按命令只该走 100 mm，实际走 ≈200 mm，
   这个 2× 差**就是** Task 14 要辨识的东西（速度映射在 MIN_DUTY 以下失效）。
 - **不许**把修正预先烘焙进命令速度（令 `v·T` 恰等于实际）：那会让"理想 vs 实际"
   恒为 0，Task 14 的信号当场消失。
 
-`assert_within_field` 的动作上限与几何分支一律用**期望行程**，不用命令量。
+`assert_within_field` 一律用**行程**、不用命令量 `v·T`：**动作上限**用"规定走多少"
+（`target_travel_mm`，纵向模型），**场地几何**用"真会走到哪"（`expected_travel_mm`，
+按通道）—— 横移这两者差 2.4 倍（R72），混用不是上限形同虚设就是对中错位。
 
 ## `assert_within_field(exp, start_xy=(0.0, 0.0))` 校验什么
 
@@ -95,6 +106,15 @@ V_STEADY_MPS = 0.56              # 稳态速度（600/350/300 ms → 256.3/110.3
 DEAD_MS = 143.0                  # 起步死区（三个行程反解出的截距一致）
 YAW_RATE_DEG_S = 243.0           # 原地旋转速率（13.87° / 0.2 s 的偏航腿）
 
+# R72：**横向通道是另一个速度模型** —— 麦轮横移的效率远低于纵向。四个真机横移点
+# (187 ms, 11.7) (285, 31.6) (285, 28.2) (300, 41.1) 最小二乘 ⇒ 0.223 m/s / 138 ms。
+# 注意"命令 80 mm"的 285 ms 真机只走 ≈31.6 mm（同一时长走纵向通道会走 79.5 mm）：
+# 矩阵的**目标行程**仍是 brief 规定的 80 mm（时长照 80 mm 反解、锁死），但**期望到达**
+# 按横向通道算 —— 起点对中必须对在真机会走的那一段上，否则车从 ±39.8 mm 处起跑，
+# 车头偏 3° 车体就压在边界线上（`after_5_r1` 实测 d_env −14.9 OUT）。
+V_LATERAL_MPS = 0.223
+DEAD_LATERAL_MS = 138.0
+
 # 45° 斜行的每轴速度：|v|·√2 = 0.12 m/s（命令量；真机行程由 duration_s 决定，R68）
 _DIAG_V = 0.12 / math.sqrt(2.0)
 _OM = math.pi / 4.0              # 45°/s（命令量）
@@ -147,6 +167,30 @@ def _dir_unit(exp) -> tuple:
     return (exp.vx / speed, exp.vy / speed)
 
 
+def target_travel_mm(exp) -> float:
+    """这条实验**规定走**多少（mm）= brief 的目标步长；旋转类返回 0。
+
+    时长是用**纵向模型**（`V_STEADY`）从目标步长反解出来的（R68），所以纵向模型反解
+    回去就是"这条实验规定走多少"。#05 的 285 ms → 79.5 mm ⇒ 目标步长 80 mm ✓。
+
+    ⚠ 与 `expected_travel_mm`（**按通道**的真机期望到达）不是一回事，别混：
+
+    - **动作上限**（brief 的 200/80/120/45°）查的是"规定走多少"⇒ 用这一支。横移 90 mm
+      的命令仍必须被拒（`MAX_STRAFE_MM`），哪怕真机横向通道只走得到它的四成；
+    - **场地几何**（车体包络在不在场里）查的是"车真会走到哪"⇒ 用 `expected_travel_mm`。
+    """
+    if exp.action == "rotate_in_place":
+        return 0.0
+    return max(0.0, V_STEADY_MPS * (exp.duration_s * 1000.0 - DEAD_MS))
+
+
+def _target_delta_mm(exp) -> tuple:
+    """**规定位移** `(dx, dy)`（mm）：沿命令方向、长度 = `target_travel_mm`。"""
+    ux, uy = _dir_unit(exp)
+    t = target_travel_mm(exp)
+    return (ux * t, uy * t)
+
+
 def body_to_field_delta(dx_body, dy_body, yaw_deg=0.0) -> tuple:
     """**车体系**位移 → 场地系位移（mm）。`yaw_deg=0`（车头对齐场地 +X）时 y 取负。
 
@@ -173,9 +217,21 @@ def field_delta_mm(exp, yaw_deg=0.0) -> tuple:
 
 
 def expected_travel_mm(exp) -> float:
-    """这条实验**真机会走**的平移距离（mm）：`V_STEADY·(T−DEAD)`；旋转类返回 0。"""
+    """这条实验**真机会走**的平移距离（mm）：`V·(T−DEAD)`；旋转类返回 0。
+
+    **按通道取模型**（R72）：横移走横向通道（`V_LATERAL_MPS` / `DEAD_LATERAL_MS`），
+    其余走纵向通道（`V_STEADY_MPS` / `DEAD_MS`）。直行是纯纵向、横移是纯横向，
+    两条通道各管一类，不多不少。
+
+    ⚠ **斜行留在纵向模型**（保守）：斜行的横向真值还没测（它可能接近纵向、也可能
+    接近横向），而这两种情形要的起点**方向相反** —— 低估横向行程会让真机跑出场地
+    （起点按低估对中，真机多走的那一段直接顶到边界码上）。取大的那个：真机 45°
+    全速时刚好对中；真机横向若其实很弱，只是对中不良，仍落在场内。
+    """
     if exp.action == "rotate_in_place":
         return 0.0
+    if exp.action == "strafe":
+        return max(0.0, V_LATERAL_MPS * (exp.duration_s * 1000.0 - DEAD_LATERAL_MS))
     return max(0.0, V_STEADY_MPS * (exp.duration_s * 1000.0 - DEAD_MS))
 
 
@@ -265,8 +321,10 @@ def assert_within_field(exp, start_xy=(0.0, 0.0)) -> None:
     - 显式 `start_xy` 时，车体半包络在起点与终点都必须落在
       `±252.5 × ±125.9` 内（旋转类只查起点）。
 
-    位移/转角一律取**期望值**（`expected_delta_mm` / `expected_yaw_deg`，真实会走多少），
-    不是命令量 `v·T`：命令量在 MIN_DUTY 以下是惰性的（R68，见模块 docstring）。
+    位移/转角一律不用命令量 `v·T`（命令量在 MIN_DUTY 以下是惰性的，R68，见模块
+    docstring）：**动作上限**取 `target_travel_mm`（规定走多少）、**几何**取
+    `expected_delta_mm`（真机会走到哪，按通道；横移差 2.4 倍，R72），转角取
+    `expected_yaw_deg`。
 
     ⚠ 位移还要从**车体系**转到**场地系**（`field_delta_mm`，R69）：`(vx, vy)` 是车体系
     速度，车左（`vy>0`）在场地系里是 −Y。包络的**数值**两侧对称（不改变通过/不通过），
@@ -275,10 +333,13 @@ def assert_within_field(exp, start_xy=(0.0, 0.0)) -> None:
     _require(exp.duration_s > 0,
              f"实验 #{exp.id}（{exp.desc}）：duration_s={exp.duration_s} 必须为正。")
 
-    dx_mm, dy_mm = field_delta_mm(exp)
+    # 上限查"**规定**走多少"（时长按纵向模型反解回去，R68）；几何查"车**真**会走到哪"
+    # （按通道，R72）—— 横移这两者差 2.4 倍，混用会让上限形同虚设或让起点对错位。
+    tx_mm, ty_mm = _target_delta_mm(exp)
     dpsi_deg = expected_yaw_deg(exp)
-    _check_motion_caps(exp, dx_mm, dy_mm, dpsi_deg)
+    _check_motion_caps(exp, tx_mm, ty_mm, dpsi_deg)
 
+    dx_mm, dy_mm = field_delta_mm(exp)
     x0, y0 = float(start_xy[0]), float(start_xy[1])
     if (x0, y0) == (0.0, 0.0):
         # 名义中心：全场可行性（偏心起点下一定放得下）

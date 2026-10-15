@@ -147,7 +147,9 @@ def test_plan_start_puts_the_sweep_midpoint_at_the_field_origin():
     assert RA.plan_start_xy(by_id[4]) == pytest.approx((75.0, 0.0), abs=tol)
     # ⚠ 横移/斜行的 y 分量按**场地系**取中点（车左 = 场地 −Y，R69；见下一条测试）
     assert abs(RA.plan_start_xy(by_id[5])[0]) <= tol
-    assert abs(RA.plan_start_xy(by_id[5])[1]) == pytest.approx(39.76, abs=tol)  # 左移 80
+    # R72：横移的期望行程按**横向通道**（0.223 m/s / 138 ms）算 ⇒ 285 ms 走 32.78 mm，
+    # 起点对中在 16.39 mm，不再是纵向模型的 39.76 mm。
+    assert abs(RA.plan_start_xy(by_id[5])[1]) == pytest.approx(16.39, abs=tol)  # 左移 80
     assert RA.plan_start_xy(by_id[6])[1] == pytest.approx(-RA.plan_start_xy(by_id[5])[1], abs=tol)
     e9 = by_id[9]                                                       # 斜行 120（45°）
     fdx9, fdy9 = body_delta_to_field(*matrix.expected_delta_mm(e9),
@@ -255,14 +257,15 @@ def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, build
         return tuple(ev)
 
     assert [(round(x), round(y)) for x, y in h.drive_targets] == [
-        (-100, 0), (-100, 0), (0, 40)]                     # 横移左移：车往 −Y 走
+        (-100, 0), (-100, 0), (0, 16)]                     # 横移左移：车往 −Y 走
+        # R72：横移的期望行程按横向通道 ⇒ 起点对中在 16.39（原 39.76，纵向模型）
     assert h.trial_ids == [1, 1, 5]
     assert [_near(e) for e in events] == [                # 计划要求的每条顺序
         ("drive_to", (-100, 0)), ("align_yaw", 0.0), ("run_trial", 1), ("write", 1),
         ("stop",),
         ("drive_to", (-100, 0)), ("align_yaw", 0.0), ("run_trial", 1), ("write", 1),
         ("stop",),
-        ("drive_to", (0, 40)), ("align_yaw", 0.0), ("run_trial", 5), ("write", 5),
+        ("drive_to", (0, 16)), ("align_yaw", 0.0), ("run_trial", 5), ("write", 5),
         ("stop",),
     ]
     assert h.car_link.stops == 3                          # 每条结束 car.stop()
@@ -383,6 +386,43 @@ def test_cli_yaw_tol_is_parsed(xlsx):
     assert h.yaw_calls == [(0.0, 8.0)] * 3
 
 
+def test_homing_failure_row_carries_the_iteration_trace(tmp_path, builder, xlsx):
+    """R72：归位失败行必须带 trace（每轮误差 + 实际脉冲宽度），表里就能分诊。
+
+    没有它，`homing_max_iter` 只剩四个字母：分不清"模型步长高估 3 倍"、"12 次空
+    脉冲（落进起步死区）"、"本来就差 26.8 mm" 三种完全不同的故障。
+    """
+    exp1 = _probe(1)
+    h = FakeHarness(home_results=[{
+        "reached": False, "reason": "max_iter", "iters": 3, "start_dist_mm": 204.0,
+        "trace": [{"dist_mm": 204.0, "cmd": (0, 0, 240)},
+                  {"dist_mm": 150.0, "cmd": (0, 0, 240)},
+                  {"dist_mm": 96.0, "cmd": (0, 0, 120)}]}])
+
+    RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                 printer=lambda _s: None, archive=False)
+
+    row = _summary_rows(openpyxl.load_workbook(xlsx)["data"])[0]
+    notes = str(row["notes"])
+    assert row["trial_reason"] == "homing_max_iter"
+    assert "homing_trace" in notes
+    assert "d=204,150,96" in notes and "ms=240,240,120" in notes
+    assert "start_dist=204.0" in notes and "iters=3" in notes
+    assert row["vision_dist_mm"] is None and row["odo_dist_mm"] is None
+
+
+def test_homing_stuck_gets_its_own_reason_in_the_table(tmp_path, builder, xlsx):
+    """R72/B：`homing_stuck` 与 `homing_max_iter` 在表里必须能分开数。"""
+    exp1 = _probe(1)
+    h = FakeHarness(home_results=[{"reached": False, "reason": "homing_stuck",
+                                   "iters": 4, "start_dist_mm": 60.0, "trace": []}])
+    stats = RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                         printer=lambda _s: None, archive=False)
+    row = _summary_rows(openpyxl.load_workbook(xlsx)["data"])[0]
+    assert stats["n_failed"] == 1 and stats["n_homing_failed"] == 1
+    assert row["trial_reason"] == "homing_stuck"
+
+
 # ------------------------------------------- 归位脉冲宽度（真机：400 ms 必振荡）
 
 def test_batch_passes_the_homing_pulse_width_through_to_drive_to(tmp_path, builder, xlsx):
@@ -398,7 +438,8 @@ def test_batch_passes_the_homing_pulse_width_through_to_drive_to(tmp_path, build
     RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx, pulse_ms=150,
                  printer=lambda _s: None, archive=False)
 
-    assert h.drive_kwargs == [{"pulse_ms": 150.0, "coarse_pulse_ms": None}] * 2
+    assert h.drive_kwargs == [{"pulse_ms": 150.0, "coarse_pulse_ms": None,
+                             "tol_mm": 12.0, "max_iter": 12}] * 2
 
 
 def test_batch_passes_the_coarse_pulse_through_to_drive_to(tmp_path, builder, xlsx):
@@ -408,7 +449,8 @@ def test_batch_passes_the_coarse_pulse_through_to_drive_to(tmp_path, builder, xl
 
     RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx, pulse_ms=130,
                  coarse_pulse_ms=240, printer=lambda _s: None, archive=False)
-    assert h.drive_kwargs == [{"pulse_ms": 130.0, "coarse_pulse_ms": 240.0}]
+    assert h.drive_kwargs[0]["coarse_pulse_ms"] == 240.0
+    assert h.drive_kwargs[0]["pulse_ms"] == 130.0
 
     h2 = FakeHarness(trial_results=[_ok_trial(200.0)])
     RA.run_batch(h2, experiments=[exp1], xlsx_path=xlsx, printer=lambda _s: None,
@@ -425,10 +467,18 @@ def test_cli_coarse_ms_is_optional_and_parsed(xlsx):
     def factory():
         yield h
 
-    rc = RA.main(["--only", "1", "--pulse-ms", "130", "--coarse-ms", "240"],
+    rc = RA.main(["--only", "1", "--pulse-ms", "130", "--coarse-ms", "240",
+                  "--tol-mm", "6", "--max-iter", "24"],
                  session_factory=factory, printer=lambda _s: None, xlsx_path=xlsx)
     assert rc == 0
-    assert h.drive_kwargs == [{"pulse_ms": 130.0, "coarse_pulse_ms": 240.0}] * 3
+    assert [d["coarse_pulse_ms"] for d in h.drive_kwargs] == [240.0] * 3
+    assert [d["pulse_ms"] for d in h.drive_kwargs] == [130.0] * 3
+    assert [d["tol_mm"] for d in h.drive_kwargs] == [6.0] * 3
+    assert [d["max_iter"] for d in h.drive_kwargs] == [24] * 3
+    assert RA.parse_args(["--tol-mm", "6"]).tol_mm == 6.0
+    assert RA.parse_args(["--max-iter", "24"]).max_iter == 24
+    with pytest.raises(SystemExit):
+        RA.parse_args(["--max-iter", "abc"])
 
 
 def test_batch_default_pulse_matches_the_harness_default(tmp_path, builder, xlsx):
@@ -456,7 +506,8 @@ def test_cli_pulse_ms_is_optional_and_parsed(xlsx):
                  printer=lambda _s: None, xlsx_path=xlsx)
 
     assert rc == 0
-    assert h.drive_kwargs == [{"pulse_ms": 150.0, "coarse_pulse_ms": None}] * 3
+    assert h.drive_kwargs == [{"pulse_ms": 150.0, "coarse_pulse_ms": None,
+                             "tol_mm": 12.0, "max_iter": 12}] * 3
     with pytest.raises(SystemExit):
         RA.parse_args(["--pulse-ms", "abc"])
 

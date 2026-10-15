@@ -58,8 +58,10 @@ import sys
 from pathlib import Path
 
 from vgt import compare, matrix
-from vgt.harness import (DEFAULT_PULSE_MS, DEFAULT_YAW_TOL_DEG,
-                         REASON_ALREADY_AT_TARGET, body_delta_to_field)
+from vgt.harness import (DEFAULT_MAX_ITER, DEFAULT_PULSE_MS, DEFAULT_TOL_MM,
+                         DEFAULT_YAW_TOL_DEG,
+                         REASON_ALREADY_AT_TARGET, body_delta_to_field,
+                         compress_trace as harness_compress_trace)
 
 # 规划起点假定的车头朝向（度）：`matrix` 的几何前提是"归位后车头已对齐"（R15），
 # 场地系 +X 就是车头方向。用 `body_delta_to_field` 转，不自己再推一遍符号。
@@ -154,13 +156,36 @@ def iterate_trials(experiments=matrix.EXPERIMENTS, only=None):
             yield exp, rep
 
 
-def _homing_failed_trial(reason: str) -> dict:
-    """归位失败时合成的"没跑过"的 trial 结果（形状与 `run_trial` 一致，全空）。"""
+def _homing_reason_label(reason: str | None) -> str:
+    """归位失败的 `trial_reason` = `homing_<reason>`，但**不重复前缀**。
+
+    `harness.REASON_STUCK` 本身就叫 `homing_stuck`（已经是"归位类"名字），直接拼
+    会变成 `homing_homing_stuck`（R72 复核抓到的那个）。
+    """
+    r = str(reason or "unknown")
+    return r if r.startswith("homing_") else f"homing_{r}"
+
+
+def _homing_failed_trial(reason: str, home: dict | None = None) -> dict:
+    """归位失败时合成的"没跑过"的 trial 结果（形状与 `run_trial` 一致，全空）。
+
+    R72：把 `drive_to` 的迭代 trace（每轮误差距离 + 实际脉冲宽度）压进 `warnings`
+    —— 一条 `homing_max_iter` 只有四个字母时，事后分诊只能靠猜：到底是"模型说步长
+    60 mm、实测 15 mm"（模型错）、"12 次空脉冲"（`homing_stuck`，落进起步死区）、
+    还是"起点就在容差内"（R67 的零脉冲）。现在这些都在表里能查。
+    """
+    trace_txt = ""
+    if home:
+        trace_txt = harness_compress_trace(home.get("trace"))
     return {
         "ok": False, "reason": reason,
         "vision": {"start": None, "mid": None, "end": None},
         "vision_delta": None, "odometry_delta": None,
-        "samples": [], "warnings": [],
+        "samples": [],
+        "warnings": [f"{reason}（start_dist="
+                     f"{home.get('start_dist_mm') if home else None} mm, "
+                     f"iters={home.get('iters') if home else '?'}"
+                     + (f", {trace_txt}" if trace_txt else "") + "）"],
     }
 
 
@@ -222,7 +247,8 @@ def _yaw_gate(harness, exp, stats, yaw_tol_deg):
 def run_batch(harness, *, experiments, only=None, xlsx_path,
               printer=print, write=compare.write_trial, archive=True,
               pulse_ms=DEFAULT_PULSE_MS, coarse_pulse_ms=None,
-              yaw_tol_deg=DEFAULT_YAW_TOL_DEG) -> dict:
+              yaw_tol_deg=DEFAULT_YAW_TOL_DEG, tol_mm=DEFAULT_TOL_MM,
+              max_iter=DEFAULT_MAX_ITER) -> dict:
     """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
 
     返回统计：`n_trials / n_ok / n_failed / n_homing_failed / n_homing_zero_pulse /
@@ -258,11 +284,13 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
         homing_note = ""
         try:
             home = harness.drive_to(start_xy[0], start_xy[1], pulse_ms=float(pulse_ms),
-                                    coarse_pulse_ms=coarse_pulse_ms)
+                                    coarse_pulse_ms=coarse_pulse_ms,
+                                    tol_mm=float(tol_mm), max_iter=int(max_iter))
             kind, homing_reason = classify_homing(home)
             if kind == "failed":
                 stats["n_homing_failed"] += 1
-                trial = _homing_failed_trial(f"homing_{homing_reason or 'unknown'}")
+                trial = _homing_failed_trial(
+                    _homing_reason_label(homing_reason), home)
             else:
                 if kind == "zero_pulse":
                     # R67：车在位但归位没动过 —— 照跑实验，但绝不当成功，且留痕。
@@ -359,6 +387,13 @@ def parse_args(argv=None):
     parser.add_argument("--coarse-ms", type=float, default=None, metavar="MS",
                         help="R70 两段式步长的粗脉冲（误差大时用）；不给 = 单段。"
                              "真机全量建议 240（步长 ~60 mm，粗段过冲上限 15 mm）")
+    parser.add_argument("--tol-mm", type=float, default=DEFAULT_TOL_MM, metavar="MM",
+                        help="归位容差 mm（默认 12 = harness 默认）。R72：#01/#02 的"
+                             "场地余量只有 17.5 mm，12 mm 容差 + 8 mm 超跑就顶穿"
+                             "（实测终点 x=+117.31 vs 上限 117.5）⇒ 全量建议 6")
+    parser.add_argument("--max-iter", type=int, default=DEFAULT_MAX_ITER, metavar="N",
+                        help=f"归位脉冲上限（默认 {DEFAULT_MAX_ITER} = harness 默认）；"
+                             "R72/E：远起点 + 横移腿需要 ~20 次")
     parser.add_argument("--yaw-tol-deg", type=float, default=DEFAULT_YAW_TOL_DEG,
                         metavar="DEG",
                         help="R71 每条平移实验前的车头容差（默认 8°=固件单步地板 "
@@ -388,12 +423,14 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
             f"{'，--only ' + str(args.only) if args.only is not None else ''}"
             f"，归位脉冲 {args.pulse_ms:g} ms"
             f"{' / 粗 ' + format(args.coarse_ms, 'g') + ' ms' if args.coarse_ms else ''}"
-            f"，车头容差 {args.yaw_tol_deg:g}°）→ {xlsx} ===")
+            f"，车头容差 {args.yaw_tol_deg:g}°，归位容差 {args.tol_mm:g} mm/"
+            f"{args.max_iter} 次）→ {xlsx} ===")
     with factory() as harness:
         stats = run_batch(harness, experiments=matrix.EXPERIMENTS, only=args.only,
                           xlsx_path=xlsx, printer=printer, pulse_ms=args.pulse_ms,
                           coarse_pulse_ms=args.coarse_ms,
-                          yaw_tol_deg=args.yaw_tol_deg)
+                          yaw_tol_deg=args.yaw_tol_deg, tol_mm=args.tol_mm,
+                          max_iter=args.max_iter)
     if stats["archive_path"]:
         printer(f"已归档：{stats['archive_path']}")
     printer(f"完成：{stats['n_ok']}/{stats['n_trials']} 通过；{stats['n_failed']} 条失败"

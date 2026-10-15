@@ -652,36 +652,45 @@ def test_drive_to_fails_fast_when_the_start_is_out_of_reach(monkeypatch):
 
 
 def test_drive_to_two_stage_pulse_far_is_coarse_then_fine(monkeypatch):
-    """两段式：远用粗脉冲、近用细脉冲；粗步 overshoot 之后必须切回细脉冲。"""
+    """两段式：远用粗脉冲（长）、近用细脉冲（短），且**单步被钉在 err−tol/2**。
+
+    R72/A：宽��是**反解**出来的（`pulse_ms_for_step_mm`），不再是固定两档；粗档上限
+    由 `coarse_pulse_ms` 给。远 120 mm ⇒ 想要 45 mm（上限）⇒ 210 ms；近 30 mm ⇒ 想要
+    27 mm ⇒ 168 ms。
+    """
     h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
                                     "RUN": [_run_chunks()] * 20})
-    # 起点 120 mm；粗脉冲（240 ms，步长 ~60 mm）打 2 下 → 误差 120→60→30 → 切细
     positions = [(120.0, 0.0, 0.0), (60.0, 0.0, 0.0), (30.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
     h.locate = lambda: positions.pop(0)
 
-    res = h.drive_to(0.0, 0.0, pulse_ms=130, coarse_pulse_ms=240,
-                     coarse_switch_mm=45.0, settle_s=0.0)
+    res = h.drive_to(0.0, 0.0, pulse_ms=120, coarse_pulse_ms=320,
+                     coarse_switch_mm=70.0, settle_s=0.0)
 
     assert res["reached"] is True and res["reason"] == "converged"
-    assert res["iters"] == 3
-    runs = [s for s in sock.sent if s.startswith("RUN")]
-    assert runs == ["RUN -0.1200 0.0000 0 240\n",      # 误差 120 > 45 ⇒ 粗
-                    "RUN -0.0600 0.0000 0 240\n",      # 误差  60 > 45 ⇒ 粗
-                    "RUN -0.0300 0.0000 0 130\n"]      # 误差  30 ≤ 45 ⇒ 细
-    # 粗段的过冲上限 = 粗步长 − switch（60 − 45 = 15 mm），细步长 7.4 < tol 12 ⇒ 必收敛
+    widths = [t["cmd"][2] for t in res["trace"]]
+    assert widths == sorted(widths, reverse=True), f"远处应当比近处用更长的脉冲：{widths}"
+    assert widths[0] > widths[-1]
+    for t in res["trace"]:
+        # 单步不超过"误差 − tol/2" ⇒ 数学上不可能甩过目标点
+        want = max(6.0, t["dist_mm"] - 3.0)
+        cap = H.pulse_ms_for_step_mm(want, straight_fraction=1.0, lo_ms=120, hi_ms=320)
+        assert t["cmd"][2] <= cap, f"第 {t['iter']} 步要多了：{t['cmd'][2]} > {cap}"
 
 
 def test_drive_to_without_coarse_keeps_the_single_stage_behaviour(monkeypatch):
-    """默认（不传 `coarse_pulse_ms`）= 每次都用 `pulse_ms`，一个字都不改。"""
+    """不传 `coarse_pulse_ms` = 单段：细脉冲、步长 ≤ `tol`，不甩过目标点。"""
     h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
                                     "RUN": [_run_chunks()] * 20})
     positions = [(80.0, 0.0, 0.0), (50.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
     h.locate = lambda: positions.pop(0)
 
-    res = h.drive_to(0.0, 0.0, pulse_ms=130, settle_s=0.0)
+    res = h.drive_to(0.0, 0.0, pulse_ms=120, settle_s=0.0)
     runs = [s for s in sock.sent if s.startswith("RUN")]
     assert res["reached"] is True and res["iters"] == 2
-    assert runs == ["RUN -0.0800 0.0000 0 130\n", "RUN -0.0500 0.0000 0 130\n"]
+    for t in res["trace"]:
+        assert t["cmd"][2] <= H.pulse_ms_for_step_mm(12.0, straight_fraction=1.0,
+                                                      lo_ms=120, hi_ms=500)
+    assert len(runs) == 2
 
 
 def test_single_stage_130ms_cannot_reach_the_sweep_start_distance(monkeypatch):
@@ -713,6 +722,106 @@ def test_drive_to_validates_the_two_stage_arguments():
     with pytest.raises(ValueError):
         h.drive_to(0.0, 0.0, coarse_pulse_ms=0.4, coarse_switch_mm=45.0)
     assert sock.sent == []                      # 参数非法：连开场 STOP 都不发
+
+
+def test_drive_to_adapts_the_pulse_width_to_the_measured_rate(monkeypatch):
+    """R72/A：模型步长只当**先验**，两轮内被自己的实测取代。
+
+    真机症状：模型说 240 ms 粗脉冲走 55~60 mm，闭环里实测只有 ~15 mm/脉冲 ⇒ 12 次
+    烧完还差 26.8 mm。这里脚本化"模型高估 3 倍"的情形：第一步按模型取宽度，第二步
+    必须按实测速率把宽度拉长。
+    """
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20})
+    # 第一轮按模型要 45 mm（⇒ 210 ms），实测只走了 15 mm；剩下 105 mm
+    positions = [(120.0, 0.0, 0.0), (105.0, 0.0, 0.0), (30.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
+    h.locate = lambda: positions.pop(0)
+
+    res = h.drive_to(0.0, 0.0, pulse_ms=120, coarse_pulse_ms=500, settle_s=0.0)
+
+    assert res["reached"] is True
+    widths = [t["cmd"][2] for t in res["trace"]]
+    assert res["trace"][0]["gained_mm"] == pytest.approx(15.0, abs=0.5)
+    assert widths[1] > widths[0], f"实测比模型慢，后一步必须更长：{widths}"
+
+
+def test_drive_to_flags_a_stuck_car_with_its_own_reason(monkeypatch):
+    """R72/B：连续 3 次脉冲实测位移 < 2 mm ⇒ `homing_stuck`（不是 `max_iter`）。
+
+    真机症状（#01 rep3）：12 次脉冲车几乎没动 —— 那是"推不动"（落进起步死区/打滑），
+    不是"迭代不够"。两种失败的处置完全不同，必须有名有姓。
+    """
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20}, locate_tries=1)
+    h.locate = lambda: (60.0, 0.0, 0.0)          # 原地不动
+    res = h.drive_to(0.0, 0.0, pulse_ms=120, coarse_pulse_ms=400, settle_s=0.0)
+
+    assert res["reached"] is False and res["reason"] == H.REASON_STUCK
+    assert res["reason"] in H.DRIVE_REASONS
+    assert res["iters"] <= 5                     # 不是烧满 max_iter
+    widths = [t["cmd"][2] for t in res["trace"]]
+    assert widths == sorted(widths), f"推不动就该把脉冲加长：{widths}"
+
+
+def test_drive_to_trace_records_the_measured_step_and_rate(monkeypatch):
+    """R72：trace 里要有"这一轮实测走了多少"和更新后的速率（分诊的依据）。"""
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20})
+    positions = [(90.0, 0.0, 0.0), (60.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
+    h.locate = lambda: positions.pop(0)
+    res = h.drive_to(0.0, 0.0, pulse_ms=120, settle_s=0.0)
+    assert res["trace"][0]["gained_mm"] == pytest.approx(30.0, abs=0.5)
+    assert res["trace"][0]["rate_mm_per_ms"] == pytest.approx(
+        30.0 / res["trace"][0]["cmd"][2], rel=1e-4)
+
+
+def test_compress_trace_is_readable_and_short():
+    """R72：失败行要能从表里看出"每轮误差 + 实际脉冲宽度"。"""
+    trace = [{"dist_mm": 204.0, "cmd": (0, 0, 240)},
+             {"dist_mm": 150.3, "cmd": (0, 0, 240)},
+             {"dist_mm": 96.1, "cmd": (0, 0, 120)}]
+    txt = H.compress_trace(trace)
+    assert txt == "homing_trace: d=204,150,96 | ms=240,240,120"
+    assert H.compress_trace([]) == ""
+    long = [{"dist_mm": 100.0, "cmd": (0, 0, 120)}] * 40
+    assert "共 40 步" in H.compress_trace(long, limit=5)
+
+
+def test_homing_reach_accounts_for_the_command_direction():
+    """R72：横移腿的单步只有直行的 40%（实测 0.21 vs 0.56 m/s），可达集必须分方向。"""
+    assert H.homing_reach_mm(120, max_iter=12, straight_fraction=1.0) == pytest.approx(
+        12 + 12 * 7.4, rel=0.05)
+    assert H.homing_reach_mm(120, max_iter=12, straight_fraction=0.0) == pytest.approx(
+        12 + 12 * 7.4 * 0.40, rel=0.05)
+    assert H.homing_reach_mm(120, max_iter=12, straight_fraction=0.0) < \
+        H.homing_reach_mm(120, max_iter=12, straight_fraction=1.0)
+    assert H.straight_fraction_of(100.0, 0.0) == 1.0
+    assert H.straight_fraction_of(0.0, 100.0) == pytest.approx(0.0)
+    assert H.straight_fraction_of(50.0, 50.0) == pytest.approx(0.5)
+
+
+def test_pulse_ms_for_step_mm_inverts_the_model():
+    """反解器与正模型必须互逆；**但地板之上互逆、地板之下是物理下限**。
+
+    `want=3 mm` + 直行方向：固件 `kick=150ms/105` 让任何脉冲的位移都 ≥ 7.4 mm，
+    所以反解给出最小脉冲、正模型回 7.4 mm —— 这不是 bug，是"这个方向上最小能走
+    7.4 mm"。地板之上的取值必须精确互逆，否则调度器会朝错的方向加/减脉冲。
+    """
+    for frac in (0.0, 0.35, 1.0):
+        for step in (12.0, 25.0, 45.0):
+            ms = H.pulse_ms_for_step_mm(step, straight_fraction=frac, lo_ms=120, hi_ms=500)
+            got = H.expected_step_mm(ms, straight_fraction=frac)
+            assert got == pytest.approx(step, rel=0.15), (frac, step, ms, got)
+        # 地板之下：请求被夹到该方向的物理下限，不会更小
+        small = 3.0
+        ms = H.pulse_ms_for_step_mm(small, straight_fraction=frac, lo_ms=120, hi_ms=500)
+        got = H.expected_step_mm(ms, straight_fraction=frac)
+        floor = H.STEP_KICK_FLOOR_MM * (H.STRAFE_STEP_FACTOR
+                                        + (1 - H.STRAFE_STEP_FACTOR) * frac)
+        assert min(small, floor) - 1e-9 <= got <= max(small, floor) + 1e-9, (
+            frac, small, ms, got, floor)
+    assert H.pulse_ms_for_step_mm(0.0, lo_ms=150, hi_ms=400) == 150     # 夹到下限
+    assert H.pulse_ms_for_step_mm(999.0, lo_ms=150, hi_ms=400) == 400   # 夹到上限
 
 
 def test_locate_retries_wait_long_enough_for_the_camera(monkeypatch):

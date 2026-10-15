@@ -104,7 +104,9 @@ def test_matrix_covers_the_mandated_manoeuvres():
                       if e.action == "straight")
     assert straight == [-200, -150, 150, 200]
 
-    strafe = sorted(round(_dy_mm(e)) for e in matrix.EXPERIMENTS
+    # R72：横移覆盖按**规定的目标步长**（时长照 80/50 反解出来的那个数）—— 真机横向
+    # 通道只走得到四成左右，`_dy_mm`（期望到达）现在是 ≈33/21，别拿它比对 mandate。
+    strafe = sorted(round(e.vy * 1000.0) for e in matrix.EXPERIMENTS
                     if e.action == "strafe")
     assert strafe == [-80, -50, 50, 80]
 
@@ -136,6 +138,10 @@ def test_durations_are_the_measured_speed_model_inverted():
     for e in matrix.EXPERIMENTS:
         if e.action == "rotate_in_place":
             want = matrix.ms_for_deg(round(abs(_dpsi_deg(e))))
+        elif e.action == "strafe":
+            # R72：时长锁的是**目标步长**（命令 80/50 mm）反解出来的那个数 —— 真机横向
+            # 通道弱（285 ms 只走 ≈31.6 mm），但时长是实验项目，不许跟着期望行程改。
+            want = matrix.ms_for_mm(round(abs(e.vy) * 1000.0))
         else:
             want = matrix.ms_for_mm(round(math.hypot(_dx_mm(e), _dy_mm(e))))
         assert e.duration_s * 1000.0 == pytest.approx(want, abs=1e-6)
@@ -209,17 +215,42 @@ def test_reference_start_uses_the_car_half_envelope_at_both_ends():
 
 
 def test_mandated_strafe_is_reachable_from_a_real_start():
-    """R15 的理由句：横移 80 从正中心放不下（净余量 51.4），但偏心起点可以。
+    """横移必须从偏心起点起跑：真实起点 `y0` 与真机会走的那一段（R72：32.78 mm）两端都要在场。
 
-    ⚠ 起点要取**车会走的那一侧的对面**（R69：`vy>0` = 车左 = 场地 −Y）：横移左移
-    80 mm 从 `y = +40` 出发往 −Y 走到 `y = −40`，y 包络 ±114.5 < ±125.9。
+    ⚠ R69：起点要取**车会走的那一侧的对面**（`vy>0` = 车左 = 场地 −Y）——
+    横移左移从 `y = +16.39` 出发往 −Y 走到 `y ≈ −16.39`。
+
+    ⚠ R72：真实行程是**横向通道**的 32.78 mm（不是纵向模型的 79.5），越界阈值也跟着挪：
+    起点侧 `|y0| > 51.4` 越界、终点侧 `y0 − 32.78 < −51.4` 即 `y0 < −18.6` 越界。
     """
     e80 = _probe("strafe", 0.0, 0.080, 0.0)
-    matrix.assert_within_field(e80, start_xy=(0.0, 40.0))      # y 包络 ±114.5 < ±125.9
+    assert matrix.expected_travel_mm(e80) == pytest.approx(32.78, abs=0.01)
+    assert matrix.target_travel_mm(e80) == pytest.approx(79.5, abs=0.1)   # 规定 80 mm
+    matrix.assert_within_field(e80, start_xy=(0.0, 16.39))     # 规划起点：两端都进
+    matrix.assert_within_field(e80, start_xy=(0.0, 40.0))      # 再偏一点也还行
     with pytest.raises(ValueError):
-        matrix.assert_within_field(e80, start_xy=(0.0, 20.0))  # 终点 y 包络 134.0 越界
+        matrix.assert_within_field(e80, start_xy=(0.0, -20.0))  # 终点 y 包络 127.3 越界
     with pytest.raises(ValueError):
         matrix.assert_within_field(e80, start_xy=(0.0, 60.0))  # 起点 y 包络越界
+
+
+def test_the_two_channel_models_are_not_interchangeable():
+    """R72：横移走**横向通道**（0.223 m/s / 138 ms），直行/斜行走纵向（0.56 / 143）。
+
+    四个真机横移点 (187, 11.7) (285, 31.6) (285, 28.2) (300, 41.1) 的最小二乘。
+    这条锁住"按通道取模型"，也顺手锁住斜行**故意留在纵向模型**（保守，见
+    `expected_travel_mm` 的 docstring）—— 谁把斜行改成横向模型，这里当场红。
+    """
+    by_id = {e.id: e for e in matrix.EXPERIMENTS}
+    assert matrix.expected_travel_mm(by_id[5]) == pytest.approx(32.78, abs=0.01)  # 285 ms 横移
+    assert matrix.expected_travel_mm(by_id[7]) == pytest.approx(20.96, abs=0.01)  # 232 ms 横移
+    assert matrix.expected_delta_mm(by_id[5]) == pytest.approx((0.0, 32.78), abs=0.01)
+    # 直行与斜行仍是纵向模型：500 ms → 199.92 mm；斜行 357 ms → 119.84（45° 两轴各 84.74）
+    assert matrix.expected_travel_mm(by_id[1]) == pytest.approx(199.92, abs=0.01)
+    assert matrix.expected_delta_mm(by_id[9])[0] == pytest.approx(84.74, abs=0.01)
+    assert matrix.expected_delta_mm(by_id[9])[1] == pytest.approx(84.74, abs=0.01)
+    # 横向通道比纵向慢：同样 285 ms，横向 32.78 vs 纵向 79.52（2.43 倍）
+    assert matrix.V_LATERAL_MPS < matrix.V_STEADY_MPS
 
 
 def test_mandated_diagonal_is_reachable_from_a_real_start():

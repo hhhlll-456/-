@@ -288,6 +288,9 @@ TRIAL_REASONS = (
 # `already_at_target`，它**不是**成功，只是"车本来就在位、这次什么也没做"。
 REASON_ALREADY_AT_TARGET = "already_at_target"
 REASON_TOO_FAR = "homing_too_far"
+# R72/B：连续几次脉冲实测位移 < `STUCK_STEP_MM`（推不动：起步死区/打滑）——
+# 不是"迭代不够"，所以不能混进 `max_iter`。
+REASON_STUCK = "homing_stuck"
 DRIVE_REASONS = (
     "converged",
     REASON_ALREADY_AT_TARGET,
@@ -295,6 +298,7 @@ DRIVE_REASONS = (
     "locate_failed",
     "run_rejected",
     REASON_TOO_FAR,
+    REASON_STUCK,
 )
 
 # ---- 归位步长模型（R70）------------------------------------------------------------
@@ -318,6 +322,21 @@ DRIVE_REASONS = (
 STEP_SLOPE_MM_PER_MS = 0.5
 STEP_DEAD_MS = 120.0
 STEP_KICK_FLOOR_MM = 7.4
+# ⚠ **步长还取决于指令方向**（R72，真机实测）：横移腿 187 ms→11.7 mm、285 ms→31.6 mm
+# ⇒ 横移 ~0.21 m/s，而直行 ~0.56 m/s（固件同一个 duty 110，是麦轮几何决定的净速度差）。
+# 纯横移的单步只有直行的 **40%**，而矩阵的横移/斜行腿**本来就是横向的** —— 用直行
+# 步长估可达距离会高估 ~2.5 倍，于是 204 mm 的横向归位被"可达"放行、实际烧满
+# `max_iter` 仍差几十毫米（#01 rep2/rep3 实测 `homing_max_iter`）。
+STRAFE_STEP_FACTOR = 0.40
+# 归位脉冲的档位边界与单步上限（R72/A 的调度器用）：细脉冲下限 = 固件 kick 量级
+# （更短转不动），单步上限把"甩过目标点"的可能性按几何压掉。
+STEP_MIN_PULSE_MS = 120.0
+STEP_MAX_PULSE_MS = 500.0
+MAX_HOMING_STEP_MM = 45.0
+# 实测单步 < 这个值就算"这一下没推动车"（连续 3 次 ⇒ `homing_stuck`）。
+STUCK_STEP_MM = 2.0
+STUCK_MAX_STEPS = 3
+STUCK_ESCALATION = 1.5
 # 误差大于它就换粗脉冲。**粗段过冲 = 粗步长 − switch**，所以 switch 必须 ≥ 粗步长，
 # 否则最后一条粗脉冲会把车甩过目标点。真机实测粗步长 55.7 mm（260 ms）/ 模型 60，
 # 取 70 ⇒ 过冲 ≤ ~14 mm；而矩阵最远的目标 |x| = 100 mm，车体半长 135 ⇒
@@ -474,25 +493,73 @@ def coasted_samples(samples, coast):
                 "rpy": [float(v) for v in coast_rpy], "synthetic": "coast"}])
 
 
-def expected_step_mm(pulse_ms) -> float:
-    """一条归位脉冲的真机位移 `pulse_ms` → mm（R70 模型，**永不高估**）。
+def expected_step_mm(pulse_ms, *, straight_fraction=1.0) -> float:
+    """一条归位脉冲的真机位移 `pulse_ms` → mm（R70/R72 模型，**永不高估**）。
 
-    `max(kick 地板 7.4, 0.5·(T−120))`；出处与逐点核对见常量区的注释。
+    `max(kick 地板 7.4, 0.5·(T−120)) × (0.40 + 0.60·straight_fraction)`：
+    - `straight_fraction` = 误差方向落在车头轴上的比例（`|ex|/(|ex|+|ey|)`）；
+      纯直行 = 1.0、纯横移 = 0（⇒ ×0.40，与实测 0.21/0.56 m/s 一致）。
+    - 混合方向另有"两轮落进 0.3 rad/s 死区"的额外折半，模型**不**额外扣（取保守的
+      乐观侧 ⇒ 可达距离可能略高估）；45° 混合实测净步长约为同距离轴对齐的一半。
     """
-    return max(STEP_KICK_FLOOR_MM,
+    frac = min(1.0, max(0.0, float(straight_fraction)))
+    base = max(STEP_KICK_FLOOR_MM,
                STEP_SLOPE_MM_PER_MS * (float(pulse_ms) - STEP_DEAD_MS))
+    return base * (STRAFE_STEP_FACTOR + (1.0 - STRAFE_STEP_FACTOR) * frac)
+
+
+def straight_fraction_of(ex_mm, ey_mm) -> float:
+    """误差方向里"车头轴"占的比例（`|ex|/(|ex|+|ey|)`）；零误差返回 1.0。"""
+    ax, ay = abs(float(ex_mm)), abs(float(ey_mm))
+    total = ax + ay
+    return 1.0 if total <= 0.0 else ax / total
+
+
+def compress_trace(trace, limit=24) -> str:
+    """把 `drive_to` 的迭代 trace 压成一行短文本（失败分诊用，R72）。
+
+    `d=204,150,96,42|ms=240,240,240,120` —— 每轮的**误差距离**与**实际脉冲宽度**。
+    没有它，一条 `homing_max_iter` 只剩四个字母，事后分诊只能靠猜：到底是"模型说
+    步长 60 mm、实测 15 mm"（模型错）、还是"12 次空脉冲"（落进起步死区）、还是
+    "本来就在容差内"（R67）—— 三者的处置完全不同。
+    """
+    if not trace:
+        return ""
+    dists = [f"{float(t.get('dist_mm', 0.0)):.0f}" for t in trace[:int(limit)]]
+    mss = [str(int(t.get("cmd", (0, 0, 0))[2])) for t in trace[:int(limit)]]
+    tail = "" if len(trace) <= int(limit) else f",…(共 {len(trace)} 步)"
+    return f"homing_trace: d={','.join(dists)}{tail} | ms={','.join(mss)}"
+
+
+def pulse_ms_for_step_mm(want_mm, *, straight_fraction=1.0,
+                         lo_ms=STEP_MIN_PULSE_MS, hi_ms=STEP_MAX_PULSE_MS) -> int:
+    """想走 `want_mm` 需要多长的脉冲（ms）——`expected_step_mm` 的反解（R72/A）。
+
+    步长模型只有 ±20% 的可信度，而**实测速率**（上一轮的位移 ÷ 时长）可以现场校准；
+    所以调度器用它反解脉冲宽度。`lo_ms`/`hi_ms` 是算子给的档位边界
+    （细脉冲 ~120 ms、算子给的粗脉冲上限）。
+    """
+    want = max(0.0, float(want_mm))
+    # 反解：step = (0.4+0.6·frac)·slope·(T−dead) ⇒ T = dead + step/斜率
+    scale = STRAFE_STEP_FACTOR + (1.0 - STRAFE_STEP_FACTOR) * float(straight_fraction)
+    slope = STEP_SLOPE_MM_PER_MS * max(0.15, scale)
+    ms = int(round(STEP_DEAD_MS + want / slope))
+    return int(min(float(hi_ms), max(float(lo_ms), ms)))
 
 
 def homing_reach_mm(pulse_ms, *, max_iter=DEFAULT_MAX_ITER, tol_mm=DEFAULT_TOL_MM,
-                    coarse_pulse_ms=None, coarse_switch_mm=COARSE_SWITCH_MM) -> float:
+                    coarse_pulse_ms=None, coarse_switch_mm=COARSE_SWITCH_MM,
+                    straight_fraction=1.0) -> float:
     """`max_iter` 次脉冲能把多大的初始误差归到位（mm）——R70 的"可达集"。
 
-    单步与误差无关 ⇒ 可达距离 = `tol + max_iter × 单步`。两段式（`coarse_pulse_ms`
-    给了）时每一步都按粗步长算，是可达集的**保守上界**。
+    单步与误差大小无关（R70）但**与方向有关**（R72）：`straight_fraction` 用来把
+    可达集算成该方向的量。两段式（`coarse_pulse_ms` 给了）时每一步都按粗步长算，
+    是可达集的**保守上界**。
     """
     if int(max_iter) < 1:
         raise ValueError(f"max_iter 至少 1，实际 {max_iter!r}")
-    step = expected_step_mm(coarse_pulse_ms if coarse_pulse_ms is not None else pulse_ms)
+    step = expected_step_mm(coarse_pulse_ms if coarse_pulse_ms is not None else pulse_ms,
+                            straight_fraction=straight_fraction)
     return float(tol_mm) + int(max_iter) * step
 
 
@@ -848,6 +915,11 @@ class Harness:
         start_dist_mm = None
         reason = "locate_failed"
         pos = self._locate_retry()
+        # R72/A：实测速率（mm/ms）。**第一轮没有实测值**，用模型当先验；每轮脉冲后
+        # 用"上一轮误差距离的减少量 ÷ 时长"更新 —— 步长模型的 ±20% 偏差因此在两三轮内
+        # 被自己的测量取代，而不是一路错到 `max_iter`。
+        rate_mm_per_ms = None
+        stuck_run = 0
         while pos is not None:
             final = pos
             ex, ey = x_t - pos[0], y_t - pos[1]
@@ -860,23 +932,52 @@ class Harness:
                 # "真归位成功" 与 "起点本来就在目标点、这次什么也没做"。
                 reason = "converged" if iters > 0 else REASON_ALREADY_AT_TARGET
                 break
-            if iters == 0 and coarse_ms is None:
-                # R70 起跑前先判"归位可不可能"：单步与误差无关 ⇒ `tol + max_iter×单步`
-                # 就是可达集。超了就当场失败并命名，一条 RUN 都不发（今天的车就是
-                # 被 12 次注定不收敛的脉冲顶到场地上、压住边码的）。
-                reach = homing_reach_mm(ms, max_iter=iter_cap, tol_mm=tol)
+            if iters == 0:
+                # R70/R72 起跑前先判"归位可不可能"：单步与误差**大小**无关、与**方向**
+                # 有关 ⇒ `tol + max_iter × 单步(方向)` 就是可达集。超了就当场失败并
+                # 命名，一条 RUN 都不发（今天的车就是被注定不收敛的脉冲一步步顶到场
+                # 地上、压住边码的）。
+                frac = straight_fraction_of(ex, ey)
+                reach = homing_reach_mm(ms, max_iter=iter_cap, tol_mm=tol,
+                                        coarse_pulse_ms=coarse_ms,
+                                        straight_fraction=frac)
                 if dist > reach:
                     reason = REASON_TOO_FAR
                     break
             if iters >= iter_cap:
                 reason = "max_iter"
                 break
+            if stuck_run >= STUCK_MAX_STEPS:
+                # R72/B：连续几次脉冲实测位移 < 2 mm —— 不是"迭代不够"，是**推不动**
+                # （落进起步死区 / 地面打滑 / 模型错）。给它自己的名字，分诊时能一眼
+                # 分开"死区"与"模型高估"。
+                reason = REASON_STUCK
+                break
 
-            # R70 两段式：远用粗脉冲（省迭代），近用细脉冲（步长 < 容差才收敛得了）。
-            # 粗段的过冲量 = 粗步长 − switch，switch=45 / 粗步 60 ⇒ 最坏 15 mm。
-            use_ms = ms
-            if coarse_ms is not None and dist > switch:
-                use_ms = coarse_ms
+            # R72/A：自适应脉冲宽度。上一步实测速率反解"要走多远要多少 ms"，并把单步
+            # 钉在 `err − tol/2` ⇒ **数学上不可能甩过目标点**，也就不可能有周期 2
+            # 极限环；粗/细两段式是这个公式的两个特例（远距离自然取到算子给的粗脉冲上限，
+            # 近距离自然落到细脉冲下限）。
+            frac = straight_fraction_of(ex, ey)
+            want = max(tol * 0.5, dist - tol * 0.5)
+            if coarse_ms is not None:
+                want = min(want, MAX_HOMING_STEP_MM)
+            else:
+                want = min(want, tol)                       # 单段：细脉冲，步长 ≤ 容差
+            hi = coarse_ms if coarse_ms is not None else int(STEP_MAX_PULSE_MS)
+            if rate_mm_per_ms is not None:
+                # 有实测速率就直接反解它（模型只当第一轮的先验）——真机上模型高估 3 倍
+                # 的那种情形，两轮之内就自己纠正过来了。
+                use_ms = int(min(hi, max(max(STEP_MIN_PULSE_MS, ms),
+                                        round(want / rate_mm_per_ms))))
+            else:
+                use_ms = pulse_ms_for_step_mm(
+                    want, straight_fraction=frac,
+                    lo_ms=max(STEP_MIN_PULSE_MS, ms),
+                    hi_ms=max(int(STEP_MAX_PULSE_MS), hi))
+            if stuck_run:
+                use_ms = int(min(STEP_MAX_PULSE_MS,
+                                 round(use_ms * STUCK_ESCALATION ** stuck_run)))
             vx, vy = body_command(ex, ey, pos[2], v_max=vmax)
             iters += 1
             run_line = "RUN {:.4f} {:.4f} 0 {}".format(vx, vy, use_ms)
@@ -897,9 +998,24 @@ class Harness:
             if outcome == "done":
                 trace.append(rec)
                 time.sleep(settle)
+                prev_dist = dist
                 pos = self._locate_retry()
                 if pos is None:
                     reason = "locate_failed"
+                    continue
+                # R72/A：用这一轮**实测**的位移更新速率（投影到误差方向的减少量）。
+                new_dist = math.hypot(x_t - pos[0], y_t - pos[1])
+                gained = prev_dist - new_dist
+                rec["gained_mm"] = round(gained, 1)
+                if gained >= STUCK_STEP_MM:
+                    measured = gained / float(use_ms)
+                    rate_mm_per_ms = (measured if rate_mm_per_ms is None
+                                      else 0.5 * rate_mm_per_ms + 0.5 * measured)
+                    rec["rate_mm_per_ms"] = round(rate_mm_per_ms, 6)
+                    stuck_run = 0
+                else:
+                    stuck_run += 1
+                    rec["stuck_run"] = stuck_run
                 continue
             if outcome == "error":
                 rec["errors"] = list(stats.get("errors", []))
