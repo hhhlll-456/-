@@ -6,3 +6,6 @@ __pycache__/
 .pio/
 .codegraph/
 .pytest_cache/
+
+# Task 12 复核脚本的派生整理集（由 build.py 现场生成）
+实验/t12_stats/dataset.json
