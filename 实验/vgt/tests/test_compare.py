@@ -264,7 +264,7 @@ def test_write_trial_appends_sample_rows_plus_one_summary_row(xlsx):
     assert r0["experiment_id"] == 1
     assert r0["action_type"] == "straight"
     assert r0["command_description"] == exp.desc
-    assert r0["duration_planned"] == pytest.approx(1.0)
+    assert r0["duration_planned"] == pytest.approx(float(exp.duration_s))   # R68：0.5
     assert r0["timestamp"] == pytest.approx(0.010)
     assert [r0["pwm_fl"], r0["pwm_fr"], r0["pwm_rl"], r0["pwm_rr"]] == [-110, 110, -110, 110]
     assert [r0["encoder_fl"], r0["encoder_fr"],

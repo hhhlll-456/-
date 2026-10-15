@@ -58,7 +58,7 @@ import sys
 from pathlib import Path
 
 from vgt import compare, matrix
-from vgt.harness import REASON_ALREADY_AT_TARGET
+from vgt.harness import DEFAULT_PULSE_MS, REASON_ALREADY_AT_TARGET
 
 
 def classify_homing(home: dict) -> tuple[str, str | None]:
@@ -110,11 +110,15 @@ def plan_start_xy(exp) -> tuple[float, float]:
 
     终点 = 起点 + 位移，取位移的对称中点：直行 200 → 起点 (−100, 0)；
     横移左 80 → (0, −40)；斜行 → (∓42.4, ∓42.4)；原地旋转 → (0, 0)。
+
+    ⚠ 位移取**期望行程**（`matrix.expected_delta_mm`，真机会走多少），不是命令量
+    `v·T`：R68 起 `duration_s` 是按实测速度模型反解的，命令量只有真机的 ~1/2
+    （#01：`v·T` = 100 mm，真机 ≈200 mm）。拿命令量算起点会把车摆到
+    126 mm 外（x 中心上限 117.5）⇒ 第一条就出界。
     """
+    dx, dy = matrix.expected_delta_mm(exp)
     if exp.action == "rotate_in_place":
         return (0.0, 0.0)
-    dx = float(exp.vx) * float(exp.duration_s) * 1000.0
-    dy = float(exp.vy) * float(exp.duration_s) * 1000.0
     return (0.0 - dx / 2.0, 0.0 - dy / 2.0)      # `0.0 − x` 顺带消掉打印里的 −0.0
 
 
@@ -180,11 +184,18 @@ def _final_stop(harness, printer) -> None:
 
 
 def run_batch(harness, *, experiments, only=None, xlsx_path,
-              printer=print, write=compare.write_trial, archive=True) -> dict:
+              printer=print, write=compare.write_trial, archive=True,
+              pulse_ms=DEFAULT_PULSE_MS) -> dict:
     """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
 
     返回统计：`n_trials / n_ok / n_failed / n_homing_failed / n_homing_zero_pulse /
     archive_path`。安全异常（`StopFailed`/`BoundaryMarkersMoved`）原样冒泡中止整批。
+
+    `pulse_ms`：传给 `drive_to` 的**归位脉冲宽度**（默认 = `harness` 默认 400 ms）。
+    ⚠ 真机实测（Task 10 清单 5.3 / SDD 台账）：400 ms 单脉冲步长 131.8–148.2 mm
+    ≫ `tol_mm=12`，12 次迭代走成周期 2 极限环、**不收敛**，"有时收敛"比稳定不收敛更
+    危险；而 >400 ms 的脉冲会把车开出场地（实测出界 1 次）。只有 **150–175 ms** 窗口
+    收敛（3 轮 6.7/11.0/11.4 mm）。所以真机跑全量必须显式 `--pulse-ms 150`。
     """
     trials = list(iterate_trials(experiments, only=only))
     stats = {"n_trials": len(trials), "n_ok": 0, "n_failed": 0,
@@ -195,7 +206,7 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
         check_experiment_feasible(exp, start_xy)          # 缺起点/越界：当场报错
         homing_note = ""
         try:
-            home = harness.drive_to(start_xy[0], start_xy[1])
+            home = harness.drive_to(start_xy[0], start_xy[1], pulse_ms=float(pulse_ms))
             kind, homing_reason = classify_homing(home)
             if kind == "failed":
                 stats["n_homing_failed"] += 1
@@ -236,9 +247,9 @@ def dry_run(*, experiments=matrix.EXPERIMENTS, only=None, printer=print) -> int:
     for index, (exp, rep) in enumerate(trials, start=1):
         start_xy = plan_start_xy(exp)
         check_experiment_feasible(exp, start_xy)
-        dx = float(exp.vx) * float(exp.duration_s) * 1000.0
-        dy = float(exp.vy) * float(exp.duration_s) * 1000.0
-        dpsi = float(exp.om) * float(exp.duration_s) * 180.0 / math.pi
+        # 终点取**期望行程**（R68：命令量 v·T 只有真机的一半，见 matrix docstring）
+        dx, dy = matrix.expected_delta_mm(exp)
+        dpsi = matrix.expected_yaw_deg(exp)
         ms = int(round(float(exp.duration_s) * 1000.0))
         printer(
             f"[{index:2d}/{len(trials)}] #{int(exp.id):02d} rep{rep + 1}/{int(exp.repeats)} "
@@ -273,11 +284,19 @@ def parse_args(argv=None):
                         help="只跑指定 experiment_id（默认全部）")
     parser.add_argument("--dry", action="store_true",
                         help="不开相机/不连车：只做场地校验并打印执行计划")
+    parser.add_argument("--pulse-ms", type=float, default=DEFAULT_PULSE_MS, metavar="MS",
+                        help=f"归位脉冲宽度 ms（默认 {DEFAULT_PULSE_MS:g} = harness 默认；"
+                             "真机实测 400 ms 不收敛，必须显式给 150）")
     return parser.parse_args(argv)
 
 
 def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> int:
-    """CLI 入口。返回 0 = 全部通过；1 = 有条目失败（已入表标注）；2 = 用法错误。"""
+    """CLI 入口。返回 0 = 全部通过；1 = 有条目失败（已入表标注）；2 = 用法错误。
+
+    `--pulse-ms` 只改**归位脉冲宽度**（默认 400 ms = `harness.DEFAULT_PULSE_MS`，行为不变）；
+    实验本身的 `RUN` 参数来自 `matrix.EXPERIMENTS`，不受它影响。真机跑全量必须显式
+    给 `--pulse-ms 150`（理由见 `run_batch` 的 docstring）。
+    """
     args = parse_args(argv)
     known = {int(e.id) for e in matrix.EXPERIMENTS}
     if args.only is not None and args.only not in known:
@@ -290,11 +309,11 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
     factory = session_factory if session_factory is not None else _open_real_session
     n_trials = sum(1 for _ in iterate_trials(matrix.EXPERIMENTS, only=args.only))
     printer(f"=== Task 12 批量：{n_trials} 次（{len(matrix.EXPERIMENTS)} 条矩阵 × repeats"
-            f"{'，--only ' + str(args.only) if args.only is not None else ''}）"
-            f"→ {xlsx} ===")
+            f"{'，--only ' + str(args.only) if args.only is not None else ''}"
+            f"，归位脉冲 {args.pulse_ms:g} ms）→ {xlsx} ===")
     with factory() as harness:
         stats = run_batch(harness, experiments=matrix.EXPERIMENTS, only=args.only,
-                          xlsx_path=xlsx, printer=printer)
+                          xlsx_path=xlsx, printer=printer, pulse_ms=args.pulse_ms)
     if stats["archive_path"]:
         printer(f"已归档：{stats['archive_path']}")
     printer(f"完成：{stats['n_ok']}/{stats['n_trials']} 通过；{stats['n_failed']} 条失败"

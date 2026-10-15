@@ -56,6 +56,16 @@ R_FACING = (math.pi, 0.0, 0.0)
 R_YAW0 = (0.0, 0.0, -math.pi / 2.0)
 
 
+def _run_line(exp) -> str:
+    """这条实验会下发的 RUN 行（与 `Harness.run_trial` 的格式化逐字一致）。
+
+    R68：矩阵的 `duration_s` 是按实测速度模型反解的，别再往断言里硬编码 "1000"。
+    """
+    return "RUN {:.4f} {:.4f} {:.4f} {}\n".format(
+        float(exp.vx), float(exp.vy), float(exp.om),
+        int(round(float(exp.duration_s) * 1000.0)))
+
+
 class FakeSock:
     """按命令前缀取回复的脚本化 socket。
 
@@ -924,7 +934,7 @@ def test_run_trial_happy_path_end_to_end(monkeypatch):
     assert cam.calls == [True, True, True]
     assert sock.sent == ["PING\n",                                   # 开场探活
                          "STOP\n",                                   # 开场兜底停车
-                         "RUN 0.2000 0.0000 0.0000 1000\n",
+                         _run_line(matrix.EXPERIMENTS[0]),
                          "STREAM 1\n",                               # R66：终点帧之后
                          "STREAM 0\n",                               # 读滑行计数
                          "STOP\n"]                                   # 收尾兜底
@@ -1292,7 +1302,7 @@ def test_run_trial_open_probe_failure_reconnects_then_proceeds(monkeypatch):
     assert res["ok"] is True
     assert calls == [1] and sock1.closed is True
     assert sock2.sent == ["PING\n", "STOP\n", "STOP\n",
-                          "RUN 0.2000 0.0000 0.0000 1000\n",
+                          _run_line(matrix.EXPERIMENTS[0]),
                           "STREAM 1\n", "STREAM 0\n",       # R66（新链路）
                           "STOP\n"]
     assert any(ev.get("event") == "open_probe" and ev.get("reconnected")
@@ -1371,7 +1381,7 @@ def test_run_trial_twice_on_one_session_keeps_state_separate(monkeypatch):
     assert first["n_samples"] == 3 and second["n_samples"] == 3
     assert cam.calls == [True] * 6
     # R66：每条都多一对 STREAM 1/0（终点帧之后读滑行计数），两条各读各的
-    assert sock.sent == ["PING\n", "STOP\n", "RUN 0.2000 0.0000 0.0000 1000\n",
+    assert sock.sent == ["PING\n", "STOP\n", _run_line(matrix.EXPERIMENTS[0]),
                          "STREAM 1\n", "STREAM 0\n", "STOP\n"] * 2
     assert first["coast_counts"] == [0, 0, 0, 0]
     assert second["coast_counts"] == [0, 0, 0, 0]

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import pytest
 
 import run_all_experiments as RA
 from vgt import matrix
+from vgt.harness import DEFAULT_PULSE_MS as H_DEFAULT_PULSE_MS
 from vgt.harness import StopFailed
 
 REPO = Path(__file__).resolve().parents[3]
@@ -63,14 +65,17 @@ class FakeHarness:
         self.trial_results = list(trial_results)
         self.raise_stop_failed = bool(raise_stop_failed)
         self.drive_targets = []
+        self.drive_kwargs = []
         self.trial_ids = []
 
     def drive_to(self, x, y, **kw):
         self.drive_targets.append((x, y))
+        self.drive_kwargs.append(dict(kw))
         self.events.append(("drive_to", (x, y)))
         if self.home_results:
             return dict(self.home_results.pop(0))
-        return {"reached": True, "reason": "converged"}
+        return {"reached": True, "reason": "converged", "at_target": True,
+                "moved": True, "iters": 1}
 
     def run_trial(self, exp, **kw):
         self.trial_ids.append(exp.id)
@@ -81,7 +86,13 @@ class FakeHarness:
 
 
 def _probe(exp_id=1, action="straight", vx=0.2, vy=0.0, om=0.0,
-           duration_s=1.0, repeats=1):
+           duration_s=None, repeats=1):
+    """造一条测试用的实验；时长默认按目标行程反解（R68：命令量惰性，见 matrix）。"""
+    if duration_s is None:
+        if action == "rotate_in_place":
+            duration_s = matrix.ms_for_deg(abs(om) * 180.0 / math.pi) / 1000.0
+        else:
+            duration_s = matrix.ms_for_mm(math.hypot(vx, vy) * 1000.0) / 1000.0
     return matrix.Experiment(exp_id, action, f"探针 #{exp_id}",
                              vx, vy, om, duration_s, repeats)
 
@@ -117,15 +128,19 @@ def _summary_rows(ws):
 # ------------------------------------------------------------------ 计划起点（R15）
 
 def test_plan_start_puts_the_sweep_midpoint_at_the_field_origin():
+    # 容差 = 1 ms 的量化尺（R68：时长按实测速度模型向下取整到 1 ms ⇒ 行程差 < 0.6 mm）
+    tol = 0.5
     by_id = {e.id: e for e in matrix.EXPERIMENTS}
-    assert RA.plan_start_xy(by_id[1]) == pytest.approx((-100.0, 0.0))   # 前进 200
-    assert RA.plan_start_xy(by_id[2]) == pytest.approx((100.0, 0.0))    # 后退 200
-    assert RA.plan_start_xy(by_id[3]) == pytest.approx((-75.0, 0.0))    # 前进 150
-    assert RA.plan_start_xy(by_id[4]) == pytest.approx((75.0, 0.0))
-    assert RA.plan_start_xy(by_id[5]) == pytest.approx((0.0, -40.0))    # 左移 80
-    assert RA.plan_start_xy(by_id[6]) == pytest.approx((0.0, 40.0))     # 右移 80
+    assert RA.plan_start_xy(by_id[1]) == pytest.approx((-100.0, 0.0), abs=tol)  # 前进 200
+    assert RA.plan_start_xy(by_id[2]) == pytest.approx((100.0, 0.0), abs=tol)   # 后退 200
+    assert RA.plan_start_xy(by_id[3]) == pytest.approx((-75.0, 0.0), abs=tol)   # 前进 150
+    assert RA.plan_start_xy(by_id[4]) == pytest.approx((75.0, 0.0), abs=tol)
+    assert RA.plan_start_xy(by_id[5]) == pytest.approx((0.0, -40.0), abs=tol)   # 左移 80
+    assert RA.plan_start_xy(by_id[6]) == pytest.approx((0.0, 40.0), abs=tol)    # 右移 80
     e9 = by_id[9]                                                       # 斜行 120（45°）
-    assert RA.plan_start_xy(e9) == pytest.approx((-e9.vx * 500.0, -e9.vy * 500.0))
+    dx9, dy9 = matrix.expected_delta_mm(e9)
+    assert RA.plan_start_xy(e9) == pytest.approx((-dx9 / 2.0, -dy9 / 2.0))
+    assert RA.plan_start_xy(e9) == pytest.approx((-42.37, -42.37), abs=0.05)
     assert RA.plan_start_xy(by_id[15]) == (0.0, 0.0)                    # 原地旋转
     assert RA.plan_start_xy(by_id[16]) == (0.0, 0.0)
 
@@ -198,12 +213,19 @@ def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, build
     stats = RA.run_batch(h, experiments=[exp1, exp5], only=None, xlsx_path=xlsx,
                          printer=lines.append, write=write, archive=False)
 
-    assert h.drive_targets == [(-100.0, 0.0), (-100.0, 0.0), (0.0, -40.0)]
+    def _near(ev):                                        # drive_to 目标取整毫米
+        kind, *rest = ev                                  # （R68：时长 1 ms 量化）
+        if kind == "drive_to":
+            return (kind, (round(rest[0][0]), round(rest[0][1])))
+        return tuple(ev)
+
+    assert [(round(x), round(y)) for x, y in h.drive_targets] == [
+        (-100, 0), (-100, 0), (0, -40)]
     assert h.trial_ids == [1, 1, 5]
-    assert events == [                                    # 计划要求的每条顺序
-        ("drive_to", (-100.0, 0.0)), ("run_trial", 1), ("write", 1), ("stop",),
-        ("drive_to", (-100.0, 0.0)), ("run_trial", 1), ("write", 1), ("stop",),
-        ("drive_to", (0.0, -40.0)), ("run_trial", 5), ("write", 5), ("stop",),
+    assert [_near(e) for e in events] == [                # 计划要求的每条顺序
+        ("drive_to", (-100, 0)), ("run_trial", 1), ("write", 1), ("stop",),
+        ("drive_to", (-100, 0)), ("run_trial", 1), ("write", 1), ("stop",),
+        ("drive_to", (0, -40)), ("run_trial", 5), ("write", 5), ("stop",),
     ]
     assert h.car_link.stops == 3                          # 每条结束 car.stop()
     assert stats == {"n_trials": 3, "n_ok": 3, "n_failed": 0,
@@ -251,6 +273,54 @@ def test_homing_failure_skips_the_trial_but_records_the_row(tmp_path, builder, x
     assert len(rows) == 1
     assert rows[0]["trial_ok"] is False
     assert rows[0]["trial_reason"] == "homing_locate_failed"
+
+
+# ------------------------------------------- 归位脉冲宽度（真机：400 ms 必振荡）
+
+def test_batch_passes_the_homing_pulse_width_through_to_drive_to(tmp_path, builder, xlsx):
+    """归位脉冲宽度必须能传下去 —— 默认 400 ms 在真机上**不收敛**（Task 10 实测）。
+
+    `drive_to` 默认 400 ms：单脉冲步长 131.8–148.2 mm ≫ `tol_mm=12`，12 次迭代走成
+    周期 2 极限环（"有时收敛"比稳定不收敛更危险）；只有 150–175 ms 窗口收敛。
+    批量入口原来把这个参数写死在默认档上，没法用真机验证过的值。
+    """
+    exp1 = _probe(1, repeats=2)
+    h = FakeHarness(trial_results=[_ok_trial(200.0), _ok_trial(200.0)])
+
+    RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx, pulse_ms=150,
+                 printer=lambda _s: None, archive=False)
+
+    assert h.drive_kwargs == [{"pulse_ms": 150.0}] * 2
+
+
+def test_batch_default_pulse_matches_the_harness_default(tmp_path, builder, xlsx):
+    """不给 `--pulse-ms` 时不许偷偷换档：与 `harness.DEFAULT_PULSE_MS` 同值。"""
+    exp1 = _probe(1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0)])
+
+    RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                 printer=lambda _s: None, archive=False)
+
+    from vgt import harness as H
+    assert h.drive_kwargs == [{"pulse_ms": H.DEFAULT_PULSE_MS}]
+
+
+def test_cli_pulse_ms_is_optional_and_parsed(xlsx):
+    assert RA.parse_args([]).pulse_ms == H_DEFAULT_PULSE_MS
+    assert RA.parse_args(["--pulse-ms", "150"]).pulse_ms == 150.0
+    h = FakeHarness(trial_results=[_ok_trial(200.0)] * 3)
+
+    @contextmanager
+    def factory():
+        yield h
+
+    rc = RA.main(["--only", "1", "--pulse-ms", "150"], session_factory=factory,
+                 printer=lambda _s: None, xlsx_path=xlsx)
+
+    assert rc == 0
+    assert h.drive_kwargs == [{"pulse_ms": 150.0}] * 3
+    with pytest.raises(SystemExit):
+        RA.parse_args(["--pulse-ms", "abc"])
 
 
 # ------------------------------------------- 零脉冲归位（R67：静默假成功的堵法）

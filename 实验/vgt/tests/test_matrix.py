@@ -56,19 +56,28 @@ def test_every_experiment_repeats_at_least_three_times():
 
 
 def _dx_mm(e):
-    return e.vx * e.duration_s * 1000.0
+    return matrix.expected_delta_mm(e)[0]
 
 
 def _dy_mm(e):
-    return e.vy * e.duration_s * 1000.0
+    return matrix.expected_delta_mm(e)[1]
 
 
 def _dpsi_deg(e):
-    return e.om * e.duration_s * 180.0 / math.pi
+    return matrix.expected_yaw_deg(e)
 
 
-def _probe(action, vx, vy, om, duration_s=1.0, exp_id=99, repeats=3):
-    """造一条测试用的实验（desc 只是占位符）。"""
+def _probe(action, vx, vy, om, duration_s=None, exp_id=99, repeats=3):
+    """造一条测试用的实验（desc 只是占位符）。
+
+    `duration_s=None`（默认）按**目标行程**反解时长（R68：命令速度惰性，真机行程只由
+    时长决定）：平移取 `|v|·1 s` mm、旋转取 `|om|·1 s` 度，与老口径的"命令量"等值。
+    """
+    if duration_s is None:
+        if action == "rotate_in_place":
+            duration_s = matrix.ms_for_deg(abs(om) * 180.0 / math.pi) / 1000.0
+        else:
+            duration_s = matrix.ms_for_mm(math.hypot(vx, vy) * 1000.0) / 1000.0
     return matrix.Experiment(exp_id, action, "探针", vx, vy, om, duration_s, repeats)
 
 
@@ -86,25 +95,79 @@ def test_experiment_namedtuple_has_exactly_the_eight_fields():
 
 
 def test_matrix_covers_the_mandated_manoeuvres():
-    """brief 的覆盖要求：直行 ±200/±150、横移 ±80/±50、斜行 ±120、旋转 ±30°/±45°。"""
-    straight = sorted(round(_dx_mm(e), 6) for e in matrix.EXPERIMENTS
+    """brief 的覆盖要求：直行 ±200/±150、横移 ±80/±50、斜行 ±120、旋转 ±30°/±45°。
+
+    位移取**期望行程**（R68：命令量惰性，真机行程由 `duration_s` 决定），
+    取整数毫米比对：1 ms 的量化误差 < 1 mm。
+    """
+    straight = sorted(round(_dx_mm(e)) for e in matrix.EXPERIMENTS
                       if e.action == "straight")
-    assert straight == pytest.approx([-200.0, -150.0, 150.0, 200.0])
+    assert straight == [-200, -150, 150, 200]
 
-    strafe = sorted(round(_dy_mm(e), 6) for e in matrix.EXPERIMENTS
+    strafe = sorted(round(_dy_mm(e)) for e in matrix.EXPERIMENTS
                     if e.action == "strafe")
-    assert strafe == pytest.approx([-80.0, -50.0, 50.0, 80.0])
+    assert strafe == [-80, -50, 50, 80]
 
-    rotate = sorted(round(_dpsi_deg(e), 6) for e in matrix.EXPERIMENTS
+    rotate = sorted(round(_dpsi_deg(e)) for e in matrix.EXPERIMENTS
                     if e.action == "rotate_in_place")
-    assert rotate == pytest.approx([-45.0, -30.0, 30.0, 45.0])
+    assert rotate == [-45, -30, 30, 45]
 
     # 斜行：四个对角方向都覆盖，位移都是 120 mm（45°）
     diagonal = [e for e in matrix.EXPERIMENTS if e.action == "diagonal"]
     assert {(_sign(_dx_mm(e)), _sign(_dy_mm(e))) for e in diagonal} == {
         (1, 1), (1, -1), (-1, 1), (-1, -1)}
     for e in diagonal:
-        assert math.hypot(_dx_mm(e), _dy_mm(e)) == pytest.approx(120.0, abs=1e-9)
+        assert round(math.hypot(_dx_mm(e), _dy_mm(e))) == 120
+
+
+def test_durations_are_the_measured_speed_model_inverted():
+    """R68：`duration_s` 全部由 `s = 0.56·(T−0.143)` 反解（向下取整）。
+
+    时长是**唯一**能改变真机行程的量（命令速度被 MIN_DUTY 抬平），所以这张表
+    必须锁住：改矩阵时长 = 改实验项目，不能顺手四舍五入。
+    """
+    assert matrix.ms_for_mm(200) == 500
+    assert matrix.ms_for_mm(150) == 410
+    assert matrix.ms_for_mm(80) == 285
+    assert matrix.ms_for_mm(50) == 232
+    assert matrix.ms_for_mm(120) == 357
+    assert matrix.ms_for_deg(30) == 266
+    assert matrix.ms_for_deg(45) == 328
+    for e in matrix.EXPERIMENTS:
+        if e.action == "rotate_in_place":
+            want = matrix.ms_for_deg(round(abs(_dpsi_deg(e))))
+        else:
+            want = matrix.ms_for_mm(round(math.hypot(_dx_mm(e), _dy_mm(e))))
+        assert e.duration_s * 1000.0 == pytest.approx(want, abs=1e-6)
+
+
+def test_expected_travel_rounds_down_under_the_target_and_the_cap():
+    """向下取整 1 ms ⇒ 期望行程 ≤ 目标 ≤ 上限（差 < 1 mm，横移 80 才不顶穿）。"""
+    for e in matrix.EXPERIMENTS:
+        if e.action == "rotate_in_place":
+            got = abs(_dpsi_deg(e))
+            cap = matrix.MAX_ROTATION_DEG
+        else:
+            got = math.hypot(_dx_mm(e), _dy_mm(e))
+            cap = {"straight": matrix.MAX_STRAIGHT_MM,
+                   "strafe": matrix.MAX_STRAFE_MM,
+                   "diagonal": matrix.MAX_DIAGONAL_MM}[e.action]
+        target = round(got)
+        assert target - 1.0 < got <= target + 1e-9, f"#{e.id} 期望 {got} vs 目标 {target}"
+        assert got <= cap + 1e-9, f"#{e.id} 期望 {got} 超过上限 {cap}"
+
+
+def test_expected_start_xy_is_the_mirror_midpoint_of_the_expected_leg():
+    """`expected_start_xy` = −期望位移/2（行程对中）；旋转原地不动。"""
+    for e in matrix.EXPERIMENTS:
+        sx, sy = matrix.expected_start_xy(e)
+        dx, dy = matrix.expected_delta_mm(e)
+        assert sx == pytest.approx(-dx / 2.0, abs=1e-9)
+        assert sy == pytest.approx(-dy / 2.0, abs=1e-9)
+        if e.action == "rotate_in_place":
+            assert (sx, sy) == (0.0, 0.0)
+        else:
+            assert (sx, sy) != (0.0, 0.0), f"#{e.id} 平移类起点不许是 (0, 0)"
 
 
 def test_experiment_ids_are_unique_and_actions_are_known():
@@ -146,7 +209,7 @@ def test_mandated_strafe_is_reachable_from_a_real_start():
     e80 = _probe("strafe", 0.0, 0.080, 0.0)
     matrix.assert_within_field(e80, start_xy=(0.0, -40.0))     # y 包络 ±114.5 < ±125.9
     with pytest.raises(ValueError):
-        matrix.assert_within_field(e80, start_xy=(0.0, -20.0))     # 终点 y 包络 134.5 越界
+        matrix.assert_within_field(e80, start_xy=(0.0, -20.0))     # 终点 y 包络 134.0 越界
     with pytest.raises(ValueError):
         matrix.assert_within_field(e80, start_xy=(0.0, -60.0))     # 起点 y 包络越界
 

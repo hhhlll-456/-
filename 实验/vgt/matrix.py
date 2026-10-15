@@ -4,15 +4,41 @@
 
 Global Constraints 的四条动作上限，加上 brief 要求的覆盖：
 
-| 动作 | 上限 | 矩阵覆盖 |
+| 动作 | 上限 | 矩阵覆盖（**目标行程**） |
 |---|---|---|
 | 直行 `straight` | 200 mm | ±200、±150 |
 | 横移 `strafe` | 80 mm | ±80、±50 |
 | 斜行 `diagonal` | 120 mm | 四个对角方向各 120 mm（45°） |
 | 原地旋转 `rotate_in_place` | 45° | ±30°、±45° |
 
-直行/横移/斜行统一 1.0 s 行程（速度就是命令值）；旋转用 45°/s（π/4 rad/s）：
-30° 走 2/3 s、45° 走 1.0 s。每条 `repeats = 3`（单次抖动用重复的中位数消化）。
+每条 `repeats = 3`（单次抖动用重复的中位数消化）。
+
+## `duration_s` 从实测速度模型反解（R68）
+
+固件把"速度"当命令收，但**命令速度在这一段是惰性的**：`interpDuty` 在表格首行
+（110 → 13.02 rad/s）以下线性外推，`bodyToPWM` 随后把 `duty` 抬到
+`MIN_DUTY = 110`（43.1%）——矩阵 16 条的命令轮速全都落在首行以下，**真机下发的
+一律是同一个占空比**。所以真机行程只由 `duration_s` 决定，时长由 opencode 自己
+标定的速度模型反解：
+
+    s_mm = V_STEADY · (T_ms − DEAD_MS),   V_STEADY = 0.56 m/s,  DEAD_MS = 143 ms
+
+（600 ms → 256.3 mm、350 → 110.3、300 → 88.6 三点拟合，截距一致；旋转速率由偏航腿
+`RUN 0 0 ±0.20 200` 的 13.05–15.72°（均值 13.87°）导出 ≈ 243°/s，死区同为 143 ms。）
+`ms_for_mm()` / `ms_for_deg()` 反解时长并**向下取整到 1 ms**（量化误差 < 0.6 mm，
+保证真实行程不超过上限）。
+
+⚠ 于是"命令量"和"目标行程"**故意不相等**，两者都要看得懂：
+
+- `expected_travel_mm(exp)` / `expected_delta_mm(exp)` / `expected_yaw_deg(exp)`
+  = **真实会走**多少（= 目标，见上表）；`expected_start_xy(exp)` = 把它对中后的起点；
+- `compare._command_param_1` 记进表的"计划距离"是 `v·T` = **命令量**（#01 = 100 mm，
+  它的 desc 与目标却是 200 mm）——固件按命令只该走 100 mm，实际走 ≈200 mm，
+  这个 2× 差**就是** Task 14 要辨识的东西（速度映射在 MIN_DUTY 以下失效）。
+- **不许**把修正预先烘焙进命令速度（令 `v·T` 恰等于实际）：那会让"理想 vs 实际"
+  恒为 0，Task 14 的信号当场消失。
+
+`assert_within_field` 的动作上限与几何分支一律用**期望行程**，不用命令量。
 
 ## `assert_within_field(exp, start_xy=(0.0, 0.0))` 校验什么
 
@@ -21,7 +47,8 @@ Global Constraints 的四条动作上限，加上 brief 要求的覆盖：
 
 **（1）动作上限**（任何分支都查）：上面四个数，超一个 `ValueError`。
 
-**（2）几何**，按起点分两支：
+**（2）几何**，按起点分两支（下面的"位移"一律指**期望行程** `expected_delta_mm`，
+不是命令量 `v·T` —— R68）：
 
 - **默认 `(0.0, 0.0)` = 名义场地中心**（起点未归位）：查**全场可行性** ——
   位移 ≤ `505-270 = 235 mm`（x）、`252-149 = 103 mm`（y），
@@ -63,32 +90,97 @@ _TOL = 1e-9                      # 命令值是十进制浮点数，200.0 会算
 
 Experiment = namedtuple("Experiment", "id action desc vx vy om duration_s repeats")
 
-# 45° 斜行的每轴速度：|v|·√2 = 0.12 m/s ⇒ 1 s 走 120 mm
+# ---- 真机速度模型（R68：从 opencode 的标定数据拟合，见模块 docstring）--------------
+V_STEADY_MPS = 0.56              # 稳态速度（600/350/300 ms → 256.3/110.3/88.6 mm）
+DEAD_MS = 143.0                  # 起步死区（三个行程反解出的截距一致）
+YAW_RATE_DEG_S = 243.0           # 原地旋转速率（13.87° / 0.2 s 的偏航腿）
+
+# 45° 斜行的每轴速度：|v|·√2 = 0.12 m/s（命令量；真机行程由 duration_s 决定，R68）
 _DIAG_V = 0.12 / math.sqrt(2.0)
-_OM = math.pi / 4.0              # 45°/s
+_OM = math.pi / 4.0              # 45°/s（命令量）
 
 EXPERIMENTS = [
     # ---- 直行：±200 / ±150（上限 200）----
-    Experiment(1, "straight", "直行前进 200 mm", 0.200, 0.0, 0.0, 1.0, 3),
-    Experiment(2, "straight", "直行后退 200 mm", -0.200, 0.0, 0.0, 1.0, 3),
-    Experiment(3, "straight", "直行前进 150 mm", 0.150, 0.0, 0.0, 1.0, 3),
-    Experiment(4, "straight", "直行后退 150 mm", -0.150, 0.0, 0.0, 1.0, 3),
+    Experiment(1, "straight", "直行前进 200 mm", 0.200, 0.0, 0.0, 0.500, 3),
+    Experiment(2, "straight", "直行后退 200 mm", -0.200, 0.0, 0.0, 0.500, 3),
+    Experiment(3, "straight", "直行前进 150 mm", 0.150, 0.0, 0.0, 0.410, 3),
+    Experiment(4, "straight", "直行后退 150 mm", -0.150, 0.0, 0.0, 0.410, 3),
     # ---- 横移：±80 / ±50（步长上限 80）----
-    Experiment(5, "strafe", "横移左移 80 mm", 0.0, 0.080, 0.0, 1.0, 3),
-    Experiment(6, "strafe", "横移右移 80 mm", 0.0, -0.080, 0.0, 1.0, 3),
-    Experiment(7, "strafe", "横移左移 50 mm", 0.0, 0.050, 0.0, 1.0, 3),
-    Experiment(8, "strafe", "横移右移 50 mm", 0.0, -0.050, 0.0, 1.0, 3),
+    Experiment(5, "strafe", "横移左移 80 mm", 0.0, 0.080, 0.0, 0.285, 3),
+    Experiment(6, "strafe", "横移右移 80 mm", 0.0, -0.080, 0.0, 0.285, 3),
+    Experiment(7, "strafe", "横移左移 50 mm", 0.0, 0.050, 0.0, 0.232, 3),
+    Experiment(8, "strafe", "横移右移 50 mm", 0.0, -0.050, 0.0, 0.232, 3),
     # ---- 斜行：四个对角方向，各 120 mm（上限 120）----
-    Experiment(9, "diagonal", "斜行前左 45° 120 mm", _DIAG_V, _DIAG_V, 0.0, 1.0, 3),
-    Experiment(10, "diagonal", "斜行前右 45° 120 mm", _DIAG_V, -_DIAG_V, 0.0, 1.0, 3),
-    Experiment(11, "diagonal", "斜行后左 45° 120 mm", -_DIAG_V, _DIAG_V, 0.0, 1.0, 3),
-    Experiment(12, "diagonal", "斜行后右 45° 120 mm", -_DIAG_V, -_DIAG_V, 0.0, 1.0, 3),
-    # ---- 原地旋转：±30° / ±45°（上限 45°，45°/s）----
-    Experiment(13, "rotate_in_place", "原地逆时针 30°", 0.0, 0.0, _OM, 2.0 / 3.0, 3),
-    Experiment(14, "rotate_in_place", "原地顺时针 30°", 0.0, 0.0, -_OM, 2.0 / 3.0, 3),
-    Experiment(15, "rotate_in_place", "原地逆时针 45°", 0.0, 0.0, _OM, 1.0, 3),
-    Experiment(16, "rotate_in_place", "原地顺时针 45°", 0.0, 0.0, -_OM, 1.0, 3),
+    Experiment(9, "diagonal", "斜行前左 45° 120 mm", _DIAG_V, _DIAG_V, 0.0, 0.357, 3),
+    Experiment(10, "diagonal", "斜行前右 45° 120 mm", _DIAG_V, -_DIAG_V, 0.0, 0.357, 3),
+    Experiment(11, "diagonal", "斜行后左 45° 120 mm", -_DIAG_V, _DIAG_V, 0.0, 0.357, 3),
+    Experiment(12, "diagonal", "斜行后右 45° 120 mm", -_DIAG_V, -_DIAG_V, 0.0, 0.357, 3),
+    # ---- 原地旋转：±30° / ±45°（上限 45°）----
+    Experiment(13, "rotate_in_place", "原地逆时针 30°", 0.0, 0.0, _OM, 0.266, 3),
+    Experiment(14, "rotate_in_place", "原地顺时针 30°", 0.0, 0.0, -_OM, 0.266, 3),
+    Experiment(15, "rotate_in_place", "原地逆时针 45°", 0.0, 0.0, _OM, 0.328, 3),
+    Experiment(16, "rotate_in_place", "原地顺时针 45°", 0.0, 0.0, -_OM, 0.328, 3),
 ]
+
+
+def ms_for_mm(target_mm: float) -> int:
+    """走 `target_mm` 需要多少 ms：`s_mm = V_STEADY·(T_ms − DEAD_MS)` 反解，向下取整。
+
+    向下取整而不是四舍五入：1 ms ≈ 0.56 mm，向上取会让真实行程顶穿上限
+    （横移 80 mm 的 285.86 ms 一进位就变 286 → 80.08 mm > 80）。
+    """
+    if target_mm < 0:
+        raise ValueError(f"目标行程必须 ≥ 0，实际 {target_mm}。")
+    return int(math.floor(target_mm / V_STEADY_MPS + DEAD_MS))
+
+
+def ms_for_deg(target_deg: float) -> int:
+    """原地转 `target_deg` 需要多少 ms（同一个死区，向下取整）。"""
+    return int(math.floor(abs(target_deg) / YAW_RATE_DEG_S * 1000.0 + DEAD_MS))
+
+
+def _dir_unit(exp) -> tuple:
+    """命令方向的单位向量（纯平移）；速度全 0 时返回 (0, 0)。"""
+    speed = math.hypot(exp.vx, exp.vy)
+    if speed == 0.0:
+        return (0.0, 0.0)
+    return (exp.vx / speed, exp.vy / speed)
+
+
+def expected_travel_mm(exp) -> float:
+    """这条实验**真机会走**的平移距离（mm）：`V_STEADY·(T−DEAD)`；旋转类返回 0。"""
+    if exp.action == "rotate_in_place":
+        return 0.0
+    return max(0.0, V_STEADY_MPS * (exp.duration_s * 1000.0 - DEAD_MS))
+
+
+def expected_yaw_deg(exp) -> float:
+    """原地旋转**真机会转**的角度（度，符号跟 `om`）；平移类返回 0。"""
+    if exp.action != "rotate_in_place":
+        return 0.0
+    turn = max(0.0, YAW_RATE_DEG_S * (exp.duration_s * 1000.0 - DEAD_MS) / 1000.0)
+    return math.copysign(turn, float(exp.om))
+
+
+def expected_delta_mm(exp) -> tuple:
+    """**期望位移** `(dx, dy)`（mm）：沿命令方向、长度 = `expected_travel_mm`。"""
+    if exp.action == "rotate_in_place":
+        return (0.0, 0.0)
+    ux, uy = _dir_unit(exp)
+    travel = expected_travel_mm(exp)
+    return (ux * travel, uy * travel)
+
+
+def expected_start_xy(exp) -> tuple:
+    """把期望位移**对中**的起点：整段行程落在场地中心两侧各一半。
+
+    平移就看这一条：起点 = −期望位移/2 ⇒ 终点 = +期望位移/2（Task 12 的 `drive_to`
+    目标）。旋转原地不动 ⇒ `(0, 0)`。
+    """
+    if exp.action == "rotate_in_place":
+        return (0.0, 0.0)
+    dx, dy = expected_delta_mm(exp)
+    return (-dx / 2.0, -dy / 2.0)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -143,13 +235,15 @@ def assert_within_field(exp, start_xy=(0.0, 0.0)) -> None:
       绝对扫掠校验留给下面的显式起点分支；
     - 显式 `start_xy` 时，车体半包络在起点与终点都必须落在
       `±252.5 × ±125.9` 内（旋转类只查起点）。
+
+    位移/转角一律取**期望值**（`expected_delta_mm` / `expected_yaw_deg`，真实会走多少），
+    不是命令量 `v·T`：命令量在 MIN_DUTY 以下是惰性的（R68，见模块 docstring）。
     """
     _require(exp.duration_s > 0,
              f"实验 #{exp.id}（{exp.desc}）：duration_s={exp.duration_s} 必须为正。")
 
-    dx_mm = exp.vx * exp.duration_s * 1000.0
-    dy_mm = exp.vy * exp.duration_s * 1000.0
-    dpsi_deg = exp.om * exp.duration_s * 180.0 / math.pi
+    dx_mm, dy_mm = expected_delta_mm(exp)
+    dpsi_deg = expected_yaw_deg(exp)
     _check_motion_caps(exp, dx_mm, dy_mm, dpsi_deg)
 
     x0, y0 = float(start_xy[0]), float(start_xy[1])
