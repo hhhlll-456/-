@@ -259,7 +259,9 @@ def plan(dx_mm: float = 0.0, dy_mm: float = 0.0, dpsi_deg: float = 0.0) -> dict:
     if y_step and abs(y_step[0]["requested"]) > STRAFE_CAL_MAX_MM:
         warn.append(f"横移 {y_step[0]['requested']} mm 超出**标定区间**（上限 "
                     f"{STRAFE_CAL_MAX_MM:.1f} mm）—— 时长是外推，只能保证把车送出去，"
-                    f"**不能保证走直**（方向随机）。长距离请改用直行，或拆成多段短的。")
+                    f"**不能保证走直**（方向随机）。长距离请改用直行；"
+                    f"拆成小步**不能**改善 —— 每步各付一次固定偏置，实测拆 10 步净转 +52.5°"
+                    f"（一次走完 3 次实测 |均| 12.4°）。见 §4.2。")
     if y_step and abs(y_step[0]["requested"]) > Y_LIMIT_MM:
         warn.append(f"横移 {y_step[0]['requested']} mm 超过车中心可用半宽 ±{Y_LIMIT_MM:.1f} mm"
                     f"（y 方向全场只有 {2*Y_LIMIT_MM:.0f} mm 可用）—— 一趟做不到，得分几步。")
