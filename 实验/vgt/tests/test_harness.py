@@ -28,6 +28,7 @@ import pytest
 from car_link import CarLink
 from vgt import harness as H
 from vgt import matrix
+from vgt import odometry
 from vgt.camera import CameraSession, CameraUnavailable
 from vision_core import load_calib
 from vision_core.markers import MarkerPose
@@ -162,7 +163,8 @@ def scene(vehicle_xy=None, yaw_rvec=R_FACING, px_shift=(0.0, 0.0), drop=()) -> d
     return poses
 
 
-def _make(poses_list=(), replies=None, link_factory=None, frames=(), camera=None, **kw):
+def _make(poses_list=(), replies=None, link_factory=None, frames=(), camera=None,
+          coast_enc=None, **kw):
     """造一套假设备：返回 `(harness, camera, detect, sock)`。
 
     `detect` 是脚本化的 `detect_markers` 替身（逐帧 pop `poses_list`，用完给 {}）；
@@ -170,11 +172,17 @@ def _make(poses_list=(), replies=None, link_factory=None, frames=(), camera=None
     时序参数压小，让所有等待路径都在毫秒级跑完。
 
     `camera`：要注入特殊相机（比如抓帧会抛的）时传进来，默认 `FakeCamera(frames)`。
+    `coast_enc`：R66 停车后那次空闲编码器读数（`STREAM 1` 的 `I` 行）的值。缺省
+    `None` = **不配**这个回复 ⇒ `_read_idle_enc` 读不到 ⇒ 记一条 `coast_read_failed`
+    warning、里程计退回只积 `D` 行。想验"滑行被并进来"的测试必须显式给值。
     """
     timeouts = dict(done_timeout_s=1.0, silence_timeout_s=0.05,
                     reply_timeout_s=0.05, handshake_timeout_s=0.5,
                     locate_tries=1)
     timeouts.update(kw)
+    replies = dict(replies or {})
+    if coast_enc is not None:
+        replies.setdefault("STREAM", _coast_replies(coast_enc))
     sock = FakeSock(replies)
     camera = camera if camera is not None else FakeCamera(frames)
     h = H.Harness(make_car_link(sock), camera, dict(CALIB),
@@ -733,20 +741,46 @@ def _d_line(t_ms, enc, pwm=PWM_FWD):
 
 
 def _trial_run_script(enc_end, *, pwm=PWM_FWD, with_done=True,
-                      samples_at=(10, 510, 990)):
+                      samples_at=(10, 510, 990), last_pwm=PWM_FWD):
     """一次 RUN 的脚本回复：OK RUN + 三条 D 样本（+可选 DONE）。
 
     中间那条（默认 t=510 ≥ 1000/2）就是中点抓帧的触发器 —— 顺序与固件一致：
     `OK RUN` 先回，样本按时间流式到达，最后才 `DONE`。
+
+    `last_pwm`：最后那条 D 样本的 pwm。**真机上它是 `[0,0,0,0]`** —— 固件在
+    补发它之前先 `stopAll()`（main.cpp:693-694）。默认保持整个 RUN 用 `pwm` 只是
+    为了让老测试的期望不变；验 R66 的滑行并入时要显式传 `[0,0,0,0]`。
     """
     mid = [c // 2 for c in enc_end]
     enc_by_t = {samples_at[0]: [0, 0, 0, 0], samples_at[1]: mid, samples_at[2]: enc_end}
     group = [b"OK RUN pwm=-110,110,-110,110 ms=1000 kick=150ms/105\n"]
     for t in sorted(enc_by_t):
-        group.append(_d_line(t, enc_by_t[t], pwm).encode())
+        group.append(_d_line(t, enc_by_t[t],
+                             last_pwm if t == samples_at[2] else pwm).encode())
     if with_done:
         group.append(b"DONE\n")
     return group
+
+
+def _i_line(enc, millis=123456):
+    """一行合法的空闲 `I` 样本（与 D 行同形，t 是 `millis()`、pwm 恒为 0）。"""
+    return ("I {:d} 0 0 0 0 {:d} {:d} {:d} {:d} 0.00 0.00 0.00\n"
+            .format(millis, enc[0], enc[1], enc[2], enc[3]))
+
+
+def _coast_replies(enc):
+    """**按发送顺序**的两组回复：`STREAM 1`（确认 + 一条 I 行）、`STREAM 0`（确认）。
+
+    `FakeSock` 按命令首词取队列，`STREAM 1` 与 `STREAM 0` 同归于 `"STREAM"`，
+    正好按顺序各 pop 一组。
+    """
+    return [[b"OK STREAM 1\n", _i_line(enc).encode()], [b"OK STREAM 0\n"]]
+
+
+def _samples(*encs, pwm=PWM_FWD, dt=100, t0=0):
+    """直接拼样本字典序列（纯函数测试用，绕开 D 行解析）。"""
+    return [{"t_ms": t0 + i * dt, "pwm": list(pwm), "enc": list(e),
+             "rpy": [0.0, 0.0, 0.0]} for i, e in enumerate(encs)]
 
 
 def _stop_replies(n):
@@ -801,13 +835,16 @@ def test_run_trial_happy_path_end_to_end(monkeypatch):
         poses_list=[_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0), _trial_pose(200.0, 0.0)],
         replies={"PING": [[b"PONG\n"]],
                  "STOP": _stop_replies(2),
-                 "RUN": [_trial_run_script(counts)]})
+                 "RUN": [_trial_run_script(counts)]},
+        coast_enc=counts)
     monkeypatch.setattr(H, "detect_markers", detect)
 
     res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
                       settle_after_done_s=0.0)
 
     assert res["ok"] is True and res["reason"] is None
+    assert res["coast_read_failed"] is False        # R66：停车后读到了（本段没滑行）
+    assert res["coast_counts"] == [0, 0, 0, 0]
     assert res["vision"]["start"] == pytest.approx((0.0, 0.0, 0.0))
     assert res["vision"]["mid"] == pytest.approx((100.0, 0.0, 0.0))
     assert res["vision"]["end"] == pytest.approx((200.0, 0.0, 0.0))
@@ -827,6 +864,8 @@ def test_run_trial_happy_path_end_to_end(monkeypatch):
     assert sock.sent == ["PING\n",                                   # 开场探活
                          "STOP\n",                                   # 开场兜底停车
                          "RUN 0.2000 0.0000 0.0000 1000\n",
+                         "STREAM 1\n",                               # R66：终点帧之后
+                         "STREAM 0\n",                               # 读滑行计数
                          "STOP\n"]                                   # 收尾兜底
 
 
@@ -1172,7 +1211,8 @@ def test_run_trial_open_probe_failure_reconnects_then_proceeds(monkeypatch):
     """开场探活失败（链路死）→ 重连成功 → 实验照跑（新链路完成全部时序）。"""
     counts = _counts_for(200.0)
     sock2 = FakeSock({"PING": [[b"PONG\n"]], "STOP": _stop_replies(3),
-                      "RUN": [_trial_run_script(counts)]})
+                      "RUN": [_trial_run_script(counts)],
+                      "STREAM": _coast_replies(counts)})
     calls = []
 
     def factory():
@@ -1191,7 +1231,9 @@ def test_run_trial_open_probe_failure_reconnects_then_proceeds(monkeypatch):
     assert res["ok"] is True
     assert calls == [1] and sock1.closed is True
     assert sock2.sent == ["PING\n", "STOP\n", "STOP\n",
-                          "RUN 0.2000 0.0000 0.0000 1000\n", "STOP\n"]
+                          "RUN 0.2000 0.0000 0.0000 1000\n",
+                          "STREAM 1\n", "STREAM 0\n",       # R66（新链路）
+                          "STOP\n"]
     assert any(ev.get("event") == "open_probe" and ev.get("reconnected")
                for ev in res["events"])
 
@@ -1254,7 +1296,8 @@ def test_run_trial_twice_on_one_session_keeps_state_separate(monkeypatch):
         poses_list=poses,
         replies={"PING": [[b"PONG\n"], [b"PONG\n"]],
                  "STOP": _stop_replies(4),
-                 "RUN": [_trial_run_script(counts), _trial_run_script(counts)]})
+                 "RUN": [_trial_run_script(counts), _trial_run_script(counts)],
+                 "STREAM": _coast_replies(counts) * 2})
     monkeypatch.setattr(H, "detect_markers", detect)
 
     first = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
@@ -1266,4 +1309,167 @@ def test_run_trial_twice_on_one_session_keeps_state_separate(monkeypatch):
     assert first["samples"] is not second["samples"]
     assert first["n_samples"] == 3 and second["n_samples"] == 3
     assert cam.calls == [True] * 6
-    assert sock.sent == ["PING\n", "STOP\n", "RUN 0.2000 0.0000 0.0000 1000\n", "STOP\n"] * 2
+    # R66：每条都多一对 STREAM 1/0（终点帧之后读滑行计数），两条各读各的
+    assert sock.sent == ["PING\n", "STOP\n", "RUN 0.2000 0.0000 0.0000 1000\n",
+                         "STREAM 1\n", "STREAM 0\n", "STOP\n"] * 2
+    assert first["coast_counts"] == [0, 0, 0, 0]
+    assert second["coast_counts"] == [0, 0, 0, 0]
+
+
+# -------------------------------------------- R66：停车后的惯性滑行（窗口对齐）
+
+
+def test_coasted_samples_keeps_direction_when_last_d_sample_is_stopped():
+    """R66 的核心陷阱：固件补发的最后一条 D 样本 `pwm=[0,0,0,0]`。
+
+    `integrate_encoders` 用 `sgn(pwm[k-1])` 定方向（单相计数不辨向，E13）——
+    要是把滑行样本直接接在全零 pwm 的样本后面，**滑行段会被算成 0 位移**：
+    不报错、不告警，只是静默少报一截。所以合成那段必须继承本段的行进方向。
+    """
+    run = _samples([0, 0, 0, 0], [100, 100, 100, 100])
+    run[-1] = dict(run[-1], pwm=[0, 0, 0, 0])       # 末条 = 固件停车后补发的 D 样本
+    merged = H.coasted_samples(run, {"enc": [150, 150, 150, 150], "rpy": [0.0, 0.0, 0.0]})
+
+    assert merged is not run and len(merged) == 3
+    assert merged[-1]["synthetic"] == "coast"
+    assert merged[-1]["pwm"] == PWM_FWD             # 继承方向，而不是全零
+    # 原样本序列不许被就地改写（调用方拿它当"固件原样证据"）
+    assert run[-1]["pwm"] == [0, 0, 0, 0]
+
+    # 整段 150 计数（用全非零 pwm 的同长度序列做基线）应得同样的位移
+    same = H.coasted_samples(_samples([0, 0, 0, 0], [150, 150, 150, 150]),
+                             {"enc": [150, 150, 150, 150], "rpy": None})
+    a = odometry.integrate_encoders(merged, c_1rev=1276.0, sign=[-1, 1, -1, 1],
+                                    l_xy_over_r=0.12825 / 0.0335, r_eff_mm=33.5)
+    b = odometry.integrate_encoders(same, c_1rev=1276.0, sign=[-1, 1, -1, 1],
+                                    l_xy_over_r=0.12825 / 0.0335, r_eff_mm=33.5)
+    assert a[-1][0] == pytest.approx(b[-1][0], abs=0.5)      # 方向没丢，位移对得上
+
+
+def test_coasted_samples_discards_reading_below_last_sample():
+    """读数比最后一条 D 样本还小 = 不可信（多半是 RUN 之前淌进来的旧 I 行）。
+
+    递减会让 `integrate_encoders` 抛 `ValueError` 把整个试次判死（R13 的契约），
+    所以这里必须**先**丢掉，而不是原样喂进去。
+    """
+    run = _samples([0, 0, 0, 0], [300, 300, 300, 300])
+    assert H.coasted_samples(run, {"enc": [100, 100, 100, 100], "rpy": None}) is run
+    assert H.coasted_samples(run, {"enc": [301, 299, 300, 300], "rpy": None}) is run  # 有一只回退
+    # 只不过某一只多跳了一格（其余持平）不算回退：那只的 dc 是 +1，不递减
+    half = H.coasted_samples(run, {"enc": [301, 300, 300, 300], "rpy": None})
+    assert half is not run and half[-1]["enc"] == [301, 300, 300, 300]
+    # 相等 = "这轮确实没滑行"：可以接一段零位移的合成样本，但不许算成负的
+    same = H.coasted_samples(run, {"enc": [300, 300, 300, 300], "rpy": None})
+    assert same is not run and same[-1]["synthetic"] == "coast"
+    traj = odometry.integrate_encoders(same, c_1rev=1276.0, sign=[-1, 1, -1, 1],
+                                       l_xy_over_r=0.12825 / 0.0335, r_eff_mm=33.5)
+    assert traj[-1][0] == pytest.approx(traj[-2][0], abs=1e-9)      # 零滑行 = 零位移
+
+
+def test_coasted_samples_noop_without_coast_or_direction():
+    run = _samples([0, 0, 0, 0], [100, 100, 100, 100])
+    assert H.coasted_samples(run, None) is run                      # 没读到
+    one = _samples([0, 0, 0, 0])
+    assert H.coasted_samples(one, {"enc": [9, 9, 9, 9], "rpy": None}) is one  # 样本不足两条
+    # 整段 RUN 都没转过（pwm 全零）：没有方向可继承，宁可退回、不猜
+    still = _samples([0, 0, 0, 0], [50, 50, 50, 50], pwm=[0, 0, 0, 0])
+    assert H.coasted_samples(still, {"enc": [80, 80, 80, 80], "rpy": None}) is still
+
+
+def test_run_trial_coast_makes_odometry_window_match_vision(monkeypatch):
+    """R66 端到端：视觉终点帧抓到的是**滑行完**的位置，里程计也得算到那儿。
+
+    真机症状：同一发 S300 脉冲，`vision_delta.dist_mm ≈ 81`、`odometry_delta.dist_mm
+    ≈ 30`（差 2.6 倍），看着像 c1 标错了 —— 其实就是停车后 1.5~1.7 倍的通电距离
+    自由滑行，而 `D` 行随停车一起停。这一条锁住"补读一次空闲编码器就对齐"。
+    """
+    counts_run = _counts_for(300.0)                     # 电机通电期
+    counts_coast = _counts_for(450.0)                   # 停车 + 自由滑行
+    h, _cam, detect, _sock = _make(
+        poses_list=[_trial_pose(0.0, 0.0), _trial_pose(150.0, 0.0),
+                    _trial_pose(450.0, 0.0)],           # 视觉量的是 450
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts_run, last_pwm=[0, 0, 0, 0])]},
+        coast_enc=counts_coast)
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True and res["warnings"] == []
+    assert res["coast_read_failed"] is False
+    assert res["coast_counts"] == [b - a for a, b in zip(counts_run, counts_coast)]
+    assert res["vision_delta"]["dist_mm"] == pytest.approx(450.0, abs=1.0)
+    # 关键断言：里程计窗口也到 450（不是只到电机停车的 300）
+    assert res["odometry_delta"]["dist_mm"] == pytest.approx(450.0, abs=2.0)
+    # 保留的原始证据仍是固件 D 行本身，合成样本只进积分副本
+    assert res["n_samples"] == 3
+    assert res["samples"][-1]["pwm"] == [0, 0, 0, 0]
+    assert all("synthetic" not in s for s in res["samples"])
+
+
+def test_run_trial_coast_read_failure_warns_without_failing(monkeypatch):
+    """读不到空闲编码器**不是**致命：试次照常判有效，但必须出声、必须标注窗口差异。"""
+    counts = _counts_for(200.0)
+    h, _cam, detect, sock = _make(
+        poses_list=[_trial_pose(0.0, 0.0), _trial_pose(100.0, 0.0),
+                    _trial_pose(200.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts)]})     # 没有 coast_enc ⇒ STREAM 无回复
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True and res["coast_read_failed"] is True
+    assert any("coast_read_failed" in w for w in res["warnings"])
+    assert "coast_counts" not in res
+    assert res["odometry_delta"]["dist_mm"] == pytest.approx(200.0, abs=1.0)  # 退回只积 D 行
+    assert "STREAM 0\n" in sock.sent                     # 失败路径也要把空闲流关掉
+
+
+def test_read_idle_enc_picks_newest_not_last_line(monkeypatch):
+    """`_read_idle_enc` 必须挑**计数最大**的那条 `I` 行，不是最后收到的那条。
+
+    真机上车停着不动也会持续发 `I` 行，而链路上还可能淌着 RUN 之前残留的旧 `I` 行
+    （R62 那类陈旧读数的亲戚）。它们到达的顺序和计数的大小**无关** —— 这里就是
+    "新行先到、旧行后到"。挑最后一条会选中陈旧读数：要么被 `coasted_samples` 的单调性
+    守卫当噪声丢掉（滑行量丢失，里程计窗口又短一截），要么更糟：假绿。
+    """
+    fresh = [900, 880, 910, 870]        # 计数更大 = 更新（车只会往前滚）
+    stale = [200, 190, 205, 195]        # RUN 之前残留的旧行，后到
+    sock = FakeSock({"STREAM": [[b"OK STREAM 1\n",
+                                 _i_line(fresh).encode(), _i_line(stale).encode()],
+                               [b"OK STREAM 0\n"]]})
+    h = H.Harness(make_car_link(sock), FakeCamera(()), dict(CALIB))
+
+    got = h._read_idle_enc(h.car_link)
+
+    assert got is not None
+    assert got["enc"] == fresh
+    assert sock.sent == ["STREAM 1\n", "STREAM 0\n"]
+
+
+def test_run_trial_coast_survives_stale_idle_line_arriving_last(monkeypatch):
+    """端到端：陈旧 `I` 行排在新鲜行后面到达，滑行量仍然必须并进来。"""
+    counts_run = _counts_for(300.0)
+    counts_coast = _counts_for(450.0)
+    stale = _counts_for(120.0)                   # 比 RUN 期间还小 ⇒ 一定是陈旧行
+    h, _cam, detect, _sock = _make(
+        poses_list=[_trial_pose(0.0, 0.0), _trial_pose(150.0, 0.0),
+                    _trial_pose(450.0, 0.0)],
+        replies={"PING": [[b"PONG\n"]], "STOP": _stop_replies(2),
+                 "RUN": [_trial_run_script(counts_run, last_pwm=[0, 0, 0, 0])],
+                 "STREAM": [[b"OK STREAM 1\n",
+                             _i_line(counts_coast).encode(),
+                             _i_line(stale).encode()],
+                            [b"OK STREAM 0\n"]]})
+    monkeypatch.setattr(H, "detect_markers", detect)
+
+    res = h.run_trial(matrix.EXPERIMENTS[0], settle_before_start_s=0.0,
+                      settle_after_done_s=0.0)
+
+    assert res["ok"] is True and res["warnings"] == []
+    assert res["coast_read_failed"] is False
+    assert res["coast_counts"] == [b - a for a, b in zip(counts_run, counts_coast)]
+    assert res["odometry_delta"]["dist_mm"] == pytest.approx(450.0, abs=2.0)

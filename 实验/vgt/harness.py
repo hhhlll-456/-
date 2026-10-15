@@ -226,6 +226,16 @@ DEFAULT_MID_FRACTION = 0.5
 # （main.cpp:400-401），同一 recv 批次可能读不到，漏了就会把上一轮的证据弄脏。
 _PROBE_TAIL_DRAIN_S = 0.2
 
+# R66：RUN 到时停车后车会**自由滑行** —— 固件 `stopAll()` 是把两个 IN 都写 0
+# （main.cpp:132-138），那是"惯性滑行"不是"短接刹车"，固件里没有刹车命令。
+# 而 `D` 行随停车一起停（main.cpp:693-696），滑行期间编码器还在计数却没有人报；
+# 视觉的终点帧却在 `settle_after_done_s` 之后才抓，把滑行量进去了。两个窗口不一样长
+# （实测滑行量是通电量的 1.5~1.7 倍），`odometry_delta` 就系统性少报 —— 看着像
+# "c1 标错了 2.7×"，其实 c1 是对的（真机复标：1295 vs 标定 1274，差 1.6%）。
+# 所以停车后要补读一次空闲（`STREAM 1` 的 `I` 行）编码器累计值，把滑行并进里程计。
+_COAST_ENC_TIMEOUT_S = 0.5        # 读完这几行就够；读不到是非致命的（但要出声）
+_COAST_ENC_LINES = 3
+
 # 里程计标定常量（Task 9 的 `integrate_encoders` 要求显式传参；真机默认值在这）。
 # 出处：`c_1rev` = `固件/exp/data/wheelmap_{airborne,grounded}.json` 的实测值；
 # `sign` = spec §2.3 的 forward 符号；`LXY=(轴距+轮距)/2=128.25 mm` 是**固件值**
@@ -329,6 +339,53 @@ def body_command(err_x_mm, err_y_mm, yaw_deg, *,
     c, s = math.cos(th), math.sin(th)
     ux, uy = ex / d, ey / d
     return (speed * (ux * c - uy * s), speed * (-ux * s - uy * c))
+
+
+def coasted_samples(samples, coast):
+    """把「DONE 之后的惯性滑行」并进**积分用**的样本序列（R66）。
+
+    固件在 RUN 到时的那一刻 `stopAll()`（main.cpp:693），补发最后一条 `D` 样本，
+    再发 `DONE` —— **`D` 行到此为止**，可车还在滑、编码器还在计数，只是没人报。
+    视觉的终点帧却在 `settle_after_done_s` 之后才抓，把滑行量进去了。两个窗口不一样
+    长，`odometry_delta` 就系统性少报（实测滑行量是通电量的 1.5~1.7 倍）——
+    看着像"c1 标错了 2.7×"，其实 c1 是对的。把停车后读到的累计计数补成最后一个样本，
+    两个窗口就一样长了（真机同一发脉冲：补前 111.9/110.3 = 1.01）。
+
+    两处必须做对，少一个就是**静默空操作**：
+
+    1. `integrate_encoders` 的方向取自 `sgn(pwm[k-1])`，而固件停车补发的那条样本
+       `pwm` 全 0（`pwm_last=[0,0,0,0]`）⇒ `sgn(0)=0` ⇒ 滑行段的位移会被整段判成 0。
+       所以最后一条 `D` 样本在**积分用的副本**里要带上本段 RUN 的行进方向
+       （滑行方向 = 停车前的运动方向）。
+    2. 单调性：编码器只增不减。补进来的读数必须**逐轮 ≥** 最后一条 `D` 样本，否则
+       宁可原样返回 —— 递减会让 `integrate_encoders` 抛 `ValueError`，把整条实验判死。
+       不满足最常见的原因是读到了一条 RUN 之前残留的旧 `I` 行（R62 那类陈旧读数的
+       亲戚），丢掉它比让整条实验报废好。
+
+    `coast`：`{"enc": [4 int], "rpy": [3 float] | None}`（`_read_idle_enc` 的输出）。
+    返回**新列表**；`samples` 不足两条、`coast` 为 None 或读数不可信时，返回 `samples`
+    本身（调用方可以用 `is` 判有没有并进去）。
+    """
+    if coast is None or len(samples) < 2:
+        return samples
+    enc = [int(v) for v in (coast.get("enc") or [])]
+    last = samples[-1]
+    if len(enc) != 4 or any(b < a for a, b in zip(last["enc"], enc)):
+        return samples
+    # 行进方向：往前找最后一条有非零 pwm 的 D 样本（固件停车补发的那条 pwm 全 0）。
+    direction = None
+    for s in reversed(samples):
+        if any(int(v) != 0 for v in s["pwm"]):
+            direction = [int(v) for v in s["pwm"]]
+            break
+    if direction is None:                       # 整段 RUN 都没转过：没有方向可言
+        return samples
+    if not any(int(v) != 0 for v in last["pwm"]):
+        last = dict(last, pwm=list(direction))  # 只改积分用的副本，不改调用方的 samples
+    coast_rpy = coast.get("rpy") or last["rpy"]
+    return (list(samples[:-1]) + [last]
+            + [{"t_ms": int(last["t_ms"]), "pwm": list(direction), "enc": enc,
+                "rpy": [float(v) for v in coast_rpy], "synthetic": "coast"}])
 
 
 def body_delta_to_field(dx_mm, dy_mm, yaw_deg):
@@ -805,6 +862,10 @@ class Harness:
             "odometry_delta": None,
             "samples": samples,
             "n_samples": 0,
+            # R66：停车后补读编码器（量惯性滑行）的结果。`None` = 这一步没走到
+            # （起点帧就失败之类）；`True` = 走了但读不到/读数不可信，此时
+            # `odometry_delta` 的窗口短于 `vision_delta`，两者不可直接比。
+            "coast_read_failed": None,
             "mid_capture_failed": False,
             "sign_ok": None,
             "sign_dot_mm2": None,
@@ -856,8 +917,11 @@ class Harness:
             raise pending
 
         # 收尾 STOP 之后统一算指标：失败条目也带上能算的证据（Task 12 要标注行）。
+        # R66：`_odo_samples` 是 `_trial_body` 备好的"含惯性滑行"的积分副本；None =
+        # 没读到/读数不可信，退回只积固件 `D` 行（此时已记过 warning，不是静默降级）。
         self._trial_metrics(result, samples, c_1rev=c_1rev, sign=sign,
-                            l_xy_over_r=l_xy_over_r, r_eff_mm=r_eff_mm)
+                            l_xy_over_r=l_xy_over_r, r_eff_mm=r_eff_mm,
+                            odo_samples=result.pop("_odo_samples", None))
         if result["reason"] is None and result["sign_ok"] is False:
             # 有符号判据：量级对、方向反 —— 只比 dist_mm 会静默通过的那一类。
             result["reason"] = "sign_mismatch"
@@ -988,6 +1052,32 @@ class Harness:
             result["reason"] = "no_telemetry"
             return
 
+        # ⑥ R66：补读停车后的编码器，把惯性滑行并进里程计窗口（见 `coasted_samples`）。
+        #    **必须放在终点帧之后**：车已停、计数已冻结，这一读覆盖的时段才包住
+        #    视觉的终点帧，两个窗口才算一样长。
+        coast = self._read_idle_enc(self.car_link)
+        if coast is None:
+            result["coast_read_failed"] = True
+            warns.append(
+                "coast_read_failed：停车后读不到空闲编码器（`STREAM 1` 的 `I` 行）。"
+                "本次 `odometry_delta` 只覆盖电机通电期，比把滑行也量进去的 "
+                "`vision_delta` 短一截（停车是自由滑行，固件没有刹车），两者不可直接比。")
+            result["_odo_samples"] = None
+            return
+        result["coast_read_failed"] = False
+        result["coast_enc"] = list(coast["enc"])
+        merged = coasted_samples(samples, coast)
+        if merged is samples:
+            warns.append(
+                f"coast_read_discarded：停车后读到的编码器 {list(coast['enc'])} 不比最后"
+                f"一条 D 样本 {list(samples[-1]['enc'])} 大（或本段没转过）—— 读数不可信，"
+                "丢弃（多半是 RUN 之前的旧 I 行）。本次里程计窗口仍短于视觉窗口。")
+            result["_odo_samples"] = None
+        else:
+            result["coast_counts"] = [b - a for a, b
+                                      in zip(samples[-1]["enc"], coast["enc"])]
+            result["_odo_samples"] = merged
+
     def _probe_resets(self):
         """在当前链路上 PING 一次（探活），并把回复连同 RESET 行收干净。
 
@@ -1010,6 +1100,53 @@ class Harness:
             pass
         return {text for _wall, text in self.reset_lines[marker:]}
 
+    def _read_idle_enc(self, link, *, timeout_s=_COAST_ENC_TIMEOUT_S,
+                       max_lines=_COAST_ENC_LINES):
+        """读一次**空闲**（非 RUN）编码器累计值：`STREAM 1` → 收 `I` 行 → `STREAM 0`。
+
+        RUN 之外固件只在 `stream_idle` 打开时发样本（main.cpp:698-699），所以这是
+        停车后唯一能拿到编码器的途径 —— R66 用它量惯性滑行。
+
+        返回 `{"enc": [4 int], "rpy": [3 float] | None}`，或 `None`（发不出去 / 链路
+        读失败 / 没收到合法 `I` 行）。**非致命**：调用方只记 warning，不改 `reason`。
+
+        取**已收到的那几行里 `sum(enc)` 最大的一条**：车已停、计数只增，最大的一条就是
+        最新的；顺带挡掉一条 RUN 之前残留的旧 `I` 行（它的计数更小）。
+
+        `STREAM 0` 在**任何**返回路径上都会发：留着空闲流会让之后的每条命令回复都掺
+        `I` 行，把 `_wait_reply` 的预期对齐弄歪。
+        """
+        try:
+            self._send_line(link, "STREAM 1")
+        except Exception:
+            return None
+        found: list[dict] = []
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            try:
+                lines, resets = self._drain(link, _RECV_POLL_S)
+            except ConnectionError:
+                break
+            if resets:
+                self._record_resets(resets)
+            new = odometry.parse_telemetry(lines, tags=("I",))
+            found.extend(new)
+            if len(found) >= max_lines:
+                break
+            if found and not new:
+                break        # 已经有读数、这一轮又没有新的 —— 够了，别空转到超时
+            time.sleep(0.005)
+        try:                                    # 关掉空闲流（成败都关）
+            self._send_line(link, "STREAM 0")
+            self._wait_reply(link, "OK STREAM", self.reply_timeout_s)
+        except Exception:
+            pass
+        if not found:
+            return None
+        best = max(found, key=lambda s: sum(s["enc"]))
+        return {"enc": [int(v) for v in best["enc"]],
+                "rpy": [float(v) for v in best["rpy"]]}
+
     def _reconnect_or_raise(self, events, phase):
         """STOP 未确认时的强制恢复：关旧链路 → 重连（握手 + STOP）。失败抛 `StopFailed`。
 
@@ -1027,14 +1164,21 @@ class Harness:
         self.car_link = new_link
         events.append({"event": phase, "ok": True, "reconnected": True})
 
-    def _trial_metrics(self, result, samples, *, c_1rev, sign, l_xy_over_r, r_eff_mm):
-        """把样本积成里程计位移，并算净位移/净转角与有符号判据（纯计算，不碰 I/O）。"""
+    def _trial_metrics(self, result, samples, *, c_1rev, sign, l_xy_over_r, r_eff_mm,
+                       odo_samples=None):
+        """把样本积成里程计位移，并算净位移/净转角与有符号判据（纯计算，不碰 I/O）。
+
+        `odo_samples`：**只喂给积分**的样本序列（默认 `samples`）。R66 用它把停车后的
+        惯性滑行补进来，好让里程计窗口和视觉窗口一样长（见 `coasted_samples`）；
+        `result["samples"]` 里保留的仍是固件原样的 `D` 行，不掺合成样本。
+        """
         result["n_samples"] = len(samples)
+        odo_in = samples if odo_samples is None else odo_samples
         odo_last = None
-        if len(samples) >= 2:
+        if len(odo_in) >= 2:
             try:
                 traj = odometry.integrate_encoders(
-                    samples, c_1rev=c_1rev, sign=sign,
+                    odo_in, c_1rev=c_1rev, sign=sign,
                     l_xy_over_r=l_xy_over_r, r_eff_mm=r_eff_mm)
             except ValueError as exc:
                 result["warnings"].append(f"里程计积分失败：{exc}")

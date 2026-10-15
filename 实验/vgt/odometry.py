@@ -79,18 +79,24 @@ import math
 import numpy as np
 
 
-def parse_telemetry(lines):
+def parse_telemetry(lines, tags=("D",)):
     """把固件 `D` 行解析成样本字典列表（顺序保持；非法行跳过）。
 
     返回 `{"t_ms": int, "pwm": [4 int], "enc": [4 int], "rpy": [3 float]}`。
-    只认 `D ` 开头、恰好 13 个字段、数字都能转的行：
-    `DONE`、`OK RUN ...`、空闲的 `I` 行、空行、字段缺失或数字坏掉的行一律跳过
+    只认 `tags` 里的行头（默认 `D`）、恰好 13 个字段、数字都能转的行：
+    `DONE`、`OK RUN ...`、别的行头、空行、字段缺失或数字坏掉的行一律跳过
     （live 流里这些都是噪声，不该让整批数据报废）。
+
+    `tags`：行头白名单。**空闲样本**要用 `("I",)` —— 固件在非 RUN 期间发的
+    `I` 行字段与 `D` 行完全同形（`main.cpp` 的 `streamSample("I", millis())`），
+    只有 `t_ms` 是 `millis()` 而不是 RUN 相对时间、`pwm` 恒为停车后的 0。
+    R66 读停车后的惯性滑行计数就靠它（见 `harness.coasted_samples`）。
     """
+    wanted = frozenset(tags)
     samples = []
     for line in lines:
         parts = line.split()
-        if not parts or parts[0] != "D" or len(parts) != 13:
+        if not parts or parts[0] not in wanted or len(parts) != 13:
             continue
         try:
             t_ms = int(parts[1])

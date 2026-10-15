@@ -97,6 +97,27 @@ def test_parse_telemetry_skips_malformed_and_idle_lines():
     assert s[0]["t_ms"] == 7 and s[0]["rpy"] == [0.5, -0.5, 1.25]
 
 
+def test_parse_telemetry_accepts_idle_lines_when_asked():
+    """`tags=("I",)`：R66 读"停车后的惯性滑行"要靠空闲行（固件 `streamSample("I",
+    millis())`，`main.cpp:698`），它与 `D` 行同形、只有行头不同。
+
+    默认 `("D",)` 必须**照旧不认** `I` 行（否则 RUN 期间淌进来的空闲行会混进
+    里程计序列），所以要显式传 tags。
+    """
+    lines = [
+        "D 10 -57 53 -73 49 100 200 300 400 1.0 2.0 3.0",
+        "I 123456 0 0 0 0 700 640 721 655 0.00 0.00 0.00",
+    ]
+    assert [s["t_ms"] for s in odometry.parse_telemetry(lines)] == [10]
+    idle = odometry.parse_telemetry(lines, tags=("I",))
+    assert len(idle) == 1
+    assert idle[0]["t_ms"] == 123456
+    assert idle[0]["enc"] == [700, 640, 721, 655]
+    assert idle[0]["pwm"] == [0, 0, 0, 0]
+    # 行头白名单可以同时给两个
+    assert len(odometry.parse_telemetry(lines, tags=("D", "I"))) == 2
+
+
 def test_parse_telemetry_preserves_types_and_order():
     s = odometry.parse_telemetry([
         "D 10 -57 53 -73 49 100 200 300 400 1.0 2.0 3.0",
