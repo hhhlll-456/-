@@ -1,18 +1,22 @@
-// 主机端回归锁：把 固件/exp/src/main.cpp 的环形缓冲逻辑原样拷出来，用小 CAP 跑单元测试。
+// 主机端回归锁：把 固件/exp/src/main.cpp 的环形缓冲 + TX 路径逻辑原样拷出来，用小 CAP 跑单元测试。
 // 目的：烧录前先证明「回绕不覆盖未发数据」「三个复位点必须两个游标一起清零」，并演示
-// 不对称复位（只清一个游标）的真实后果 —— **覆盖未发数据**（不是"判满、静默丢弃"）。
+// 不对称复位（只清一个游标）的真实后果 —— **覆盖未发数据**（不是"判满、静默丢弃"）；
+// R64 起还锁「send() 硬错误立刻踢 / 软错误等 5 s 阈值」（见拷贝块 2/3）。
 //
-// 【这是拷贝，不是共享代码】下面标注"拷贝自 main.cpp"的 4 个函数 + 相关变量必须与
+// 【这是拷贝，不是共享代码】下面标注"拷贝自 main.cpp"的 6 个函数 + 相关变量必须与
 // main.cpp 的逻辑逐字一致（只允许两类替换：CAP 换成小值、client/send/millis 换成假依赖）。
-// 拷贝块 1：环形缓冲（resetRunBuf / runPushLine / flushRunBuf）；
-// 拷贝块 2：TX 停摆看门狗（checkTxStall，R62 —— "环里有积压且 >2s 没发出一个字节 = 僵尸"）。
-// 改了 main.cpp 的这两块，必须同步改这里，否则这条锁会腐烂成"永远绿"的假锁 ——
-// 变异自检（run.sh 第 2 步）只兜底不复位一处。
+// 拷贝块 1：环形缓冲（resetRunBuf / runPushLine）及其变量；
+// 拷贝块 2：发送路径（txSendNonBlocking：TX_SEND_OK/SOFT/HARD 三分类）；
+// 拷贝块 3：丢弃 + 看门狗（dropFakeTxClient ≈ dropTxClient / flushRunBuf 的环部分 / checkTxStall）——
+//   "硬错误立刻踢、软错误 >5s 才踢"。
+// 改了 main.cpp 的这几块，必须同步改这里，否则这条锁会腐烂成"永远绿"的假锁 ——
+// 变异自检（run.sh 第 2 步）只兜底三类回归，不能代替同步。
 //
 // 为什么 CAP 取 40（真实是 32768）：让"回绕"和"缓冲满"在几十行内反复发生，测试才有杠杆。
 // 一行 8 B × 一批 5 行 = 40 B 恰好等于 CAP —— 顺便锁住"一整批必须能整批放下"这个边界。
 //
 // 用法：bash 固件/exp/host_test/run.sh   （纯 g++，不需要 PlatformIO / 硬件）
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -45,33 +49,80 @@ static bool runPushLine(const char* s, size_t len) {
   return true;
 }
 
-// —— 假 socket：等价于 main.cpp 的 txSendNonBlocking（send(MSG_DONTWAIT)）——
-// 真实现"能写就写一部分、写不动立刻返回 0"；这里用"每次 flushRunBuf 给一份字节额度"复现：
-// 额度内尽量写、用完即返回 0（模拟 socket TX 满）。写出去的字节追加到 wire（TCP 是字节流）。
-// 与 main.cpp 相同：只有真的写出字节（w>0）才刷新看门狗时间戳（见下一块拷贝）。
-static const uint32_t TX_STALL_MS = 2000;            // 拷贝自 main.cpp（看门狗阈值）
+// —— 假 socket：等价于 main.cpp 的 send(MSG_DONTWAIT) ——
+// 真实现"能写就写一部分、写不动/写失败立刻返回"；这里用"每次 flushRunBuf 给一份字节额度"
+// 复现：额度内尽量写、用完即写 0（模拟零窗口）。写出去的字节追加到 wire（TCP 是字节流）。
+// R64：fake_send 失败时置**真 errno**，让下面 txSendNonBlocking 拷贝里与 main.cpp 同一套
+// errno case 真正被执行 —— 否则"软错误被误判成硬错误"这类回归在测试里根本触发不到。
+static const uint32_t TX_STALL_MS = 5000;            // 拷贝自 main.cpp（看门狗阈值）
 static uint32_t tx_last_ok_ms = 0;                   // 拷贝自 main.cpp（最近成功写出字节的时刻）
 static uint32_t fake_now_ms = 0;                     // 主机侧假时钟（替代 millis()）
 static uint32_t fakeMillis() { return fake_now_ms; }
 
-static bool        fake_connected    = true;         // 等价 client.connected()
+static bool        fake_connected    = true;         // 等价 client.connected()（operator bool 也等于它）
 static long        fake_budget_cap   = 1L << 30;     // 每次 flush 的可用额度（等价"总能写"）
 static long        fake_budget       = 0;
+static int         fake_fd           = 3;            // 等价 client.fd()
+static int         fake_send_errno   = 0;            // 非 0：模拟 send() 返回 -1 并置 errno（EPIPE=硬 / EAGAIN=软）
 static int         dropped_reported  = 0;            // 等价 main.cpp flush 时对 Serial 的上报
 static std::string wire;                             // 收到的全部字节
 static const size_t FAKE_WIRE_LIMIT  = 100000;       // 假 socket 的收端总量上限
 
-static size_t fakeSendNonBlocking(const uint8_t* p, size_t n) {
+static int fake_send(int fd, const void* p, size_t n) {   // main.cpp: send(fd, p, n, MSG_DONTWAIT)
+  (void)fd;
+  if (fake_send_errno) { errno = fake_send_errno; return -1; }   // 等价 send() 失败
   size_t w = 0;
-  if (wire.size() >= FAKE_WIRE_LIMIT) return 0;      // 收端不再吞吐（等价 socket 彻底卡住）
   if (fake_connected && fake_budget > 0) {
     w = ((long)n < fake_budget) ? n : (size_t)fake_budget;
     if (wire.size() + w > FAKE_WIRE_LIMIT) w = FAKE_WIRE_LIMIT - wire.size();
     fake_budget -= (long)w;
     wire.append((const char*)p, w);
   }
-  if (w > 0) tx_last_ok_ms = fakeMillis();           // main.cpp: 只有真写出字节才算 TX 活着
-  return w;
+  return (int)w;               // 0 = 零窗口（额度 0 / 收端不再吞吐）
+}
+
+// ===== 拷贝自 main.cpp 的发送路径（txSendNonBlocking，R64 三分类）=====
+// 逐字同构；替换：client → fake_connected、client.fd() → fake_fd、send → fake_send、
+// millis() → fakeMillis()。errno 的 switch 保持原样（用真 errno）。
+enum TxSend : uint8_t { TX_SEND_OK, TX_SEND_SOFT, TX_SEND_HARD };
+
+static TxSend txSendNonBlocking(const uint8_t* p, size_t n, size_t* sent) {
+  *sent = 0;
+  if (n == 0) return TX_SEND_SOFT;                          // 见 main.cpp：没发出字节就不算成功（否则调用方空转）
+  if (!fake_connected) return TX_SEND_HARD;                 // main.cpp: if (!client || !client.connected())
+  int fd = fake_fd;                                         // main.cpp: int fd = client.fd();
+  if (fd < 0) return TX_SEND_HARD;                          // 没有有效 fd：没东西可发
+  errno = 0;                                                // 防残留：w<0 时立刻读 errno
+  int w = fake_send(fd, p, n);                              // main.cpp: int w = send(fd, p, n, MSG_DONTWAIT);
+  if (w > 0) { tx_last_ok_ms = fakeMillis(); *sent = (size_t)w; return TX_SEND_OK; }
+  if (w == 0) return TX_SEND_SOFT;                          // 0 字节被接受（空间不足）：可自愈，别砍
+  switch (errno) {
+    case EAGAIN:      // == EWOULDBLOCK（lwip）：对端零窗口 / 本端无缓冲
+    case EINTR:       // 被信号打断：重试即可
+    case ENOBUFS:     // lwip ERR_BUF（对端停读时常见）：暂时缺缓冲，不是连接死
+    case ENOMEM:      // lwip ERR_MEM：同上
+      return TX_SEND_SOFT;
+    default:          // EPIPE/ECONNRESET/ENOTCONN/ECONNABORTED…：连接确实死了
+      return TX_SEND_HARD;
+  }
+}
+
+// ===== 拷贝自 main.cpp 的丢弃路径（dropTxClient）+ 环 flush（flushRunBuf）=====
+static bool fake_client_stopped = false;   // client.stop() 的代理：停掉后 connected() 即 false
+static int  fake_watchdog_fires = 0;       // 记录踢连接次数（硬错误与超时都算）
+static bool fake_running        = false;
+static bool fake_ramp_active    = false;
+
+static void fakeClientStop() { fake_client_stopped = true; fake_watchdog_fires++; fake_connected = false; }
+static void fakeStopAll()    {}
+
+static void dropFakeTxClient(const char* why) {          // main.cpp: dropTxClient
+  (void)why;                                             // main.cpp 此处 Serial.printf 上报 why 与 pending
+  fakeClientStop();                                      // main.cpp: client.stop()
+  resetRunBuf();
+  fake_running = false;
+  fake_ramp_active = false;
+  fakeStopAll();                                         // main.cpp: stopAll()
 }
 
 void flushRunBuf() {
@@ -83,8 +134,10 @@ void flushRunBuf() {
       size_t pos   = (run_tail + off) % RUN_BUF_CAP;
       size_t chunk = RUN_BUF_CAP - pos;
       if (chunk > pend - off) chunk = pend - off;
-      size_t w = fakeSendNonBlocking((const uint8_t*)(run_buf + pos), chunk);
-      if (w == 0) break;
+      size_t w = 0;
+      TxSend r = txSendNonBlocking((const uint8_t*)(run_buf + pos), chunk, &w);
+      if (r == TX_SEND_HARD) { dropFakeTxClient("send() hard error"); return; }
+      if (r != TX_SEND_OK) break;
       off += w;
     }
     run_tail += off;
@@ -94,27 +147,13 @@ void flushRunBuf() {
     if (run_dropped) { dropped_reported += run_dropped; run_dropped = 0; }   // main.cpp 此处 printf 上报
   }
 }
-// ===== 拷贝自 main.cpp 的 TX 停摆看门狗（checkTxStall，R62）=====
+// ===== 拷贝自 main.cpp 的 TX 停摆看门狗（checkTxStall，R62/R64）=====
 // 触发条件与 main.cpp 逐字同构；只把依赖换成假对象：
-//   millis() → fakeMillis()      Serial.printf → 无
-//   client.stop() → fakeClientStop()   stopAll() → fakeStopAll()
-//   running / ramp_active → fake_running / fake_ramp_active
-static bool fake_client_stopped = false;   // client.stop() 的代理：停掉后 connected() 即 false
-static int  fake_watchdog_fires = 0;       // 记录触发次数
-static bool fake_running        = false;
-static bool fake_ramp_active    = false;
-
-static void fakeClientStop() { fake_client_stopped = true; fake_watchdog_fires++; }
-static void fakeStopAll()    {}
-
+//   millis() → fakeMillis()      dropTxClient → dropFakeTxClient（后者含 client.stop() 与停车的假代理）
 void checkTxStall() {
   if (run_head == run_tail) { tx_last_ok_ms = fakeMillis(); return; }   // 环空：不判停摆
-  if ((uint32_t)(fakeMillis() - tx_last_ok_ms) <= TX_STALL_MS) return;  // 2s 内还有字节出去
-  fakeClientStop();      // main.cpp: Serial.printf(...) + client.stop()
-  resetRunBuf();
-  fake_running = false;
-  fake_ramp_active = false;
-  fakeStopAll();
+  if ((uint32_t)(fakeMillis() - tx_last_ok_ms) <= TX_STALL_MS) return;  // 5s 内还有字节出去
+  dropFakeTxClient("stall >5s");     // main.cpp: dropTxClient("stall >5s")
 }
 // ===== 拷贝结束（以下为测试脚手架）=====
 
@@ -229,14 +268,15 @@ int main() {
   check(calls == 10, "40 字节 / 每次 4 字节 = 正好 10 次 flushRunBuf 才发干净");
   check(dropped_reported == 0, "部分写不会误判成缓冲满");
 
-  // ---- T7 TX 停摆看门狗（R62）：健康流式不误触；停摆 >2 s 判僵尸 → stop + 清环 + 停车 ----
-  printf("T7 TX 停摆看门狗（checkTxStall）：健康不误触 / 停摆 >2s 判僵尸\n");
+  // ---- T7 TX 路径（R62/R64）：健康不误触；软错误等 5 s 阈值；硬错误立刻踢 ----
+  printf("T7 TX 路径（R64）：健康不误触 / 软错误等 5s 阈值 / 硬错误立刻踢\n");
   resetRunBuf(); wire.clear();
   fake_connected = true; fake_budget_cap = 16; dropped_reported = 0;
   fake_now_ms = 0; tx_last_ok_ms = 0; fake_watchdog_fires = 0;
   fake_client_stopped = false; fake_running = true; fake_ramp_active = true;
+  fake_send_errno = 0; fake_fd = 3;
 
-  // 健康但"慢"的流式：生产 8 B/50 ms，每 5 ms 一次 flush 发 ≤16 B ——
+  // (a) 健康但"慢"的流式：生产 8 B/50 ms，每 5 ms 一次 flush 发 ≤16 B ——
   // 吞吐不宽裕但**持续有字节出去**，看门狗绝不能触发（跑 10 s）。
   for (int i = 1, t = 0; t <= 10000; t += 5) {
     fake_now_ms = (uint32_t)t;
@@ -247,35 +287,95 @@ int main() {
   check(fake_watchdog_fires == 0, "健康慢速流式 10 s：0 次误触发");
   check(run_head == run_tail && run_pending == 0, "健康流式：每次 flush 后环都排空");
 
-  // 空闲：环里没有未发数据，时间过多久都不判停摆（时间戳被刷新）。
+  // (b) 空闲：环里没有未发数据，时间过多久都不判停摆（时间戳被刷新）。
   resetRunBuf(); fake_now_ms = 20000; tx_last_ok_ms = 0; fake_watchdog_fires = 0;
   for (int t = 20000; t <= 620000; t += 1000) { fake_now_ms = (uint32_t)t; checkTxStall(); }
   check(fake_watchdog_fires == 0, "空闲 10 分钟：0 次误触发（无积压不判停摆）");
 
-  // 僵尸停摆：连接仍"在线"（fake_connected=true）但一个字节都写不出去 —— 正是 R62。
-  fake_budget_cap = 0; fake_watchdog_fires = 0; fake_client_stopped = false;
+  // (c) 软错误（零窗口 / EAGAIN）：连接仍"在线"（connected()=true）但写不动 ——
+  // 绝不能立刻踢；要等满 5 s 阈值（R64：健康链路最长自愈停摆 2.32 s，不能被砍）。
+  fake_send_errno = EAGAIN; fake_budget_cap = 0;
+  fake_watchdog_fires = 0; fake_client_stopped = false;
   int last_ok_ms = (int)fake_now_ms;            // 此刻 TX 还是好的（时间戳新鲜）
   int fired_at = -1;
-  for (int k = 0; k <= 5000; k += 50) {
+  for (int k = 0; k <= 5100; k += 50) {
     fake_now_ms = (uint32_t)(last_ok_ms + k);
     pushLine(mkline(900 + k / 50)); run_pending++;
-    flushRunBuf();                              // budget 0：一个字节也发不出去
+    flushRunBuf();                              // EAGAIN：一个字节也发不出去（软错误）
     checkTxStall();
-    if (k == 2000) check(fake_watchdog_fires == 0, "停摆满 2.000 s：边界未过，尚未触发");
+    if (k == 1000) check(fake_watchdog_fires == 0, "软错误（EAGAIN）停摆 1.000 s：不立刻踢（正确地等阈值）");
+    if (k == 5000) check(fake_watchdog_fires == 0, "软错误停摆满 5.000 s：边界未过，尚未触发");
     if (fake_watchdog_fires) { fired_at = k; break; }
   }
-  check(fired_at == 2050, "停摆后第一个检测点（2.05 s）触发 —— 2 s 阈值边界正确");
+  check(fired_at == 5050, "软错误停摆后第一个检测点（5.05 s）触发 —— 5 s 阈值边界正确");
   check(fake_client_stopped, "触发时调用了 client.stop()（僵尸被踢回可 accept 状态）");
   check(run_head == 0 && run_tail == 0 && run_pending == 0, "触发时清环（resetRunBuf）");
   check(!fake_running && !fake_ramp_active, "触发时停车（running / ramp_active 清零）");
 
-  // 踢掉僵尸后：新会话恢复发送，看门狗不再触发。
-  fake_connected = true; fake_budget_cap = 1L << 30;
-  fake_watchdog_fires = 0; wire.clear();
+  // (d) 软错误第二种形态：send 返回 0（零窗口，与 errno 无关）—— 同样不许立刻踢。
+  resetRunBuf(); fake_connected = true; fake_send_errno = 0; fake_budget_cap = 0;
+  fake_watchdog_fires = 0; fake_client_stopped = false;
+  fake_running = true; fake_ramp_active = true; tx_last_ok_ms = fake_now_ms;
+  pushLine(mkline(8001)); run_pending++;
+  flushRunBuf(); checkTxStall();
+  fake_now_ms += 100; flushRunBuf(); checkTxStall();
+  check(fake_watchdog_fires == 0 && !fake_client_stopped, "软错误（send 写 0 字节）0.1 s：不立刻踢");
+
+  // (d2) n==0：没请求发任何字节 —— 必须报"软"（不能报 OK）。
+  // 报 OK 而 *sent=0 会让 flushRunBuf 的 while(off < pend) 原地空转（看门狗路径上的死循环）。
+  {
+    resetRunBuf(); fake_connected = true; fake_fd = 3;
+    fake_send_errno = EPIPE;               // 哪怕 errno 是硬错误：n==0 根本没发，不该据此判死
+    fake_budget_cap = 1L << 30;
+    fake_watchdog_fires = 0; fake_client_stopped = false;
+    fake_running = true; fake_ramp_active = true;
+    size_t dummy_sent = 12345;
+    check(txSendNonBlocking((const uint8_t*)"X", 0, &dummy_sent) == TX_SEND_SOFT,
+          "n==0 报软错误（返回 OK 会让 flushRunBuf 空转）");
+    check(dummy_sent == 0, "n==0 时 *sent 被清零");
+    // 「没推进游标就 break」的旁证：零窗口时 flush 返回后 run_tail 不动（数据留着下次发），
+    // 而不是原地空转到卡死，也没有误踢连接。
+    fake_send_errno = 0; fake_budget_cap = 0;   // 纯零窗口软错误
+    pushLine(mkline(8002)); run_pending++;
+    flushRunBuf();
+    check(run_head != run_tail && run_tail == 0, "零窗口：游标未推进（无进展即 break，没有空转）");
+    check(!fake_client_stopped && fake_watchdog_fires == 0, "零窗口：不踢连接、也不触发看门狗");
+    resetRunBuf();
+  }
+
+  // (e) 硬错误：连接"看起来还在"（connected() 仍 true —— 正是僵尸态）但 send 报硬错误
+  // —— 必须**立刻**踢，不等 5 s 阈值。EPIPE / ECONNRESET / ENOTCONN / fd<0 四种变体。
+  const char* hard_names[] = {"EPIPE", "ECONNRESET", "ENOTCONN", "fd<0"};
+  for (int v = 0; v < 4; v++) {
+    printf("  硬错误变体：%s（connected() 仍 true，时间戳新鲜）\n", hard_names[v]);
+    resetRunBuf(); wire.clear();
+    fake_connected = true; fake_budget_cap = 1L << 30; fake_fd = 3; fake_send_errno = 0;
+    fake_watchdog_fires = 0; fake_client_stopped = false;
+    fake_running = true; fake_ramp_active = true;
+    tx_last_ok_ms = fake_now_ms;
+    if (v == 0) fake_send_errno = EPIPE;
+    if (v == 1) fake_send_errno = ECONNRESET;
+    if (v == 2) fake_send_errno = ENOTCONN;
+    if (v == 3) fake_fd = -1;
+    pushLine(mkline(7000 + v)); run_pending++;
+    flushRunBuf();                              // 一次发送就吃到硬错误
+    check(fake_watchdog_fires == 1, "硬错误一次 flush 内立刻踢（没踢 = 漏判成软错误）");
+    check(fake_client_stopped, "硬错误踢连接：client.stop()");
+    check(run_head == 0 && run_tail == 0 && run_pending == 0, "硬错误清环");
+    check(!fake_running && !fake_ramp_active, "硬错误停车");
+    check((uint32_t)(fake_now_ms - tx_last_ok_ms) < TX_STALL_MS, "踢发生在阈值远未到时（没有走超时路径）");
+  }
+
+  // (f) 踢掉后：新会话（connected() 恢复）发送立即恢复，看门狗不再多余触发。
+  resetRunBuf(); wire.clear();
+  fake_connected = true; fake_fd = 3; fake_send_errno = 0; fake_budget_cap = 1L << 30;
+  fake_watchdog_fires = 0; fake_client_stopped = false;
+  fake_now_ms += 50;
   pushLine(mkline(7777)); run_pending++;
   flushRunBuf();
-  check(wire.find("L007777") != std::string::npos, "踢掉僵尸后新会话恢复发送");
+  check(wire.find("L007777") != std::string::npos, "踢掉后新会话恢复发送");
   check(tx_last_ok_ms == fake_now_ms, "恢复发送后看门狗时间戳被刷新");
+  check(fake_watchdog_fires == 0, "恢复后没有多余触发");
 
   printf("\n%s (%d failure(s))\n", fails ? "FAILED" : "ALL PASS", fails);
   return fails ? 1 : 0;

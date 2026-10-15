@@ -45,6 +45,7 @@
 #include <ArduinoOTA.h>
 #include <math.h>
 #include <lwip/sockets.h>   // send()/MSG_DONTWAIT：非阻塞发送（见 flushRunBuf）
+#include <errno.h>          // errno：区分 send() 硬/软错误（R64）
 #include <esp_system.h>     // esp_reset_reason()：复位原因回报
 #include "wheel_map.h"
 #include "stagger.h"        // 四轮错峰抬升（防 brownout）
@@ -344,20 +345,60 @@ static bool runPushLine(const char* s, size_t len) {
   return true;
 }
 
-// ---------------- TX 停摆看门狗（R62 防死兜底） ----------------
+// ---------------- TX 停摆看门狗（R62 防死兜底；R64 区分硬/软错误） ----------------
 // 时间戳在 txSendNonBlocking 真正写出字节时刷新；判定逻辑见 checkTxStall。
-static const uint32_t TX_STALL_MS = 2000;   // 连续 >2s 一个字节都没发出去 ⇒ 僵尸
+// 阈值沿革：R62 取 2 s → R64 上机实测健康链路自然停摆 [0.05–2.5 s]（能自愈的最长 2.32 s），
+// 2 s 落在分布内侧 ⇒ 长遥测会话被反复误踢（6.5 分钟里 3 次，长 RUN 丢 99.1 s 遥测）。
+// 5 s ≈ 2× 最长自愈停摆：只兜"真死了"的连接。
+static const uint32_t TX_STALL_MS = 5000;   // 连续 >5s 一个字节都没发出去 ⇒ 僵尸
 static uint32_t tx_last_ok_ms = 0;          // 最近一次 send() 真正写出字节的 millis()
 
-// 非阻塞发送：把数据尽量推给 TCP，满了立刻返回 0，绝不阻塞 loop。
+// send() 结果三分类（R64）。原来所有失败都折成"没发出去"（返回 0），于是
+// 「对端已经没了」（EPIPE/ECONNRESET/ENOTCONN…）与「对端零窗口暂时写不动」
+// （EAGAIN/EWOULDBLOCK）无法区分，只能靠超时猜。分开报之后：
+//   TX_SEND_OK   写出去 >=1 字节（调用方按 *sent 推进游标）
+//   TX_SEND_SOFT 暂时写不动：由 TX_STALL_MS 兜底（错判成硬会在正常零窗口上砍断连接）
+//   TX_SEND_HARD 连接确实死了：立刻丢（漏判成软会退化成"只能靠超时"的旧行为）
+enum TxSend : uint8_t { TX_SEND_OK, TX_SEND_SOFT, TX_SEND_HARD };
+
+// 非阻塞发送：把数据尽量推给 TCP，写不动立刻返回，绝不阻塞 loop。
 // （WiFiClient::write 是 select(1s)×10 的阻塞实现；send(MSG_DONTWAIT) 不会被它冻住。）
-static size_t txSendNonBlocking(const uint8_t* p, size_t n) {
-  if (!client || !client.connected() || n == 0) return 0;
+// *sent 只在 TX_SEND_OK 时非 0；硬/软判据见上面枚举注释。
+static TxSend txSendNonBlocking(const uint8_t* p, size_t n, size_t* sent) {
+  *sent = 0;
+  // n==0 也归"软"：调用方 flushRunBuf 用 `r != OK → break` 决定要不要推进游标，
+  // 返回 OK 却 *sent=0 会让 while(off < pend) 空转 —— 一个字节都没发出去就不该算成功。
+  // （当前 flushRunBuf 的 chunk 恒 >=1，走不到这里；留着是为了不给看门狗路径埋死循环。）
+  if (n == 0) return TX_SEND_SOFT;
+  if (!client || !client.connected()) return TX_SEND_HARD;  // 对端已关（connected() 只探 RX）
   int fd = client.fd();
-  if (fd < 0) return 0;
+  if (fd < 0) return TX_SEND_HARD;                          // 没有有效 fd：没东西可发
+  errno = 0;                                                // 防残留：w<0 时立刻读 errno
   int w = send(fd, p, n, MSG_DONTWAIT);
-  if (w > 0) tx_last_ok_ms = millis();   // 只有真的写出字节才算"TX 还活着"
-  return (w > 0) ? (size_t)w : 0;
+  if (w > 0) { tx_last_ok_ms = millis(); *sent = (size_t)w; return TX_SEND_OK; }  // 真写出字节才算"TX 还活着"
+  if (w == 0) return TX_SEND_SOFT;                          // 0 字节被接受（空间不足）：可自愈，别砍
+  switch (errno) {
+    case EAGAIN:      // == EWOULDBLOCK（lwip）：对端零窗口 / 本端无缓冲
+    case EINTR:       // 被信号打断：重试即可
+    case ENOBUFS:     // lwip ERR_BUF（对端停读时常见）：暂时缺缓冲，不是连接死
+    case ENOMEM:      // lwip ERR_MEM：同上
+      return TX_SEND_SOFT;
+    default:          // EPIPE/ECONNRESET/ENOTCONN/ECONNABORTED…：连接确实死了
+      return TX_SEND_HARD;
+  }
+}
+
+// 连接确实死了（或判定僵尸）：踢 socket + 清环 + 停车，把接受路径踢回可 accept 状态。
+// 两个触发点共用：send() 硬错误（flushRunBuf 里立刻丢，不等阈值）与
+// TX 停摆 >TX_STALL_MS（checkTxStall 里的软错误兜底）。
+static void dropTxClient(const char* why) {
+  Serial.printf("[tx] drop client (%s), ring cleared (pending=%u B)\n",
+                why, (unsigned)(run_head - run_tail));
+  client.stop();
+  resetRunBuf();
+  running = false;
+  ramp_active = false;
+  stopAll();      // 停车：TX 死掉期间 PC 已看不到遥测，而 M 没有超时，绝不能继续开环输出
 }
 
 // 把还没 flush 的字节尽量推给 TCP，绝不阻塞。只推进真正写出去的部分，
@@ -370,8 +411,10 @@ void flushRunBuf() {
       size_t pos   = (run_tail + off) % RUN_BUF_CAP;
       size_t chunk = RUN_BUF_CAP - pos;
       if (chunk > pend - off) chunk = pend - off;
-      size_t w = txSendNonBlocking((const uint8_t*)(run_buf + pos), chunk);
-      if (w == 0) break;
+      size_t w = 0;
+      TxSend r = txSendNonBlocking((const uint8_t*)(run_buf + pos), chunk, &w);
+      if (r == TX_SEND_HARD) { dropTxClient("send() hard error"); return; }  // 连接死了：立刻踢，不等阈值
+      if (r != TX_SEND_OK) break;                                             // 软错误：留着下次接着发
       off += w;
     }
     run_tail += off;
@@ -385,25 +428,21 @@ void flushRunBuf() {
   }
 }
 
-// TX 停摆看门狗（每轮 loop 在 flushRunBuf 之后调用）——R62 的防死兜底：
+// TX 停摆看门狗（每轮 loop 在 flushRunBuf 之后调用）—— R62 的防死兜底，R64 拆成两档：
 // 背景：这条 socket 会进入「TCP 层连着、send() 已不成功」的僵尸态（射频层正常；
 // 停读/接收窗口关死等场景实测可确定复现）。WiFiClient::connected() 只探测 RX
 // （recv(fd,&dummy,0)），完全不看 TX —— 僵尸态下它仍返回 true，于是：
 //   1) flushRunBuf 反复尝试、一个字节都发不出去 → 环被新样本填满，DONE/控制行一起被丢；
 //   2) 接受路径 `if (!client.connected())` 永不成立 → 新连接永不被 accept（堵死到复位）。
-// 兜底：环里有未发出的数据、且连续 >TX_STALL_MS 一个字节都没成功发出去 ⇒ 判僵尸，
-// client.stop()（把接受路径踢回可 accept 状态）+ 清环 + 停车。
+// 兜底分两档（判据见 txSendNonBlocking 的三分类）：
+//   - 硬错误（EPIPE/ECONNRESET/ENOTCONN…）：flushRunBuf 里**立刻** dropTxClient，不等阈值；
+//   - 软错误（EAGAIN 零窗口等）：本函数按 TX_STALL_MS 判僵尸。阈值 5 s 的依据：
+//     R64 实测健康链路自然停摆最长 2.32 s（且之后自行排空），2 s 会误踢，5 s ≈ 2× 余量。
 // 正常 100 Hz 流式（健康 socket）每批都发得出去，时间戳一直新鲜，绝不会误触发。
 void checkTxStall() {
   if (run_head == run_tail) { tx_last_ok_ms = millis(); return; }   // 环空：没有可判停摆的量
-  if ((uint32_t)(millis() - tx_last_ok_ms) <= TX_STALL_MS) return;  // 2s 内还有字节出去
-  Serial.printf("[tx] stall >2s: drop zombie client, ring cleared (pending=%u B)\n",
-                (unsigned)(run_head - run_tail));
-  client.stop();
-  resetRunBuf();
-  running = false;
-  ramp_active = false;
-  stopAll();      // 停车：TX 死掉期间 PC 已看不到遥测，而 M 没有超时，绝不能继续开环输出
+  if ((uint32_t)(millis() - tx_last_ok_ms) <= TX_STALL_MS) return;  // 5s 内还有字节出去
+  dropTxClient("stall >5s");      // 软错误长时间不退 ⇒ 判僵尸（硬错误在 flushRunBuf 里已立刻处理）
 }
 
 // 所有出站文本统一走 run 环形缓冲 + 非阻塞 flush：
