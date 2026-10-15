@@ -735,6 +735,97 @@ def test_locate_retries_wait_long_enough_for_the_camera(monkeypatch):
     assert len(pauses) >= 2 and sum(pauses) >= 0.4, f"重试间隔太短：{pauses}"
 
 
+# ------------------------------------------------- 偏航闭环（R71）
+
+def test_expected_yaw_step_matches_the_measured_points():
+    """R71 转角模型：152→7.7°、199→15.8°、211→16~17°、266→22.7°、278→29.7°。
+
+    散点 ±25%（偏航率随地板/摩擦变化），模型偏差 ≤ 14% 且**略微高估**步长 ——
+    宁可脉冲短一点，也别冲过头。
+    """
+    for ms, measured in ((152, 7.7), (199, 15.8), (211, 16.5), (266, 22.7),
+                         (278, 29.7)):
+        assert H.expected_yaw_step_deg(ms) == pytest.approx(measured, rel=0.20), ms
+    assert H.expected_yaw_step_deg(150) == pytest.approx(7.5, abs=1.5)   # kick 地板
+    # 反解：越大要转越久，但地板之下给 150 ms、上限 320 ms
+    assert H.pulse_ms_for_yaw_deg(0.0) == 150
+    assert H.pulse_ms_for_yaw_deg(5.0) == 150
+    assert H.pulse_ms_for_yaw_deg(16.0) == pytest.approx(203, abs=8)
+    assert H.pulse_ms_for_yaw_deg(180.0) == 320
+
+
+def test_align_yaw_converges_and_only_sends_timed_runs(monkeypatch):
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks(), _run_chunks()]},
+                           locate_tries=1)
+    positions = [(0.0, 0.0, 20.0), (0.0, 0.0, 5.0)]     # 20° → 5°（容差 8° 内）
+    h.locate = lambda: positions.pop(0)
+
+    res = h.align_yaw(0.0, tol_deg=8.0, settle_s=0.0)
+
+    assert res["converged"] is True and res["reason"] == "converged"
+    assert res["steps"] == 1 and res["final_yaw"] == pytest.approx(5.0)
+    runs = [s for s in sock.sent if s.startswith("RUN")]
+    assert len(runs) == 1 and runs[0].split()[-1].isdigit()      # 末位是 ms（有超时）
+    assert "STOP" in sock.sent[-1]                               # 收尾 STOP
+
+
+def test_align_yaw_sign_convention_and_step_directions(monkeypatch):
+    """yaw > 目标 ⇒ 用**负** om 把它转回来（`om>0` = 逆时针 = yaw 增大）。"""
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"]] * 6,
+                                    "RUN": [_run_chunks(), _run_chunks()]},
+                           locate_tries=1)
+    positions = [(0.0, 0.0, -20.0), (0.0, 0.0, -5.0)]    # −20° → 需要 +20°（逆时针）
+    h.locate = lambda: positions.pop(0)
+    res = h.align_yaw(0.0, tol_deg=8.0, settle_s=0.0)
+    assert res["converged"] is True
+    om = res["trace"][0]["cmd"][2]
+    assert om > 0.0
+
+
+def test_align_yaw_reports_locate_failure_without_rotating(monkeypatch):
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"]] * 4}, locate_tries=1)
+    h.locate = lambda: None
+
+    res = h.align_yaw(0.0, tol_deg=8.0, settle_s=0.0)
+    assert res["converged"] is False and res["reason"] == "locate_failed"
+    assert res["steps"] == 0 and res["trace"] == []
+    assert [s for s in sock.sent if s.startswith("RUN")] == []
+
+
+def test_align_yaw_gives_up_with_a_named_reason(monkeypatch):
+    """步数用满 ⇒ `max_steps` + 最后 yaw（不许静默算成功）。"""
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"]] * 8,
+                                    "RUN": [_run_chunks()] * 8}, locate_tries=1)
+    h.locate = lambda: (0.0, 0.0, 30.0)          # 永远转不过来的假定位
+
+    res = h.align_yaw(0.0, tol_deg=8.0, max_steps=2, settle_s=0.0)
+    assert res["converged"] is False and res["reason"] == "max_steps"
+    assert res["steps"] == 2 and res["final_yaw"] == pytest.approx(30.0)
+
+
+def test_align_yaw_validates_arguments():
+    h, _, _, sock = _make()
+    with pytest.raises(ValueError):
+        h.align_yaw(0.0, tol_deg=0.0)
+    with pytest.raises(ValueError):
+        h.align_yaw(0.0, max_steps=0)
+    with pytest.raises(ValueError):
+        h.align_yaw(0.0, settle_s=-1.0)
+    assert [s for s in sock.sent if s.startswith("RUN")] == []
+
+
+def test_align_yaw_propagates_boundary_markers_moved(monkeypatch):
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"]] * 4}, locate_tries=1)
+
+    def locate():
+        raise H.BoundaryMarkersMoved("测试：边界码被撞")
+
+    h.locate = locate
+    with pytest.raises(H.BoundaryMarkersMoved):
+        h.align_yaw(0.0, settle_s=0.0)
+
+
 # ------------------------------------------------- 链路失败：判完、看门狗、失控保护
 
 

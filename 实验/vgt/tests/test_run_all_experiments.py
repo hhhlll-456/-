@@ -58,14 +58,16 @@ class FakeCarLink:
 
 class FakeHarness:
     def __init__(self, *, events=None, home_results=(), trial_results=(),
-                 raise_stop_failed=False):
+                 raise_stop_failed=False, yaw_results=()):
         self.events = [] if events is None else events
         self.car_link = FakeCarLink(self.events)
         self.home_results = list(home_results)
         self.trial_results = list(trial_results)
         self.raise_stop_failed = bool(raise_stop_failed)
+        self.yaw_results = list(yaw_results)
         self.drive_targets = []
         self.drive_kwargs = []
+        self.yaw_calls = []
         self.trial_ids = []
 
     def drive_to(self, x, y, **kw):
@@ -76,6 +78,14 @@ class FakeHarness:
             return dict(self.home_results.pop(0))
         return {"reached": True, "reason": "converged", "at_target": True,
                 "moved": True, "iters": 1}
+
+    def align_yaw(self, target_deg=0.0, tol_deg=8.0, **kw):
+        self.yaw_calls.append((target_deg, tol_deg))
+        self.events.append(("align_yaw", target_deg))
+        if self.yaw_results:
+            return dict(self.yaw_results.pop(0))
+        return {"converged": True, "reason": "converged", "steps": 0,
+                "final_yaw": 1.5, "trace": []}
 
     def run_trial(self, exp, **kw):
         self.trial_ids.append(exp.id)
@@ -248,13 +258,17 @@ def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, build
         (-100, 0), (-100, 0), (0, 40)]                     # 横移左移：车往 −Y 走
     assert h.trial_ids == [1, 1, 5]
     assert [_near(e) for e in events] == [                # 计划要求的每条顺序
-        ("drive_to", (-100, 0)), ("run_trial", 1), ("write", 1), ("stop",),
-        ("drive_to", (-100, 0)), ("run_trial", 1), ("write", 1), ("stop",),
-        ("drive_to", (0, 40)), ("run_trial", 5), ("write", 5), ("stop",),
+        ("drive_to", (-100, 0)), ("align_yaw", 0.0), ("run_trial", 1), ("write", 1),
+        ("stop",),
+        ("drive_to", (-100, 0)), ("align_yaw", 0.0), ("run_trial", 1), ("write", 1),
+        ("stop",),
+        ("drive_to", (0, 40)), ("align_yaw", 0.0), ("run_trial", 5), ("write", 5),
+        ("stop",),
     ]
     assert h.car_link.stops == 3                          # 每条结束 car.stop()
     assert stats == {"n_trials": 3, "n_ok": 3, "n_failed": 0,
                      "n_homing_failed": 0, "n_homing_zero_pulse": 0,
+                     "n_yaw_failed": 0, "n_yaw_corrected": 0,
                      "archive_path": None}
     assert len(lines) == 3 and all("OK" in ln for ln in lines)
     assert any("200.0mm" in ln or "200.0 mm" in ln or "200.0" in ln for ln in lines)
@@ -298,6 +312,75 @@ def test_homing_failure_skips_the_trial_but_records_the_row(tmp_path, builder, x
     assert len(rows) == 1
     assert rows[0]["trial_ok"] is False
     assert rows[0]["trial_reason"] == "homing_locate_failed"
+
+
+# ------------------------------------------------- 偏航闸（R71）
+
+def test_batch_aligns_yaw_before_translation_experiments(tmp_path, builder, xlsx):
+    """R71：平移类实验前必须摆头；顺序是 drive_to → align_yaw → run_trial。"""
+    exp1 = _probe(1)                                   # straight
+    exp13 = matrix.Experiment(13, "rotate_in_place", "旋转 30°", 0.0, 0.0,
+                              math.pi / 4, 0.266, 1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0), _ok_trial(10.0)])
+    h.yaw_results = [{"converged": True, "reason": "converged", "steps": 2,
+                      "final_yaw": 3.1, "trace": [{"yaw": -18.0}]},
+                     {"converged": True, "reason": "converged", "steps": 0,
+                      "final_yaw": 12.0, "trace": []}]
+    events = []
+
+    def write(trial, exp, **kw):
+        events.append(("write", exp.id, list(trial.get("warnings") or [])))
+
+    RA.run_batch(h, experiments=[exp1, exp13], xlsx_path=xlsx, printer=lambda _s: None,
+                 write=write, archive=False)
+
+    assert h.yaw_calls == [(0.0, 8.0)]                # 只有平移那条摆头，旋转腿不摆
+    kinds = [e[0] for e in events]
+    assert kinds == ["write", "write"]
+    # 摆头留痕进 notes（yaw_corrected），旋转腿那条没有
+    assert any("yaw_corrected" in str(w[2]) for w in events if w[1] == 1)
+    assert all("yaw_corrected" not in str(w[2]) for w in events if w[1] == 13)
+
+
+def test_batch_yaw_gate_failure_skips_the_experiment(tmp_path, builder, xlsx):
+    """摆头失败 = 车头歪着 → **不开电机**跑实验，记 `homing_yaw_<reason>`。"""
+    exp1 = _probe(1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0)])
+    h.yaw_results = [{"converged": False, "reason": "max_steps", "steps": 6,
+                      "final_yaw": 31.0, "trace": []}]
+
+    stats = RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                         printer=lambda _s: None, archive=False)
+
+    assert h.trial_ids == []                           # 没跑实验
+    assert stats["n_yaw_failed"] == 1
+    rows = _summary_rows(openpyxl.load_workbook(xlsx)["data"])
+    assert rows[0]["trial_ok"] is False
+    assert rows[0]["trial_reason"] == "homing_yaw_max_steps"
+
+
+def test_batch_yaw_gate_can_be_switched_off(tmp_path, builder, xlsx):
+    exp1 = _probe(1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0)])
+
+    RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx, yaw_tol_deg=0.0,
+                 printer=lambda _s: None, archive=False)
+
+    assert h.yaw_calls == [] and h.trial_ids == [1]
+
+
+def test_cli_yaw_tol_is_parsed(xlsx):
+    assert RA.parse_args([]).yaw_tol_deg == 8.0
+    assert RA.parse_args(["--yaw-tol-deg", "0"]).yaw_tol_deg == 0.0
+    h = FakeHarness(trial_results=[_ok_trial(200.0)] * 3)
+
+    @contextmanager
+    def factory():
+        yield h
+
+    RA.main(["--only", "1"], session_factory=factory, printer=lambda _s: None,
+            xlsx_path=xlsx)
+    assert h.yaw_calls == [(0.0, 8.0)] * 3
 
 
 # ------------------------------------------- 归位脉冲宽度（真机：400 ms 必振荡）

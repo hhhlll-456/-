@@ -318,9 +318,36 @@ DRIVE_REASONS = (
 STEP_SLOPE_MM_PER_MS = 0.5
 STEP_DEAD_MS = 120.0
 STEP_KICK_FLOOR_MM = 7.4
-# 误差大于它就换粗脉冲。粗步长必须 > switch − tol，否则"最后一步"的过冲量由
-# 粗步长决定（过冲 = 粗步长 − switch）。
-COARSE_SWITCH_MM = 45.0
+# 误差大于它就换粗脉冲。**粗段过冲 = 粗步长 − switch**，所以 switch 必须 ≥ 粗步长，
+# 否则最后一条粗脉冲会把车甩过目标点。真机实测粗步长 55.7 mm（260 ms）/ 模型 60，
+# 取 70 ⇒ 过冲 ≤ ~14 mm；而矩阵最远的目标 |x| = 100 mm，车体半长 135 ⇒
+# |x| = 114 时车缘 249 mm < 场地半长 252.5（switch=45 时过冲可达 25 mm ⇒ 车缘
+# 260 mm，会蹭到 x=±252.5 的边码）。
+COARSE_SWITCH_MM = 70.0
+
+# ---- 偏航闭环（R71）---------------------------------------------------------------
+#
+# 为什么必须有：一条平移实验会把车头带偏 4.4°（#04 三条实测 −6.3°→+1.0°→−16.8°），
+# 而车体 135×74.5 的包络在 yaw θ 时的 y 向伸出是 `135|sinθ|+74.5|cosθ|`：θ=17° 就是
+# 110.7 mm（比正放的 74.5 多 36 mm），把 y 侧的可行区间从 51.4 mm 压到 15.2 mm。
+# 实测一趟直行就能走掉 22~49 mm 的横向分量（#01 终点 y=−49、#04 Δy=−22.5）⇒
+# 不管 yaw，矩阵的场地校验（按 yaw=0 算）就是错的。`drive_to` 只平移不转，
+# 所以偏航要单独闭环。
+#
+# 单脉冲转角模型（实测 152 ms→7.7°、199 ms→15.8°、211 ms→16~17°、266 ms→22.7°、
+# 278 ms→29.7°）：**有 ~7.5° 的地板**（固件 kick=150ms/105），散点 ±25%，所以 yaw
+# 只能收敛到 ±7.5° 量级，取默认容差 8°。拟合取 `0.16·(T−105)`：五个实测点的偏差
+# ≤ 14%，且**略微高估**步长（宁可脉冲短一点，也别冲过头）。
+YAW_STEP_SLOPE_DEG_PER_MS = 0.16
+YAW_STEP_DEAD_MS = 105.0
+YAW_STEP_FLOOR_DEG = 7.5
+DEFAULT_YAW_TOL_DEG = 8.0
+DEFAULT_YAW_MAX_STEPS = 6
+DEFAULT_YAW_SETTLE_S = 0.8
+DEFAULT_YAW_PULSE_MIN_MS = 150
+DEFAULT_YAW_PULSE_MAX_MS = 320
+# 旋转腿的命令角速度（45°/s，与矩阵同档；MIN_DUTY 地板下真实速率只由时长决定）。
+OM_CMD_RAD_S = 0.7854
 
 # P 控制参数：v_cmd = clamp(KP · |err|, v_min, v_max)，单位 m/s。
 # KP=0.001 的含义：100 mm 误差 → 0.1 m/s（与实验矩阵 0.05–0.2 m/s 同量级）。
@@ -467,6 +494,26 @@ def homing_reach_mm(pulse_ms, *, max_iter=DEFAULT_MAX_ITER, tol_mm=DEFAULT_TOL_M
         raise ValueError(f"max_iter 至少 1，实际 {max_iter!r}")
     step = expected_step_mm(coarse_pulse_ms if coarse_pulse_ms is not None else pulse_ms)
     return float(tol_mm) + int(max_iter) * step
+
+
+def expected_yaw_step_deg(pulse_ms) -> float:
+    """一条旋转脉冲的真机转角（度）：`max(kick 地板 7.5, 0.212·(T−138))`。
+
+    实测三点：152 ms → 7.7°、199 ms → 15.8°、266 ms → 22.7°。
+    """
+    return max(YAW_STEP_FLOOR_DEG,
+               YAW_STEP_SLOPE_DEG_PER_MS * (float(pulse_ms) - YAW_STEP_DEAD_MS))
+
+
+def pulse_ms_for_yaw_deg(target_deg) -> int:
+    """要转 `target_deg` 需要多长的脉冲（ms）——`expected_yaw_step_deg` 的反解。
+
+    下限 `DEFAULT_YAW_PULSE_MIN_MS`（固件 kick：更短转不动），上限 320 ms
+    （再长单步就 >40°，过冲风险与耗时都不划算）。
+    """
+    need = max(0.0, abs(float(target_deg)) - YAW_STEP_FLOOR_DEG)
+    ms = int(round(need / YAW_STEP_SLOPE_DEG_PER_MS + DEFAULT_YAW_PULSE_MIN_MS))
+    return int(min(DEFAULT_YAW_PULSE_MAX_MS, max(DEFAULT_YAW_PULSE_MIN_MS, ms)))
 
 
 def body_delta_to_field(dx_mm, dy_mm, yaw_deg):
@@ -918,6 +965,97 @@ class Harness:
             if k + 1 < tries:
                 time.sleep(_LOCATE_RETRY_PAUSE_S)
         return None
+
+    # ---- 偏航闭环（R71）------------------------------------------------------------
+
+    def align_yaw(self, target_deg=0.0, tol_deg=DEFAULT_YAW_TOL_DEG, *,
+                  max_steps=DEFAULT_YAW_MAX_STEPS,
+                  settle_s=DEFAULT_YAW_SETTLE_S):
+        """把车头摆到 `target_deg ± tol_deg`，返回 `{"converged", "steps", ...}`。
+
+        为什么需要（模块 docstring 的「偏航闭环（R71）」一节）：`drive_to` 只平移，
+        而一条平移实验把车头带偏 4.4°、一趟能走掉 22~49 mm 的横向分量，车体包络在
+        17° 时的 y 向伸出比正放多 36 mm —— 矩阵的场地校验是按 yaw=0 算的。
+
+        只发**带时长**的 `RUN 0 0 ±om <ms>`（固件到时自停），每步之后 `STOP` + 沉降
+        + 重新 `locate()`；单步转角由 `pulse_ms_for_yaw_deg` 反解（有 ~7.5° 地板，
+        所以容差默认 8° —— 想更精确也做不到，别把容差调到地板以下）。
+
+        失败语义（都**不动**或已停下，不会静默算成功）：
+        - `locate()` 连续失败 → `reason="locate_failed"`，一步都不转；
+        - 步数用满 → `reason="max_steps"`，返回最后的 yaw；
+        - 收尾 STOP 未确认 → 照旧记 `stop_confirmed=False` + 警告（与 `drive_to` 同口径）。
+        """
+        target = float(target_deg)
+        tol = float(tol_deg)
+        if not (tol > 0.0):
+            raise ValueError(f"tol_deg 必须是正数，实际 {tol_deg!r}")
+        if int(max_steps) < 1:
+            raise ValueError(f"max_steps 至少 1，实际 {max_steps!r}")
+        settle = float(settle_s)
+        if settle < 0.0:
+            raise ValueError(f"settle_s 不能为负，实际 {settle_s!r}")
+
+        events: list[dict] = []
+        trace: list[dict] = []
+        stop_confirmed = self._try_stop(self.car_link)
+        events.append({"event": "open_stop", "ok": stop_confirmed})
+
+        reason = "locate_failed"
+        steps = 0
+        final = None
+        pos = self._locate_retry()
+        while pos is not None:
+            final = pos
+            err = _wrap180_deg(target - pos[2])
+            if abs(err) <= tol:
+                reason = "converged"
+                break
+            if steps >= int(max_steps):
+                reason = "max_steps"
+                break
+            ms = pulse_ms_for_yaw_deg(abs(err))
+            om = OM_CMD_RAD_S if err > 0 else -OM_CMD_RAD_S
+            steps += 1
+            line = "RUN 0.0000 0.0000 {:.4f} {}".format(om, ms)
+            rec = {"step": steps, "yaw": pos[2], "err_deg": err, "cmd": (0.0, 0.0, om, ms),
+                   "run_line": line}
+            try:
+                self._send_line(self.car_link, line)
+            except Exception as exc:
+                rec["send_error"] = f"{type(exc).__name__}: {exc}"
+                outcome = "closed"
+            else:
+                outcome, _stats = self._wait_done(self.car_link)
+            rec["outcome"] = outcome
+            trace.append(rec)
+            if outcome == "error":                 # 固件拒了这条 RUN：没在转
+                reason = "run_rejected"
+                break
+            time.sleep(max(settle, ms / 1000.0 * 0.5) + settle)
+            self._try_stop(self.car_link)
+            pos = self._locate_retry()
+            if pos is None:
+                reason = "locate_failed"
+
+        stop_ok = self._try_stop(self.car_link)
+        events.append({"event": "final_stop", "ok": stop_ok})
+        if not stop_ok:
+            warnings.warn(
+                "align_yaw 收尾 STOP 未确认：车若还在转，这里没拦住。"
+                "立即人工确认车已停。", RuntimeWarning, stacklevel=2)
+        return {
+            "converged": reason == "converged",
+            "steps": steps,
+            "reason": reason,
+            "final_yaw": None if final is None else float(final[2]),
+            "final": None if final is None else tuple(float(v) for v in final),
+            "tol_deg": tol,
+            "target_deg": target,
+            "trace": trace,
+            "events": events,
+            "stop_confirmed": stop_ok,
+        }
 
     # ---- 实验编排：单次 trial（Task 11） --------------------------------------------
 

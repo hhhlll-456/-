@@ -58,7 +58,8 @@ import sys
 from pathlib import Path
 
 from vgt import compare, matrix
-from vgt.harness import DEFAULT_PULSE_MS, REASON_ALREADY_AT_TARGET, body_delta_to_field
+from vgt.harness import (DEFAULT_PULSE_MS, DEFAULT_YAW_TOL_DEG,
+                         REASON_ALREADY_AT_TARGET, body_delta_to_field)
 
 # 规划起点假定的车头朝向（度）：`matrix` 的几何前提是"归位后车头已对齐"（R15），
 # 场地系 +X 就是车头方向。用 `body_delta_to_field` 转，不自己再推一遍符号。
@@ -193,9 +194,35 @@ def _final_stop(harness, printer) -> None:
                 "（run_trial 自身的收尾 STOP 已发；若两次都没确认，harness 会抛 StopFailed）")
 
 
+def _yaw_gate(harness, exp, stats, yaw_tol_deg):
+    """R71：平移类实验前把车头摆到 `±yaw_tol_deg`（旋转类本身就在转，不摆）。
+
+    实测理由：一条平移腿把车头带偏 4.4°（#04 三条 −6.3°→+1.0°→−16.8°），而车体
+    135×74.5 的包络在 yaw 17° 时 y 向伸出 110.7 mm（正放 74.5，多 36 mm），一趟实测
+    就能走掉 22~49 mm 横向分量 ⇒ 不摆头就跑，矩阵的场地校验（按 yaw=0 算）就是错的，
+    这正是本轮把车开出场地、压住边码的机制。
+
+    返回 `{"ok", "steps", "from_yaw", "to_yaw", "reason"}`；`ok=False` 时调用方把本条
+    记成 `homing_yaw_<reason>` 的失败行（不开电机）。
+    """
+    if not yaw_tol_deg:
+        return {"ok": True, "skipped": True, "steps": 0}
+    if exp.action == "rotate_in_place":
+        return {"ok": True, "skipped": True, "steps": 0}   # 旋转腿的 yaw 就是被测量
+    res = harness.align_yaw(0.0, tol_deg=float(yaw_tol_deg))
+    if not res["converged"]:
+        return {"ok": False, "reason": res["reason"], "steps": 0,
+                "from_yaw": res["final_yaw"], "to_yaw": res["final_yaw"]}
+    stats["n_yaw_corrected"] += 1 if res["steps"] else 0
+    return {"ok": True, "steps": res["steps"], "reason": "converged",
+            "from_yaw": None if not res["trace"] else round(res["trace"][0]["yaw"], 2),
+            "to_yaw": None if res["final_yaw"] is None else round(res["final_yaw"], 2)}
+
+
 def run_batch(harness, *, experiments, only=None, xlsx_path,
               printer=print, write=compare.write_trial, archive=True,
-              pulse_ms=DEFAULT_PULSE_MS, coarse_pulse_ms=None) -> dict:
+              pulse_ms=DEFAULT_PULSE_MS, coarse_pulse_ms=None,
+              yaw_tol_deg=DEFAULT_YAW_TOL_DEG) -> dict:
     """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
 
     返回统计：`n_trials / n_ok / n_failed / n_homing_failed / n_homing_zero_pulse /
@@ -214,10 +241,16 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
     那次视觉死锁）。给了粗脉冲可达集拉到 ~732 mm，且 `drive_to` 会把超界的起点
     **起跑前**判成 `homing_too_far`（一条 RUN 都不发）。
     真机全量建议：`--pulse-ms 130 --coarse-ms 240`。
+
+    `yaw_tol_deg`（R71，默认 8°）：每条**平移**实验前先把车头摆到 `±yaw_tol_deg`
+    （`harness.align_yaw`，只发带时长的 `RUN 0 0 ±om ms`）。`0` = 不摆。摆头失败就把
+    本条记成 `homing_yaw_<reason>` 的失败行、**不开电机**跑实验；摆了几步会在汇总行
+    的 `notes` 里留 `yaw_corrected` 痕迹。
     """
     trials = list(iterate_trials(experiments, only=only))
     stats = {"n_trials": len(trials), "n_ok": 0, "n_failed": 0,
-             "n_homing_failed": 0, "n_homing_zero_pulse": 0, "archive_path": None}
+             "n_homing_failed": 0, "n_homing_zero_pulse": 0,
+             "n_yaw_failed": 0, "n_yaw_corrected": 0, "archive_path": None}
 
     for index, (exp, rep) in enumerate(trials, start=1):
         start_xy = plan_start_xy(exp)
@@ -225,7 +258,7 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
         homing_note = ""
         try:
             home = harness.drive_to(start_xy[0], start_xy[1], pulse_ms=float(pulse_ms),
-                                        coarse_pulse_ms=coarse_pulse_ms)
+                                    coarse_pulse_ms=coarse_pulse_ms)
             kind, homing_reason = classify_homing(home)
             if kind == "failed":
                 stats["n_homing_failed"] += 1
@@ -235,9 +268,22 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
                     # R67：车在位但归位没动过 —— 照跑实验，但绝不当成功，且留痕。
                     stats["n_homing_zero_pulse"] += 1
                     homing_note = _zero_pulse_note(home)
-                trial = harness.run_trial(exp)
-                if homing_note:
-                    trial.setdefault("warnings", []).append(homing_note)
+                # R71：平移类实验前把车头摆正（`drive_to` 只平移）。
+                yaw = _yaw_gate(harness, exp, stats, yaw_tol_deg)
+                if not yaw["ok"]:
+                    stats["n_yaw_failed"] += 1
+                    trial = _homing_failed_trial(
+                        f"homing_yaw_{yaw.get('reason') or 'unknown'}")
+                else:
+                    trial = harness.run_trial(exp)
+                    if homing_note:
+                        trial.setdefault("warnings", []).append(homing_note)
+                    if yaw.get("steps"):
+                        # 摆头动作留痕（notes 列）：表里的 vision_start_yaw 是摆正后的值
+                        homing_note = (homing_note + "  " if homing_note else "") + \
+                            f"yaw_corrected：摆头 {yaw['steps']} 步（" \
+                            f"{yaw['from_yaw']}° → {yaw['to_yaw']}°）"
+                        trial.setdefault("warnings", []).append(homing_note)
             summary = compare.trial_summary(trial)
             write(trial, exp, xlsx_path=xlsx_path)        # 失败也写（留痕）
             printer(format_trial_line(index, len(trials), exp, rep, summary,
@@ -313,6 +359,10 @@ def parse_args(argv=None):
     parser.add_argument("--coarse-ms", type=float, default=None, metavar="MS",
                         help="R70 两段式步长的粗脉冲（误差大时用）；不给 = 单段。"
                              "真机全量建议 240（步长 ~60 mm，粗段过冲上限 15 mm）")
+    parser.add_argument("--yaw-tol-deg", type=float, default=DEFAULT_YAW_TOL_DEG,
+                        metavar="DEG",
+                        help="R71 每条平移实验前的车头容差（默认 8°=固件单步地板 "
+                             "7.5° 的量级；传 0 关闭摆头）")
     return parser.parse_args(argv)
 
 
@@ -338,11 +388,12 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
             f"{'，--only ' + str(args.only) if args.only is not None else ''}"
             f"，归位脉冲 {args.pulse_ms:g} ms"
             f"{' / 粗 ' + format(args.coarse_ms, 'g') + ' ms' if args.coarse_ms else ''}"
-            f"）→ {xlsx} ===")
+            f"，车头容差 {args.yaw_tol_deg:g}°）→ {xlsx} ===")
     with factory() as harness:
         stats = run_batch(harness, experiments=matrix.EXPERIMENTS, only=args.only,
                           xlsx_path=xlsx, printer=printer, pulse_ms=args.pulse_ms,
-                          coarse_pulse_ms=args.coarse_ms)
+                          coarse_pulse_ms=args.coarse_ms,
+                          yaw_tol_deg=args.yaw_tol_deg)
     if stats["archive_path"]:
         printer(f"已归档：{stats['archive_path']}")
     printer(f"完成：{stats['n_ok']}/{stats['n_trials']} 通过；{stats['n_failed']} 条失败"
@@ -352,6 +403,8 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
         printer(f"⚠ 另有 {stats['n_homing_zero_pulse']} 条的归位是**零脉冲**"
                 f"（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，"
                 "但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。")
+    printer(f"车头（R71）：摆头 {stats['n_yaw_corrected']} 条、失败 "
+            f"{stats['n_yaw_failed']} 条。")
     return 0 if stats["n_failed"] == 0 else 1
 
 
