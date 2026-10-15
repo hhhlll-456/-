@@ -8,10 +8,11 @@
 |---|---|---|
 | `yaw_c1.py` | 偏航腿 → `c1` 尺度因子的离线解算（含对 `integrate_encoders` 的闭式自校验） | ✅ 只依赖仓库内模块 |
 | `s300_review.py` | 一轮单发 S300 脉冲复核（走 `Harness.run_trial`） | ✅ 只依赖仓库内模块 |
-| `rotcheck.py` | 偏航腿的采集脚本（**依赖 `/tmp/opencode/c1cal/{measure,calib_c1}.py`，不在仓库里**） | ❌ 见文件头 |
+| `rotcheck.py` | 偏航腿的采集脚本。**2026-10-15 深夜起自包含**：其依赖的 `measure.py` / `calib_c1.py` 已收进本目录 | ✅ 依赖已在仓库内 |
 | `data/rot_prev.jsonl` | 上一轮（被打断）的 3 条偏航腿 | — |
 | `data/rot.jsonl` | 本轮重采的 3 条偏航腿（`keep=True` 修复后） | — |
 | `data/s300_review.json` | 单发 S300 复核的完整结果（含原始 D 行） | — |
+| `measure.py` / `calib_c1.py` | 视觉测量层 / 链路底层 + 速度模型（原先只在 `/tmp/opencode/c1cal/`，2026-10-15 收进仓库） | ✅ |
 
 ```bash
 cd 实验/rotcheck

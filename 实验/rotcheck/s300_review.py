@@ -46,7 +46,7 @@ from vgt.harness import Harness, ODOM_C_1REV, ODOM_SIGN, ODOM_R_EFF_MM  # noqa: 
 from vgt import compare, matrix                           # noqa: E402
 from vision_core import load_calib                        # noqa: E402
 
-OUT = Path("/tmp/opencode/c1cal/s300_review.json")
+OUT = Path(__file__).resolve().parent / "data" / "s300_review.json"
 SETTLE_BEFORE = 0.5
 SETTLE_AFTER = 1.0
 MS = 300

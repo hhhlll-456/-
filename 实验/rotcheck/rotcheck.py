@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 """偏航通道交叉校验（rotcheck 的修复版）—— 把上一轮没跑完的那条腿跑完。
 
-## ⚠ 外部依赖（本文件不是自包含的）
+## 依赖（2026-10-15 深夜已自包含）
 
-`/tmp/opencode/c1cal/` 下有两个真机辅助模块**不在仓库里**：
+本文件原先 `sys.path` 第一条写死 `/tmp/opencode/c1cal`，**那两个模块不在仓库里**
+⇒ 直接跑会 `ModuleNotFoundError: measure`。现已把两个模块**收进本目录**：
 
   - `measure.py` —— 视觉测量层（一次抓 N 帧，给出 `pnp` / `ruler_h` / `ruler_l`
     三条彼此独立的位移口径 + 帧间离散度）；
   - `calib_c1.py` —— 链路底层（`stop` / `drain` / `read_until` / `read_enc` /
     `do_leg`）与速度模型 `ms_for(mm) = mm/0.56 + 143`。
 
-本文件 `sys.path` 的第一条就是 `/tmp/opencode/c1cal`，所以直接跑会
-`ModuleNotFoundError: measure`。入库是为了**留证据和配方**（`data/rot*.jsonl`
-是它产的），不是宣称开箱能跑。其余两个脚本（`yaw_c1.py`、`s300_review.py`）
-只依赖仓库内模块，可以直接跑。
+三者的 `sys.path` 与输出路径已改为**按 `__file__` 定位**，输出落到本目录
+`data/`（原来写 `/tmp`，重启就没了）⇒ 现在整目录自包含。其余两个脚本
+（`yaw_c1.py`、`s300_review.py`）本来就只依赖仓库内模块，也已把写死的输出路径
+一并改为 `data/`。
 
 ## 与上一轮 `rotcheck.py` 的唯一差别（真 bug，不是"改进"）
 
@@ -48,11 +49,13 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/tmp/opencode/c1cal")
-sys.path.insert(0, "/home/hanli/麦轮小车pid/实验")
-sys.path.insert(0, "/home/hanli/麦轮小车pid/实验/vgt")
-sys.path.insert(0, "/home/hanli/麦轮小车pid/视觉测量/脚本")
-sys.path.insert(0, "/home/hanli/麦轮小车pid/实验/task10_live")
+_HERE = Path(__file__).resolve().parent        # 实验/rotcheck/
+_ROOT = _HERE.parents[1]                      # 仓库根
+sys.path.insert(0, str(_HERE))                # calib_c1.py / measure.py 同目录
+sys.path.insert(0, str(_ROOT / "实验"))
+sys.path.insert(0, str(_ROOT / "实验" / "vgt"))
+sys.path.insert(0, str(_ROOT / "视觉测量" / "脚本"))
+sys.path.insert(0, str(_ROOT / "实验" / "task10_live"))
 
 import calib_c1 as C                                             # noqa: E402
 import measure as M                                              # noqa: E402
@@ -68,7 +71,7 @@ LXY_OVER_R = 0.12825 / 0.0335
 R_EFF = 33.5
 LXY_MM = 128.25
 K = 2.0 * math.pi * R_EFF / (4.0 * LXY_MM)
-OUT = Path("/tmp/opencode/c1cal/rot2.jsonl")
+OUT = _HERE / "data" / "rot2.jsonl"       # 原来写 /tmp，重启就没了
 SAFE_X, SAFE_Y = 105.0, 46.0
 
 
