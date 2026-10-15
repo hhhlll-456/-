@@ -20,7 +20,7 @@ import pytest
 import run_all_experiments as RA
 from vgt import matrix
 from vgt.harness import DEFAULT_PULSE_MS as H_DEFAULT_PULSE_MS
-from vgt.harness import StopFailed
+from vgt.harness import StopFailed, body_delta_to_field
 
 REPO = Path(__file__).resolve().parents[3]
 BUILDER_PATH = REPO / "实验" / "实验数据记录_build.py"
@@ -135,14 +135,39 @@ def test_plan_start_puts_the_sweep_midpoint_at_the_field_origin():
     assert RA.plan_start_xy(by_id[2]) == pytest.approx((100.0, 0.0), abs=tol)   # 后退 200
     assert RA.plan_start_xy(by_id[3]) == pytest.approx((-75.0, 0.0), abs=tol)   # 前进 150
     assert RA.plan_start_xy(by_id[4]) == pytest.approx((75.0, 0.0), abs=tol)
-    assert RA.plan_start_xy(by_id[5]) == pytest.approx((0.0, -40.0), abs=tol)   # 左移 80
-    assert RA.plan_start_xy(by_id[6]) == pytest.approx((0.0, 40.0), abs=tol)    # 右移 80
+    # ⚠ 横移/斜行的 y 分量按**场地系**取中点（车左 = 场地 −Y，R69；见下一条测试）
+    assert abs(RA.plan_start_xy(by_id[5])[0]) <= tol
+    assert abs(RA.plan_start_xy(by_id[5])[1]) == pytest.approx(39.76, abs=tol)  # 左移 80
+    assert RA.plan_start_xy(by_id[6])[1] == pytest.approx(-RA.plan_start_xy(by_id[5])[1], abs=tol)
     e9 = by_id[9]                                                       # 斜行 120（45°）
-    dx9, dy9 = matrix.expected_delta_mm(e9)
-    assert RA.plan_start_xy(e9) == pytest.approx((-dx9 / 2.0, -dy9 / 2.0))
-    assert RA.plan_start_xy(e9) == pytest.approx((-42.37, -42.37), abs=0.05)
+    fdx9, fdy9 = body_delta_to_field(*matrix.expected_delta_mm(e9),
+                                    RA.PLANNED_START_YAW_DEG)
+    assert RA.plan_start_xy(e9) == pytest.approx((-fdx9 / 2.0, -fdy9 / 2.0))
+    assert RA.plan_start_xy(e9) == pytest.approx((-42.37, 42.37), abs=0.05)
     assert RA.plan_start_xy(by_id[15]) == (0.0, 0.0)                    # 原地旋转
     assert RA.plan_start_xy(by_id[16]) == (0.0, 0.0)
+
+
+def test_plan_start_mirrors_the_body_frame_y_sign_into_the_field():
+    """R69（真机实测）：`vy>0`（车左）在场地系里是 **−Y**，起点必须取对侧。
+
+    真机锚点：#05「横移左移 80 mm」起点 y = −34.9 → 终点 y = −66.3，**往 −Y 走**。
+    按命令方向直接取中点会把起点摆到 −Y 侧，车再往 −Y 多走 31 mm，车体包络越出场地
+    14.9 mm（实测 `OUT`）。这里钉死转换必须走 `body_delta_to_field`。
+    """
+    by_id = {e.id: e for e in matrix.EXPERIMENTS}
+    for exp_id in (5, 6, 7, 8, 9, 10, 11, 12):
+        exp = by_id[exp_id]
+        sx, sy = RA.plan_start_xy(exp)
+        dx, dy = matrix.expected_delta_mm(exp)
+        fdx, fdy = body_delta_to_field(dx, dy, RA.PLANNED_START_YAW_DEG)
+        assert (sx, sy) == pytest.approx((-fdx / 2.0, -fdy / 2.0)), (
+            f"#{exp_id} 的起点必须是**场地系**位移的对中点")
+    # 车左（vy>0）⇒ 起点在 +Y 侧（车会往 −Y 走）；车右（vy<0）反之
+    assert RA.plan_start_xy(by_id[5])[1] > 0             # 横移左移
+    assert RA.plan_start_xy(by_id[6])[1] < 0             # 横移右移
+    assert RA.plan_start_xy(by_id[9])[1] > 0             # 斜行前左
+    assert RA.plan_start_xy(by_id[10])[1] < 0            # 斜行前右
 
 
 def test_planned_starts_engage_the_strict_branch_and_are_all_feasible():
@@ -220,12 +245,12 @@ def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, build
         return tuple(ev)
 
     assert [(round(x), round(y)) for x, y in h.drive_targets] == [
-        (-100, 0), (-100, 0), (0, -40)]
+        (-100, 0), (-100, 0), (0, 40)]                     # 横移左移：车往 −Y 走
     assert h.trial_ids == [1, 1, 5]
     assert [_near(e) for e in events] == [                # 计划要求的每条顺序
         ("drive_to", (-100, 0)), ("run_trial", 1), ("write", 1), ("stop",),
         ("drive_to", (-100, 0)), ("run_trial", 1), ("write", 1), ("stop",),
-        ("drive_to", (0, -40)), ("run_trial", 5), ("write", 5), ("stop",),
+        ("drive_to", (0, 40)), ("run_trial", 5), ("write", 5), ("stop",),
     ]
     assert h.car_link.stops == 3                          # 每条结束 car.stop()
     assert stats == {"n_trials": 3, "n_ok": 3, "n_failed": 0,

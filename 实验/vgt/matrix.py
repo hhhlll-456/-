@@ -147,6 +147,31 @@ def _dir_unit(exp) -> tuple:
     return (exp.vx / speed, exp.vy / speed)
 
 
+def body_to_field_delta(dx_body, dy_body, yaw_deg=0.0) -> tuple:
+    """**车体系**位移 → 场地系位移（mm）。`yaw_deg=0`（车头对齐场地 +X）时 y 取负。
+
+    R69（真机实测）：`(vx, vy)` 是车体系速度，而"车体在不在场地里"是**场地系**的
+    问题。真机锚点：#05「横移左移 80 mm」（vy>0）起点 y = −34.9 → 终点 y = −66.3 ——
+    车左在场地系里是 **−Y**。符号链与 `harness.body_delta_to_field` 逐字相同
+    （`test_matrix` 里有一条测试对拍两者）；这里自己写一遍是因为 `harness` import
+    `matrix`，反向 import 会成环。
+    """
+    th = math.radians(float(yaw_deg))
+    c, s = math.cos(th), math.sin(th)
+    dx, dy = float(dx_body), float(dy_body)
+    return (dx * c - dy * s, -dx * s - dy * c)
+
+
+def field_delta_mm(exp, yaw_deg=0.0) -> tuple:
+    """**场地系**位移 `(dx, dy)`（mm）：期望行程沿命令方向、按 `yaw_deg` 转到场地系。
+
+    `expected_delta_mm` 给的是车体系（命令方向）；场地几何校验与执行起点都要场地系
+    那一侧，两者差一个 y 的符号（R69）。
+    """
+    dx, dy = expected_delta_mm(exp)
+    return body_to_field_delta(dx, dy, yaw_deg)
+
+
 def expected_travel_mm(exp) -> float:
     """这条实验**真机会走**的平移距离（mm）：`V_STEADY·(T−DEAD)`；旋转类返回 0。"""
     if exp.action == "rotate_in_place":
@@ -171,15 +196,19 @@ def expected_delta_mm(exp) -> tuple:
     return (ux * travel, uy * travel)
 
 
-def expected_start_xy(exp) -> tuple:
-    """把期望位移**对中**的起点：整段行程落在场地中心两侧各一半。
+def expected_start_xy(exp, yaw_deg=0.0) -> tuple:
+    """把**场地系**期望位移对中后的起点：整段行程落在场地中心两侧各一半。
 
-    平移就看这一条：起点 = −期望位移/2 ⇒ 终点 = +期望位移/2（Task 12 的 `drive_to`
+    ⚠ 对中必须用**场地系**位移（R69）：`expected_delta_mm` 给的是车体系（命令方向），
+    车左（`vy>0`）在场地系里是 −Y —— 真机实测 #05「横移左移 80 mm」起点 y = −34.9
+    → 终点 y = −66.3。按命令方向取中点会把横移/斜行的起点摆到错的一侧。
+
+    平移就看这一条：起点 = −场地系位移/2 ⇒ 终点 = +场地系位移/2（Task 12 的 `drive_to`
     目标）。旋转原地不动 ⇒ `(0, 0)`。
     """
     if exp.action == "rotate_in_place":
         return (0.0, 0.0)
-    dx, dy = expected_delta_mm(exp)
+    dx, dy = field_delta_mm(exp, yaw_deg)
     return (-dx / 2.0, -dy / 2.0)
 
 
@@ -238,11 +267,15 @@ def assert_within_field(exp, start_xy=(0.0, 0.0)) -> None:
 
     位移/转角一律取**期望值**（`expected_delta_mm` / `expected_yaw_deg`，真实会走多少），
     不是命令量 `v·T`：命令量在 MIN_DUTY 以下是惰性的（R68，见模块 docstring）。
+
+    ⚠ 位移还要从**车体系**转到**场地系**（`field_delta_mm`，R69）：`(vx, vy)` 是车体系
+    速度，车左（`vy>0`）在场地系里是 −Y。包络的**数值**两侧对称（不改变通过/不通过），
+    但"扫掠在哪一侧"必须是真的，否则规划起点与校验会互相打架。
     """
     _require(exp.duration_s > 0,
              f"实验 #{exp.id}（{exp.desc}）：duration_s={exp.duration_s} 必须为正。")
 
-    dx_mm, dy_mm = expected_delta_mm(exp)
+    dx_mm, dy_mm = field_delta_mm(exp)
     dpsi_deg = expected_yaw_deg(exp)
     _check_motion_caps(exp, dx_mm, dy_mm, dpsi_deg)
 

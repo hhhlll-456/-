@@ -58,7 +58,11 @@ import sys
 from pathlib import Path
 
 from vgt import compare, matrix
-from vgt.harness import DEFAULT_PULSE_MS, REASON_ALREADY_AT_TARGET
+from vgt.harness import DEFAULT_PULSE_MS, REASON_ALREADY_AT_TARGET, body_delta_to_field
+
+# 规划起点假定的车头朝向（度）：`matrix` 的几何前提是"归位后车头已对齐"（R15），
+# 场地系 +X 就是车头方向。用 `body_delta_to_field` 转，不自己再推一遍符号。
+PLANNED_START_YAW_DEG = 0.0
 
 
 def classify_homing(home: dict) -> tuple[str, str | None]:
@@ -109,17 +113,23 @@ def plan_start_xy(exp) -> tuple[float, float]:
     """一条实验的**执行起点**（场地系 mm）：让行程以场地原点对称（R15）。
 
     终点 = 起点 + 位移，取位移的对称中点：直行 200 → 起点 (−100, 0)；
-    横移左 80 → (0, −40)；斜行 → (∓42.4, ∓42.4)；原地旋转 → (0, 0)。
+    横移左 80 → (0, +40)；斜行 → (∓42.4, ±42.4)；原地旋转 → (0, 0)。
 
     ⚠ 位移取**期望行程**（`matrix.expected_delta_mm`，真机会走多少），不是命令量
     `v·T`：R68 起 `duration_s` 是按实测速度模型反解的，命令量只有真机的 ~1/2
     （#01：`v·T` = 100 mm，真机 ≈200 mm）。拿命令量算起点会把车摆到
     126 mm 外（x 中心上限 117.5）⇒ 第一条就出界。
+
+    ⚠⚠ 命令方向**不等于**场地系方向（R69，真机实测钉死）：`(vx, vy)` 是**车体系**
+    速度，矩阵的前提是"归位后车头已对齐"（yaw ≈ 0）。按 `harness.body_delta_to_field`
+    的同一条符号链，车体系 +y（车左）在场地系里是 **−Y** —— 真机实测：#05「横移左移
+    80 mm」起点 y = −34.9、终点 y = −66.3（**往 −Y 走**）。拿命令方向当场地方向会把
+    横移/斜行的起点摆到错的一侧：#05 因此在 −Y 侧多走 31 mm，车体包络越出场地 14.9 mm
+    所以这里一律先用 `body_delta_to_field(..., yaw=0)` 转到场地系；
+    R69 起"对中"的唯一实现是 `matrix.expected_start_xy`（内部走 `field_delta_mm`），
+    本函数直接调它 —— 规划起点与场地校验共用同一个真源，不再各自推一遍符号。
     """
-    dx, dy = matrix.expected_delta_mm(exp)
-    if exp.action == "rotate_in_place":
-        return (0.0, 0.0)
-    return (0.0 - dx / 2.0, 0.0 - dy / 2.0)      # `0.0 − x` 顺带消掉打印里的 −0.0
+    return tuple(matrix.expected_start_xy(exp, PLANNED_START_YAW_DEG))
 
 
 def check_experiment_feasible(exp, start_xy) -> None:
@@ -247,8 +257,12 @@ def dry_run(*, experiments=matrix.EXPERIMENTS, only=None, printer=print) -> int:
     for index, (exp, rep) in enumerate(trials, start=1):
         start_xy = plan_start_xy(exp)
         check_experiment_feasible(exp, start_xy)
-        # 终点取**期望行程**（R68：命令量 v·T 只有真机的一半，见 matrix docstring）
-        dx, dy = matrix.expected_delta_mm(exp)
+        # 终点取**期望行程**（R68：命令量 v·T 只有真机的一半，见 matrix docstring），
+        # 且必须是**场地系**位移（R69）：`plan_start_xy` 的起点已经用
+        # `body_delta_to_field` 转过了，打印机再拿车体系 `expected_delta_mm` 相加
+        # 会把横移的终点印到起点同侧（#05 印成 +119.3，实际是 −39.7）——显示与
+        # `check_experiment_feasible` 的校验各说一套，`--dry` 就成了误导操作员的那一份。
+        dx, dy = matrix.field_delta_mm(exp)
         dpsi = matrix.expected_yaw_deg(exp)
         ms = int(round(float(exp.duration_s) * 1000.0))
         printer(

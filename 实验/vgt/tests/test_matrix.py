@@ -158,10 +158,14 @@ def test_expected_travel_rounds_down_under_the_target_and_the_cap():
 
 
 def test_expected_start_xy_is_the_mirror_midpoint_of_the_expected_leg():
-    """`expected_start_xy` = −期望位移/2（行程对中）；旋转原地不动。"""
+    """`expected_start_xy` = −**场地系**期望位移/2（行程对中）；旋转原地不动。
+
+    ⚠ R69：对中必须用场地系那一侧。车体系 +y（车左）在场地系里是 −Y —— 真机实测
+    #05「横移左移 80 mm」起点 y = −34.9 → 终点 y = −66.3（往 −Y 走）。
+    """
     for e in matrix.EXPERIMENTS:
         sx, sy = matrix.expected_start_xy(e)
-        dx, dy = matrix.expected_delta_mm(e)
+        dx, dy = matrix.field_delta_mm(e)
         assert sx == pytest.approx(-dx / 2.0, abs=1e-9)
         assert sy == pytest.approx(-dy / 2.0, abs=1e-9)
         if e.action == "rotate_in_place":
@@ -205,18 +209,37 @@ def test_reference_start_uses_the_car_half_envelope_at_both_ends():
 
 
 def test_mandated_strafe_is_reachable_from_a_real_start():
-    """R15 的理由句：横移 80 从正中心放不下（净余量 51.4），但偏心起点可以。"""
+    """R15 的理由句：横移 80 从正中心放不下（净余量 51.4），但偏心起点可以。
+
+    ⚠ 起点要取**车会走的那一侧的对面**（R69：`vy>0` = 车左 = 场地 −Y）：横移左移
+    80 mm 从 `y = +40` 出发往 −Y 走到 `y = −40`，y 包络 ±114.5 < ±125.9。
+    """
     e80 = _probe("strafe", 0.0, 0.080, 0.0)
-    matrix.assert_within_field(e80, start_xy=(0.0, -40.0))     # y 包络 ±114.5 < ±125.9
+    matrix.assert_within_field(e80, start_xy=(0.0, 40.0))      # y 包络 ±114.5 < ±125.9
     with pytest.raises(ValueError):
-        matrix.assert_within_field(e80, start_xy=(0.0, -20.0))     # 终点 y 包络 134.0 越界
+        matrix.assert_within_field(e80, start_xy=(0.0, 20.0))  # 终点 y 包络 134.0 越界
     with pytest.raises(ValueError):
-        matrix.assert_within_field(e80, start_xy=(0.0, -60.0))     # 起点 y 包络越界
+        matrix.assert_within_field(e80, start_xy=(0.0, 60.0))  # 起点 y 包络越界
 
 
 def test_mandated_diagonal_is_reachable_from_a_real_start():
     e = _probe("diagonal", 0.12 / math.sqrt(2), 0.12 / math.sqrt(2), 0.0)
-    matrix.assert_within_field(e, start_xy=(-100.0, -40.0))
+    matrix.assert_within_field(e, start_xy=(-100.0, 40.0))     # 斜行前左：vx>0、vy>0
+
+
+def test_body_to_field_delta_matches_the_harness_sign_chain():
+    """R69：车体系 → 场地系的符号链必须与 `harness.body_delta_to_field` 逐字一致。
+
+    真机锚点：#05「横移左移 80 mm」（vy>0）起点 y = −34.9 → 终点 y = −66.3，**往 −Y 走**。
+    """
+    from vgt.harness import body_delta_to_field
+    for dx, dy in ((0.0, 79.5), (79.5, 0.0), (84.7, 84.7), (-50.0, 25.0)):
+        for yaw in (0.0, 17.0, -42.0, 90.0):
+            assert matrix.body_to_field_delta(dx, dy, yaw) == pytest.approx(
+                body_delta_to_field(dx, dy, yaw))
+    # 车左 = 场地 −Y（yaw=0）；车头 = 场地 +X
+    assert matrix.body_to_field_delta(0.0, 10.0) == pytest.approx((0.0, -10.0))
+    assert matrix.body_to_field_delta(10.0, 0.0) == pytest.approx((10.0, 0.0))
 
 
 # --- 上限与非法输入 ---------------------------------------------------------------
