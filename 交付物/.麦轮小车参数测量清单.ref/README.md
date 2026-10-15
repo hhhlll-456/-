@@ -58,8 +58,14 @@ PYTHONPATH=~/.local/lib/python3.12/site-packages \
 1. 备份当前交付物：`cp 交付物/麦轮小车参数测量清单.xlsx /tmp/before.xlsx`
 2. 改 `v2_stage.xlsx` 里的值（**用脚本改**，别用 Excel 存盘）
 3. 重跑 `build_v4.py`
-4. 逐单元格 diff `/tmp/before.xlsx` vs 新交付物 → **old → new 全列出**；
-   **派生量**（凡进公式的）变更 **≥1 mm** 的必须单列并说明来源
+4. 逐单元格 diff `/tmp/before.xlsx` vs 新交付物：
+
+   ```bash
+   python3 交付物/.麦轮小车参数测量清单.ref/diff_xlsx.py /tmp/before.xlsx 交付物/麦轮小车参数测量清单.xlsx
+   ```
+
+   它会打印**每个变化单元格的 old → new**，并单独汇总**数值变化 ≥1 的单元格**；
+   **派生量**（凡进公式的）变更 ≥1 mm 的必须单列并说明来源
 5. 差异写进 commit message，再提交
 
 ## 备份文件不入库
