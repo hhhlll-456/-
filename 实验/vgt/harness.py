@@ -27,9 +27,26 @@
   `last_locate_reason`（`"boundary_moved"` / `"no_vehicle_marker"`，与
   `verify_vision` 同一词表）。
 - `drive_to(x_mm, y_mm, tol_mm=12.0, max_iter=12) -> dict`：P 控制归位。返回
-  `{"reached", "iters", "final", "reason", "trace", "events", "reset_lines",
-  "stop_confirmed"}`；`iters` = 实际下发的 RUN 脉冲数，`final` = 最后一次成功
-  `locate()` 的位姿（一次都没成功就是 `None`）。
+  `{"reached", "iters", "final", "reason", "at_target", "moved", "start_dist_mm",
+  "trace", "events", "reset_lines", "stop_confirmed"}`；`iters` = 实际下发的 RUN
+  脉冲数，`final` = 最后一次成功 `locate()` 的位姿（一次都没成功就是 `None`）。
+
+## `reached` 的语义（R67：零脉冲不许算成功）
+
+真机现场：`drive_to(0,0)` 连跑三次全返回 `reached=True, iters=0` —— **车根本没动**。
+只读 `reached` 的调用方（Task 12 批量入口）会把"没动过"记成"归位成功"，**这是静默假
+数据**。所以本模块把"成功"和"车已在位"拆成两个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `reached` | **真归位成功**：闭环至少执行过一次动作（`iters ≥ 1`）且落在容差内 |
+| `moved` | 至少真的执行过一次动作（`iters > 0`），与 `reached` 同口径但可单独读 |
+| `at_target` | 车**实测**在目标点容差内（不管有没有动过）—— 零脉冲时为 `True` |
+| `start_dist_mm` | 第一次 `locate()` 量到的目标距离（零脉冲判定的证据，None = 连一次都没量到） |
+| `reason` | `DRIVE_REASONS` 词表；零脉冲收敛是独立的 `"already_at_target"` |
+
+契约：`reached is True` ⇒ `moved is True` ⇒ `iters ≥ 1`。想区分"真归位成功"与"起点本来
+就在目标点、没动过"的调用方读 `at_target`/`reason`/`iters`，别只看 `reached`。
 
 ## 控制律与脉冲（brief 原文 + 已知物理坑）
 
@@ -261,6 +278,18 @@ TRIAL_REASONS = (
     "camera_failed",
     "sign_mismatch",
     "trial_error",
+)
+
+# `drive_to` 的收工原因词表（R67：`already_at_target` 是新增的一档，见模块 docstring）。
+# `"converged"` 专属给"闭环真的动过并且落进容差"的收敛；零迭代收敛单独叫
+# `already_at_target`，它**不是**成功，只是"车本来就在位、这次什么也没做"。
+REASON_ALREADY_AT_TARGET = "already_at_target"
+DRIVE_REASONS = (
+    "converged",
+    REASON_ALREADY_AT_TARGET,
+    "max_iter",
+    "locate_failed",
+    "run_rejected",
 )
 
 # P 控制参数：v_cmd = clamp(KP · |err|, v_min, v_max)，单位 m/s。
@@ -655,7 +684,13 @@ class Harness:
           恢复成功则继续下一圈（这一圈的位移已经算数），失败抛 `StopFailed`；
         - 固件回 `ERR`（RUN 被拒）→ 收工，`reason="run_rejected"`；
         - `locate()` 连续失败 → 收工，`reason="locate_failed"`；
-        - 脉冲用满还没进 `tol_mm` → 收工，`reason="max_iter"`。
+        - 脉冲用满还没进 `tol_mm` → 收工，`reason="max_iter"`；
+        - **第一次 `locate()` 就在容差内**（一条 RUN 都没发）→ 收工，
+          `reason="already_at_target"` 且 `reached=False`（R67：零脉冲不许算成功），
+          `at_target=True` 仍然告诉调用方"车确实在位"。
+
+        返回字典里 `reached` / `at_target` / `moved` / `start_dist_mm` 的区别见模块
+        docstring 的「`reached` 的语义（R67）」一节。
         """
         x_t, y_t = float(x_mm), float(y_mm)
         self._check_target_in_field(x_t, y_t)
@@ -692,14 +727,21 @@ class Harness:
 
         final = None
         iters = 0
+        converged = False
+        start_dist_mm = None
         reason = "locate_failed"
         pos = self._locate_retry()
         while pos is not None:
             final = pos
             ex, ey = x_t - pos[0], y_t - pos[1]
             dist = math.hypot(ex, ey)
+            if start_dist_mm is None:
+                start_dist_mm = dist          # R67：零脉冲判定的证据
             if dist <= tol:
-                reason = "converged"
+                converged = True
+                # R67：零次迭代的收敛不是"归位成功" —— 单独一档，让调用方能分辨
+                # "真归位成功" 与 "起点本来就在目标点、这次什么也没做"。
+                reason = "converged" if iters > 0 else REASON_ALREADY_AT_TARGET
                 break
             if iters >= iter_cap:
                 reason = "max_iter"
@@ -751,8 +793,13 @@ class Harness:
                 "这里只是清环+报平安；稳妥起见人工确认车是停的。",
                 RuntimeWarning, stacklevel=2)
         return {
+            # R67：reached 只认"动过并且收敛"，零脉冲归位是 reached=False +
+            # at_target=True（车在位）与 reason="already_at_target"（没做过动作）。
             "reached": reason == "converged",
+            "at_target": converged,
+            "moved": iters > 0,
             "iters": iters,
+            "start_dist_mm": start_dist_mm,
             "final": final,
             "reason": reason,
             "trace": trace,

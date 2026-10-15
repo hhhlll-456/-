@@ -13,6 +13,21 @@
 `homing_*` 失败 → `harness.run_trial(exp)` → `compare.write_trial` 入表（失败也写）
 → 打印一行"视觉 vs 里程计"对比 → 收尾 `car.stop()`。
 
+## Important 3（R67）：归位结果必须分三类，不能只读 `reached`
+
+真机现场：`drive_to(0,0)` 连跑三次全 `reached=True, iters=0` —— **车根本没动**。
+本文件原来只看 `reached`，于是把"没动过"记成"归位成功"（静默假数据）。
+`harness.drive_to` 现在把"成功"与"车已在位"拆成两个字段（`reached` vs `at_target` +
+`reason="already_at_target"`），本文件用 `classify_homing` 把归位结果分成三类：
+
+- `"ok"` —— 闭环真的动过并收敛（`reached and moved`）：照常跑实验；
+- `"zero_pulse"` —— 车**实测**在容差内但一条 RUN 都没发：实验**照跑**（车在位，数据
+  是真的），但打印行带 `⚠零脉冲` 标记、计入 `n_homing_zero_pulse`、并往 trial 的
+  `warnings` 里塞一条 `homing_zero_pulse`（`write_trial` 会写进汇总行的 `notes` 列 ——
+  表里筛得出来，不留无声痕迹）；
+- `"failed"` —— 真没归位：不跑实验（车在哪不知道，开电机等于盲开），只写一行
+  `trial_reason="homing_*"` 的失败记录，继续下一条。
+
 ## Important 1：为什么起点必须显式传
 
 `matrix.assert_within_field(exp, start_xy=(0.0, 0.0))` 的默认值会**静默走宽松
@@ -43,6 +58,51 @@ import sys
 from pathlib import Path
 
 from vgt import compare, matrix
+from vgt.harness import REASON_ALREADY_AT_TARGET
+
+
+def classify_homing(home: dict) -> tuple[str, str | None]:
+    """`drive_to` 的结果 → `("ok" | "zero_pulse" | "failed", reason)`（R67）。
+
+    一个布尔值说不清这件事，必须分三类（词表见模块 docstring）：
+
+    - `"ok"`：闭环**真的动过**并且收敛（`reached and moved`）；
+    - `"zero_pulse"`：车**实测**在容差内，但这次一条 RUN 都没发（`iters == 0`）——
+      `harness` 报 `reached=False, reason="already_at_target", at_target=True`；
+      这是"起点本来就达标"的合法情形，但**绝不是归位成功**（R67 的静默假成功）；
+    - `"failed"`：真没归到位（`locate_failed` / `max_iter` / `run_rejected` …）。
+
+    兜底（老结果字典、手造字典）：`moved` 缺失时用 `iters` 判；`reached=True` 且明确
+    "没动过"的一律降级成 `zero_pulse` —— **宁可标出来，也不许静默当成功**。
+    """
+    reason = home.get("reason") or None
+    moved = home.get("moved")
+    if moved is None:
+        iters = home.get("iters")
+        moved = None if iters is None else int(iters) > 0
+    reached = bool(home.get("reached"))
+    at_target = home.get("at_target")
+    if at_target is None:
+        at_target = reached        # 老字典的 `reached` 原意就是"车落在容差内"
+
+    if reached and moved is True:
+        return "ok", None
+    if reason == REASON_ALREADY_AT_TARGET or (reached and moved is False):
+        # 零脉冲：只有"车确实在容差内"才允许照常跑实验，否则按没归位处理。
+        return ("zero_pulse", REASON_ALREADY_AT_TARGET) if at_target \
+            else ("failed", REASON_ALREADY_AT_TARGET)
+    if not reached:
+        return "failed", reason or "unknown"
+    return "ok", None            # 退化兼容：既没 moved 也没 iters 的老字典
+
+
+def _zero_pulse_note(home: dict) -> str:
+    """零脉冲归位的留痕文字（进打印行与 trial 的 warnings → xlsx 的 `notes` 列）。"""
+    start = home.get("start_dist_mm")
+    start_txt = "" if start is None else f"，起点实测距目标 {float(start):.1f} mm"
+    return (f"homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代"
+            f"（drive_to reason={REASON_ALREADY_AT_TARGET}{start_txt}）—— "
+            "车确实在位，但本次归位没有执行过任何动作，不计为归位成功")
 
 
 def plan_start_xy(exp) -> tuple[float, float]:
@@ -89,8 +149,9 @@ def _homing_failed_trial(reason: str) -> dict:
     }
 
 
-def format_trial_line(index: int, total: int, exp, rep: int, summary: dict) -> str:
-    """一行实时对比：`#id rep 描述：vision / odo / Δ% / yawΔ / 判定`。"""
+def format_trial_line(index: int, total: int, exp, rep: int, summary: dict,
+                      homing_note: str = "") -> str:
+    """一行实时对比：`#id rep 描述：vision / odo / Δ% / yawΔ / 判定`（+ 归位备注）。"""
     def num(value, spec):
         return "-" if value is None else format(value, spec)
 
@@ -100,7 +161,8 @@ def format_trial_line(index: int, total: int, exp, rep: int, summary: dict) -> s
         f"vision {num(summary['vision_dist_mm'], '.1f')}mm / "
         f"odo {num(summary['odo_dist_mm'], '.1f')}mm / "
         f"Δ {num(summary['dist_diff_pct'], '+.1f')}% / "
-        f"yawΔ {num(summary['yaw_diff_deg'], '+.2f')}°  {verdict}")
+        f"yawΔ {num(summary['yaw_diff_deg'], '+.2f')}°  {verdict}"
+        + (f"  ⚠{homing_note}" if homing_note else ""))
 
 
 def _final_stop(harness, printer) -> None:
@@ -121,27 +183,35 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
               printer=print, write=compare.write_trial, archive=True) -> dict:
     """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
 
-    返回统计：`n_trials / n_ok / n_failed / n_homing_failed / archive_path`。
-    安全异常（`StopFailed`/`BoundaryMarkersMoved`）原样冒泡中止整批。
+    返回统计：`n_trials / n_ok / n_failed / n_homing_failed / n_homing_zero_pulse /
+    archive_path`。安全异常（`StopFailed`/`BoundaryMarkersMoved`）原样冒泡中止整批。
     """
     trials = list(iterate_trials(experiments, only=only))
     stats = {"n_trials": len(trials), "n_ok": 0, "n_failed": 0,
-             "n_homing_failed": 0, "archive_path": None}
+             "n_homing_failed": 0, "n_homing_zero_pulse": 0, "archive_path": None}
 
     for index, (exp, rep) in enumerate(trials, start=1):
         start_xy = plan_start_xy(exp)
         check_experiment_feasible(exp, start_xy)          # 缺起点/越界：当场报错
+        homing_note = ""
         try:
             home = harness.drive_to(start_xy[0], start_xy[1])
-            if not home.get("reached"):
+            kind, homing_reason = classify_homing(home)
+            if kind == "failed":
                 stats["n_homing_failed"] += 1
-                trial = _homing_failed_trial(
-                    f"homing_{home.get('reason') or 'unknown'}")
+                trial = _homing_failed_trial(f"homing_{homing_reason or 'unknown'}")
             else:
+                if kind == "zero_pulse":
+                    # R67：车在位但归位没动过 —— 照跑实验，但绝不当成功，且留痕。
+                    stats["n_homing_zero_pulse"] += 1
+                    homing_note = _zero_pulse_note(home)
                 trial = harness.run_trial(exp)
+                if homing_note:
+                    trial.setdefault("warnings", []).append(homing_note)
             summary = compare.trial_summary(trial)
             write(trial, exp, xlsx_path=xlsx_path)        # 失败也写（留痕）
-            printer(format_trial_line(index, len(trials), exp, rep, summary))
+            printer(format_trial_line(index, len(trials), exp, rep, summary,
+                                      homing_note=homing_note))
         finally:
             _final_stop(harness, printer)                 # 每条结束 car.stop()
         if summary["trial_ok"]:
@@ -228,8 +298,12 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
     if stats["archive_path"]:
         printer(f"已归档：{stats['archive_path']}")
     printer(f"完成：{stats['n_ok']}/{stats['n_trials']} 通过；{stats['n_failed']} 条失败"
-            f"（其中归位失败 {stats['n_homing_failed']} 条）—— 失败条目已入表并标注 "
-            "trial_reason，可筛除后重跑。")
+            f"（其中归位失败 {stats['n_homing_failed']} 条）"
+            f" —— 失败条目已入表并标注 trial_reason，可筛除后重跑。")
+    if stats["n_homing_zero_pulse"]:
+        printer(f"⚠ 另有 {stats['n_homing_zero_pulse']} 条的归位是**零脉冲**"
+                f"（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，"
+                "但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。")
     return 0 if stats["n_failed"] == 0 else 1
 
 

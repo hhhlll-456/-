@@ -427,13 +427,74 @@ def test_drive_to_converges_and_commands_the_right_directions(monkeypatch):
 
 
 def test_drive_to_at_target_needs_no_pulse(monkeypatch):
+    """起点已在容差内 ⇒ 一条 RUN 都不发（这是省动作，不是成功）。"""
     h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]]})
     h.locate = lambda: (3.0, 2.0, 0.0)          # 距目标 3.6 mm ≤ 12 mm
 
     res = h.drive_to(0.0, 0.0, settle_s=0.0)
-    assert res["reached"] is True and res["iters"] == 0
+    assert res["iters"] == 0
     assert res["final"] == (3.0, 2.0, 0.0)
     assert [s for s in sock.sent if s.startswith("RUN")] == []
+
+
+def test_drive_to_zero_pulse_is_not_a_success(monkeypatch):
+    """R67：`iters=0` 的"归位成功"是**静默假成功**，不许再发出去。
+
+    真机现场：`drive_to(0,0)` 连跑三次全 `reached=True, iters=0`，车根本没动。
+    Task 12 只读 `reached`，于是把"没动过"记成"归位成功"。契约钉死：
+
+    - `reached=True` **必须**蕴含至少真的执行过一次动作（`moved`/`iters ≥ 1`）；
+    - 零迭代收敛改判 `reached=False` + `reason="already_at_target"`，
+      同时用 `at_target=True` 告诉调用方"车确实已经在容差内"（可以照常往下走，
+      但归位这件事本身没有执行过任何动作，必须能分辨）。
+    """
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]]})
+    h.locate = lambda: (3.0, 2.0, 0.0)          # 距目标 3.6 mm ≤ 12 mm
+
+    res = h.drive_to(0.0, 0.0, settle_s=0.0)
+
+    assert res["reached"] is False, "零次迭代不能算归位成功（R67）"
+    assert res["reason"] == "already_at_target"
+    assert res["reason"] in H.DRIVE_REASONS
+    assert res["at_target"] is True             # 车确实在容差内（≠ 闭环成功）
+    assert res["moved"] is False and res["iters"] == 0
+    assert res["start_dist_mm"] == pytest.approx(math.hypot(3.0, 2.0))
+    assert [s for s in sock.sent if s.startswith("RUN")] == []
+
+
+def test_drive_to_reached_implies_at_least_one_executed_pulse(monkeypatch):
+    """反过来也钉住：真收敛（有脉冲）仍然是成功，`reached` 不许被误伤。"""
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                   "RUN": [_run_chunks()]})
+    positions = [(90.0, 0.0, 0.0), (5.0, 0.0, 0.0)]
+    h.locate = lambda: positions.pop(0)
+
+    res = h.drive_to(0.0, 0.0, settle_s=0.0)
+
+    assert res["reached"] is True and res["reason"] == "converged"
+    assert res["moved"] is True and res["iters"] == 1
+    assert res["at_target"] is True
+    assert res["start_dist_mm"] == pytest.approx(90.0)
+    assert [s for s in sock.sent if s.startswith("RUN")] == ["RUN -0.0900 0.0000 0 400\n"]
+
+
+def test_drive_to_never_executed_is_reachable_from_every_reason(monkeypatch):
+    """零迭代的三种收工原因都不许报 `reached=True`（防止以后又改回单一布尔值）。"""
+    # ① 第一次 locate 就失败
+    h, _, _, _ = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]]}, locate_tries=1)
+    h.locate = lambda: None
+    res = h.drive_to(0.0, 0.0, settle_s=0.0)
+    assert (res["reached"], res["moved"], res["at_target"]) == (False, False, False)
+    assert res["reason"] == "locate_failed" and res["start_dist_mm"] is None
+
+    # ② RUN 被固件拒（没在跑）
+    h2, _, _, _ = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                "RUN": [[b"ERR RUN busy\n"]]})
+    h2.locate = lambda: (80.0, 0.0, 0.0)
+    res2 = h2.drive_to(0.0, 0.0, settle_s=0.0)
+    assert res2["reason"] == "run_rejected" and res2["reached"] is False
+    assert res2["moved"] is True               # 脉冲发过（被拒），但位置没到
+    assert res2["at_target"] is False
 
 
 def test_drive_to_stops_at_max_iter(monkeypatch):
@@ -496,7 +557,7 @@ def test_drive_to_accepts_the_exact_field_limit():
     h, _, _, _ = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]]})
     h.locate = lambda: (117.5, 0.0, 0.0)        # |x| 恰好 = 252.5 − 135
     res = h.drive_to(117.5, 0.0, settle_s=0.0)
-    assert res["reached"] is True
+    assert res["at_target"] is True            # 目标本身合法（零脉冲，R67 语义见上）
 
 
 def test_drive_to_validates_scalar_arguments():

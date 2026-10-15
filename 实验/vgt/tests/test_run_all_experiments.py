@@ -207,7 +207,8 @@ def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, build
     ]
     assert h.car_link.stops == 3                          # 每条结束 car.stop()
     assert stats == {"n_trials": 3, "n_ok": 3, "n_failed": 0,
-                     "n_homing_failed": 0, "archive_path": None}
+                     "n_homing_failed": 0, "n_homing_zero_pulse": 0,
+                     "archive_path": None}
     assert len(lines) == 3 and all("OK" in ln for ln in lines)
     assert any("200.0mm" in ln or "200.0 mm" in ln or "200.0" in ln for ln in lines)
 
@@ -250,6 +251,71 @@ def test_homing_failure_skips_the_trial_but_records_the_row(tmp_path, builder, x
     assert len(rows) == 1
     assert rows[0]["trial_ok"] is False
     assert rows[0]["trial_reason"] == "homing_locate_failed"
+
+
+# ------------------------------------------- 零脉冲归位（R67：静默假成功的堵法）
+
+def test_classify_homing_separates_real_success_from_zero_pulse():
+    """`drive_to` 的结果不是一个布尔值能说清的：三类必须分得开。"""
+    # 闭环真的动过并收敛
+    assert RA.classify_homing({"reached": True, "reason": "converged", "moved": True,
+                               "iters": 2}) == ("ok", None)
+    # 零迭代（新版 drive_to：reached=False + already_at_target）
+    assert RA.classify_homing({"reached": False, "reason": "already_at_target",
+                               "at_target": True, "moved": False, "iters": 0}) \
+        == ("zero_pulse", "already_at_target")
+    # 老字典/手造结果：只有 reached、明确说没动过 ⇒ 一律降级，绝不当成功
+    assert RA.classify_homing({"reached": True, "reason": "converged",
+                               "moved": False}) == ("zero_pulse", "already_at_target")
+    assert RA.classify_homing({"reached": True, "iters": 0}) == ("zero_pulse", "already_at_target")
+    # 真没归到位
+    assert RA.classify_homing({"reached": False, "reason": "max_iter", "iters": 12}) \
+        == ("failed", "max_iter")
+    assert RA.classify_homing({"reached": False, "reason": None}) == ("failed", "unknown")
+    # 退化兼容：老结果既没有 moved 也没有 iters，但 reached=True ⇒ 只能当成功
+    assert RA.classify_homing({"reached": True, "reason": "converged"}) == ("ok", None)
+
+
+def test_zero_pulse_homing_runs_the_trial_but_is_never_counted_as_success(tmp_path, builder, xlsx):
+    """零脉冲归位：**跑实验**（车实测在容差内，照常安全），但不许记成"归位成功"。
+
+    静默假数据（R67）的堵法：既不跳条（车确实在位，数据是真的），也不当成功 ——
+    打印行带醒目标记、计数单独统计、汇总行的 notes 里留痕（表里筛得出来）。
+    """
+    exp1 = _probe(1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0)],
+                    home_results=[{"reached": False, "reason": "already_at_target",
+                                  "at_target": True, "moved": False, "iters": 0,
+                                  "start_dist_mm": 4.1}])
+    lines = []
+
+    stats = RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                         printer=lines.append, archive=False)
+
+    assert h.trial_ids == [1]                    # 实验照跑（车在容差内）
+    assert stats["n_homing_zero_pulse"] == 1
+    assert stats["n_homing_failed"] == 0         # 不是"归位失败"：车确实在位
+    assert stats["n_ok"] == 1                    # 数据本身有效
+    assert "零脉冲" in lines[0] and "already_at_target" in lines[0]
+
+    rows = _summary_rows(openpyxl.load_workbook(xlsx)["data"])
+    assert rows[0]["trial_ok"] is True           # trial 本身合格
+    assert "homing_zero_pulse" in str(rows[0]["notes"])     # 但归位零脉冲留了痕
+
+
+def test_zero_pulse_that_is_not_at_target_is_a_homing_failure(tmp_path, builder, xlsx):
+    """零迭代 + 没到容差内（`at_target` 假）= 真没归位 ⇒ 跳条、留痕。"""
+    exp1 = _probe(1)
+    h = FakeHarness(home_results=[{"reached": False, "reason": "already_at_target",
+                                   "at_target": False, "moved": False, "iters": 0}])
+
+    stats = RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                         printer=lambda _s: None, archive=False)
+
+    assert h.trial_ids == []
+    assert stats["n_homing_failed"] == 1 and stats["n_homing_zero_pulse"] == 0
+    rows = _summary_rows(openpyxl.load_workbook(xlsx)["data"])
+    assert rows[0]["trial_reason"] == "homing_already_at_target"
 
 
 def test_stop_failed_aborts_the_whole_batch(tmp_path, builder, xlsx):
