@@ -291,24 +291,26 @@ REASON_TOO_FAR = "homing_too_far"
 # R72/B：连续几次脉冲实测位移 < `STUCK_STEP_MM`（推不动：起步死区/打滑）——
 # 不是"迭代不够"，所以不能混进 `max_iter`。
 REASON_STUCK = "homing_stuck"
-# R73：一个脉冲让车**离目标更远**（`gained_mm <= -STUCK_STEP_MM`）。**立刻停，别升级脉冲。**
+# R73/R74：车**离目标更远**。旧口径（R73：任何一次 `gained <= -STUCK_STEP_MM`
+# 就当场收手）在真机上变成了**误判源**：末段从 `d≈4–6 mm` 发 180/270 ms 的脉冲，
+# 实际走过去 ~15–30 mm、冲过目标，标量误差反超 `tol + 最小单步`，就被当成
+# "方向反了"。#12 rep2 的三条 trace 标量误差都**单调下降** —— 物理上没有反向。
 #
-# 实测（2026-10-15 Task 12 Step 4 补跑 #07 rep3，真机）：车头 yaw 只有 −3.4°、场地中心
-# 附近，`drive_to` 的三个脉冲是 `d=14,8,26 | ms=160,191,480`。第二个脉冲让误差从 8 mm
-# **涨到** 26 mm（`gained = −18 mm`）—— 车往反方向走了；而 `gained < STUCK_STEP_MM`
-# 在 R72/B 的分类里落进 `else` 分支，被当成"推不动"，于是下一发**放大** 1.5 倍到
-# 480 ms。这一发把车送出 187 mm、直接停在边界码 ID20 上压住它 ⇒ `locate()` 彻底失败
-# （视觉死锁，必须人工搬车）。
-#
-# 也就是说：R72/B 的 `else`（`|gained| < 2 mm` 的起步死区）把"**反方向走了 18 mm**"
-# 误分类成"推不动"，并用脉冲升级把失控**放大**。本条把两件事分开：
-#   `gained <= -STUCK_STEP_MM` → 方向反了 → `wrong_way`，**当场收手**；
-#   `-STUCK_STEP_MM < gained < STUCK_STEP_MM` → 真的没动 → 才算 `homing_stuck` 并升级。
-#
-# ⚠ 这是**兜底护栏，不是已查明的修法**。为什么反向，根因仍未查明（候选：命令方向与
-# 实际轮向不一致 / 视觉在大车体角解错位姿 / MIN_DUTY 钳位）。这里只保证"一旦发现车
-# 往反方向走了，就不要再发更大的脉冲把它推得更远"。
+# R74 的两条判据（满足其一才收手）：
+#   ① **连续两步**标量误差都变大（各 ≥ `STUCK_STEP_MM`）—— 单步过冲不算；
+#   ② 单步位移矢量与"脉冲前误差方向"的投影 ≤ −`STUCK_STEP_MM`（夹角 > 90°，
+#      车真的朝反方向走了）。过冲的位移仍沿原误差方向穿过目标（投影为正），
+#      不会触发 ②；而 R73 的原始真机案例（8 → 26 mm，反向 18 mm）仍被 ②
+#      在**单步**内抓住 —— 这是两者的分界线。
 REASON_WRONG_WAY = "homing_wrong_way"
+# R74：分辨率地板。`tol` 可以小于一个最小脉冲的步长（真机 `tol=4 < 120 ms` 的
+# 7.4 mm），于是"离目标一个最小步之内"时闭环**物理上走不细**：误差落进
+# `d <= tol + 本方向最小单步` 后最多再发**一发最小脉冲**，然后以本原因收工。
+# 它**不是失败**：`classify_homing` 把它归入"照跑实验 + 留痕"档（车就在目标旁
+# 一个最小步内、位置由 `locate()` 实测、实验只关心相对位移；R67 的"零脉冲不算
+# 成功"是另一件事）。这一段也绝不升级脉冲、不判 `stuck` —— 旧实现正是在这里
+# 把"推不动"升级成 180/270 ms 并记成 `homing_stuck`。
+REASON_FLOOR = "homing_floor"
 DRIVE_REASONS = (
     "converged",
     REASON_ALREADY_AT_TARGET,
@@ -318,6 +320,7 @@ DRIVE_REASONS = (
     REASON_TOO_FAR,
     REASON_STUCK,
     REASON_WRONG_WAY,
+    REASON_FLOOR,
 )
 
 # ---- 归位步长模型（R70）------------------------------------------------------------
@@ -347,8 +350,11 @@ STEP_KICK_FLOOR_MM = 7.4
 # 步长估可达距离会高估 ~2.5 倍，于是 204 mm 的横向归位被"可达"放行、实际烧满
 # `max_iter` 仍差几十毫米（#01 rep2/rep3 实测 `homing_max_iter`）。
 STRAFE_STEP_FACTOR = 0.40
-# 归位脉冲的档位边界与单步上限（R72/A 的调度器用）：细脉冲下限 = 固件 kick 量级
-# （更短转不动），单步上限把"甩过目标点"的可能性按几何压掉。
+# 归位脉冲的档位边界与单步上限（R72/A 建的调度器、R74 起只用模型反解）：
+# 细脉冲下限 = 固件 kick 量级（更短转不动），单步上限把"甩过目标点"的可能性按几何压掉。
+# ⚠ R74：脉宽**只由 `pulse_ms_for_step_mm`（模型反解）给出**，不再用
+# `gained / 本轮ms` 自估速率 —— 那个分母把 ~105–140 ms 起步死区算了进去，
+# 误差越小 rate 越被低估、反解出的脉冲反而越长（#12 rep2 的 120/180/270 ms 根因）。
 STEP_MIN_PULSE_MS = 120.0
 STEP_MAX_PULSE_MS = 500.0
 MAX_HOMING_STEP_MM = 45.0
@@ -554,9 +560,11 @@ def pulse_ms_for_step_mm(want_mm, *, straight_fraction=1.0,
                          lo_ms=STEP_MIN_PULSE_MS, hi_ms=STEP_MAX_PULSE_MS) -> int:
     """想走 `want_mm` 需要多长的脉冲（ms）——`expected_step_mm` 的反解（R72/A）。
 
-    步长模型只有 ±20% 的可信度，而**实测速率**（上一轮的位移 ÷ 时长）可以现场校准；
-    所以调度器用它反解脉冲宽度。`lo_ms`/`hi_ms` 是算子给的档位边界
-    （细脉冲 ~120 ms、算子给的粗脉冲上限）。
+    R74 起这是**唯一**的脉宽来源：调度器不再用 `gained / 本轮ms` 自估速率
+    （那个分母含起步死区，短脉冲的 rate 被严重低估 ⇒ 误差越小脉冲越长）。
+    模型只有 ±20% 的可信度 —— 要改就改 `STEP_SLOPE_MM_PER_MS`/`STEP_DEAD_MS`
+    这些常量（整体重建模型），不要在闭环里现学现卖。
+    `lo_ms`/`hi_ms` 是算子给的档位边界（细脉冲 ~120 ms、算子给的粗脉冲上限）。
     """
     want = max(0.0, float(want_mm))
     # 反解：step = (0.4+0.6·frac)·slope·(T−dead) ⇒ T = dead + step/斜率
@@ -870,7 +878,7 @@ class Harness:
         给了 `coarse_pulse_ms` 时：误差 > `coarse_switch_mm` 用粗脉冲，否则用
         `pulse_ms`（细），可达集随之拉长到 `homing_reach_mm(..., coarse_pulse_ms=…)`。
 
-        失败语义：
+        失败语义（R74 起 `homing_floor` 只对"失败"分类的调用方生效 —— 它**不是**失败）：
 
         - `locate()` 抛 `BoundaryMarkersMoved` → **立即向上冒泡**（"立即中止"，R18）；
         - 起点误差超出可达集 → `reason="homing_too_far"`（零脉冲）；
@@ -878,10 +886,20 @@ class Harness:
           恢复成功则继续下一圈（这一圈的位移已经算数），失败抛 `StopFailed`；
         - 固件回 `ERR`（RUN 被拒）→ 收工，`reason="run_rejected"`；
         - `locate()` 连续失败 → 收工，`reason="locate_failed"`；
-        - 脉冲用满还没进 `tol_mm` → 收工，`reason="max_iter"`；
+        - 脉冲用满、误差在地板之上还没进 `tol_mm` → 收工，`reason="max_iter"`；
         - **第一次 `locate()` 就在容差内**（一条 RUN 都没发）→ 收工，
           `reason="already_at_target"` 且 `reached=False`（R67：零脉冲不许算成功），
-          `at_target=True` 仍然告诉调用方"车确实在位"。
+          `at_target=True` 仍然告诉调用方"车确实在位"；
+        - 误差落进**分辨率地板**（`d ≤ tol + 本方向最小单步`，直行最小步 = 120 ms
+          的 7.4 mm）：最多再发**一发最小脉冲**，仍进不了容差 → `reason="homing_floor"`，
+          `reached=False, at_target=False`（不谎报进容差），但**不是失败** ——
+          `classify_homing` 把它归入"照跑实验 + 留痕"档（R74）。
+
+        **方向守卫（R74）**：一个脉冲让车离目标更远时，只有满足其一才收工
+        `reason="homing_wrong_way"`：① 位移矢量在脉冲前误差方向上的投影
+        ≤ −`STUCK_STEP_MM`（真·反着走）；② **连续两步**标量误差都变大 ≥ 2 mm。
+        单步过冲（穿过目标、投影为正）只记 `away_run=1` 继续闭环 —— #12 rep2 的
+        两次误判正是把单步过冲当成反向。
 
         返回字典里 `reached` / `at_target` / `moved` / `start_dist_mm` 的区别见模块
         docstring 的「`reached` 的语义（R67）」一节。
@@ -934,11 +952,12 @@ class Harness:
         start_dist_mm = None
         reason = "locate_failed"
         pos = self._locate_retry()
-        # R72/A：实测速率（mm/ms）。**第一轮没有实测值**，用模型当先验；每轮脉冲后
-        # 用"上一轮误差距离的减少量 ÷ 时长"更新 —— 步长模型的 ±20% 偏差因此在两三轮内
-        # 被自己的测量取代，而不是一路错到 `max_iter`。
-        rate_mm_per_ms = None
+        # 两个计数器分开数（处置完全不同）：`stuck_run` = 连续"推不动"（R72/B）、
+        # `away_run` = 连续"越走越远"（R74）。`floor_used` = 分辨率地板里那**一发**
+        # 最小脉冲是否已经发过（R74，见下面 in_floor 分支）。
         stuck_run = 0
+        away_run = 0
+        floor_used = False
         while pos is not None:
             final = pos
             ex, ey = x_t - pos[0], y_t - pos[1]
@@ -963,45 +982,62 @@ class Harness:
                 if dist > reach:
                     reason = REASON_TOO_FAR
                     break
-            if iters >= iter_cap:
-                reason = "max_iter"
-                break
-            if stuck_run >= STUCK_MAX_STEPS:
-                # R72/B：连续几次脉冲实测位移 < 2 mm —— 不是"迭代不够"，是**推不动**
-                # （落进起步死区 / 地面打滑 / 模型错）。给它自己的名字，分诊时能一眼
-                # 分开"死区"与"模型高估"。
-                reason = REASON_STUCK
-                break
 
-            # R72/A：自适应脉冲宽度。上一步实测速率反解"要走多远要多少 ms"，并把单步
-            # 钉在 `err − tol/2` ⇒ **数学上不可能甩过目标点**，也就不可能有周期 2
-            # 极限环；粗/细两段式是这个公式的两个特例（远距离自然取到算子给的粗脉冲上限，
-            # 近距离自然落到细脉冲下限）。
+            # R74 分辨率地板：`tol` 可以小于**一个最小脉冲的步长**（真机 tol=4 <
+            # 120 ms 的 7.4 mm）⇒ 误差落进 `tol + 本方向最小单步` 后，闭环物理上
+            # 走不细。规则：最多再发**一发最小脉冲**，再量一次；还是进不了容差就以
+            # `homing_floor` 收工（**非失败**：车就在目标旁一个最小步内）——
+            # 这一段的脉冲**不许升级**、**不许判 stuck/wrong_way**（旧实现正是在
+            # 这里把"推不动"升级成 180/270 ms、把末段过冲判成反向）。
             frac = straight_fraction_of(ex, ey)
-            want = max(tol * 0.5, dist - tol * 0.5)
-            if coarse_ms is not None:
-                want = min(want, MAX_HOMING_STEP_MM)
+            min_pulse = max(int(STEP_MIN_PULSE_MS), ms)
+            floor_step = expected_step_mm(STEP_MIN_PULSE_MS, straight_fraction=frac)
+            in_floor = dist <= tol + floor_step
+            if in_floor and (floor_used or iters >= iter_cap):
+                reason = REASON_FLOOR
+                break
+            if not in_floor:
+                if iters >= iter_cap:
+                    reason = "max_iter"
+                    break
+                if stuck_run >= STUCK_MAX_STEPS:
+                    # R72/B：连续几次脉冲实测位移 < 2 mm —— 不是"迭代不够"，是**推不动**
+                    # （落进起步死区 / 地面打滑 / 模型错）。给它自己的名字，分诊时能一眼
+                    # 分开"死区"与"模型高估"。
+                    reason = REASON_STUCK
+                    break
+
+            if in_floor:
+                # 地板里只发**一发最小脉冲**：此距离上模型反解没有意义（给的是
+                # "最小能走多远"，不是"想走多远"）；也**跳过** stuck 升级链。
+                floor_used = True
+                use_ms = min_pulse
             else:
-                want = min(want, tol)                       # 单段：细脉冲，步长 ≤ 容差
-            hi = coarse_ms if coarse_ms is not None else int(STEP_MAX_PULSE_MS)
-            if rate_mm_per_ms is not None:
-                # 有实测速率就直接反解它（模型只当第一轮的先验）——真机上模型高估 3 倍
-                # 的那种情形，两轮之内就自己纠正过来了。
-                use_ms = int(min(hi, max(max(STEP_MIN_PULSE_MS, ms),
-                                        round(want / rate_mm_per_ms))))
-            else:
+                # R74：脉冲宽度只由**步长模型反解**（`ms = 120 + want/斜率`），把单步
+                # 钉在 `err − tol/2` ⇒ 数学上不可能甩过目标点。**不再**用
+                # `gained / 本轮ms` 自估速率 —— 那个分母把 ~105–140 ms 起步死区算了
+                # 进去，误差越小 rate 越被低估、反解出的脉冲反而越长（#12 rep2 的
+                # 120/180/270 ms 根因）。粗/细两段式是这个公式的两个特例。
+                want = max(tol * 0.5, dist - tol * 0.5)
+                if coarse_ms is not None:
+                    want = min(want, MAX_HOMING_STEP_MM)
+                else:
+                    want = min(want, tol)                   # 单段：细脉冲，步长 ≤ 容差
+                hi = coarse_ms if coarse_ms is not None else int(STEP_MAX_PULSE_MS)
                 use_ms = pulse_ms_for_step_mm(
                     want, straight_fraction=frac,
-                    lo_ms=max(STEP_MIN_PULSE_MS, ms),
+                    lo_ms=min_pulse,
                     hi_ms=max(int(STEP_MAX_PULSE_MS), hi))
-            if stuck_run:
-                use_ms = int(min(STEP_MAX_PULSE_MS,
-                                 round(use_ms * STUCK_ESCALATION ** stuck_run)))
+                if stuck_run:
+                    use_ms = int(min(STEP_MAX_PULSE_MS,
+                                     round(use_ms * STUCK_ESCALATION ** stuck_run)))
             vx, vy = body_command(ex, ey, pos[2], v_max=vmax)
             iters += 1
             run_line = "RUN {:.4f} {:.4f} 0 {}".format(vx, vy, use_ms)
             rec = {"iter": iters, "pos": pos, "err_mm": (ex, ey), "dist_mm": dist,
                    "cmd": (vx, vy, use_ms), "run_line": run_line}
+            if in_floor:
+                rec["floor_pulse"] = True
             try:
                 self._send_line(self.car_link, run_line)
             except Exception as exc:                       # 发不出去 = 链路有问题
@@ -1017,38 +1053,51 @@ class Harness:
             if outcome == "done":
                 trace.append(rec)
                 time.sleep(settle)
-                prev_dist = dist
+                prev_pos, prev_dist = pos, dist
                 pos = self._locate_retry()
                 if pos is None:
                     reason = "locate_failed"
                     continue
-                # R72/A：用这一轮**实测**的位移更新速率（投影到误差方向的减少量）。
+                # 这一发的位移：标量减少量 `gained` + 位移矢量在**脉冲前误差方向**
+                # 上的投影 `along`（R74 判据 ② 的原料，两个都进 trace 供分诊）。
                 new_dist = math.hypot(x_t - pos[0], y_t - pos[1])
                 gained = prev_dist - new_dist
                 rec["gained_mm"] = round(gained, 1)
-                if gained <= -STUCK_STEP_MM:
-                    # R73：一个脉冲把车推**离目标更远**。当场收手、给名字 ——
-                    # 绝不能让它掉进下面的 `else`（"推不动"）去触发脉冲升级：
-                    # 实测就是这样 160 → 191 → 480 ms，最后一发送出 187 mm 并压住
-                    # 边界码 ID20，视觉死锁。**根因未查明，这只是护栏。**
-                    reason = REASON_WRONG_WAY
-                    rec["wrong_way"] = True
-                    warnings.warn(
-                        f"drive_to: 第 {iters} 个脉冲让车**离目标更远** "
-                        f"（gained={gained:+.1f} mm，脉冲 {use_ms} ms，"
-                        f"误差 {prev_dist:.1f} → {new_dist:.1f} mm）—— 已收手，"
-                        "不再发更大的脉冲。命令方向与实际轮向不一致的根因仍未查明。",
-                        RuntimeWarning, stacklevel=2)
-                    break
-                if gained >= STUCK_STEP_MM:
-                    measured = gained / float(use_ms)
-                    rate_mm_per_ms = (measured if rate_mm_per_ms is None
-                                      else 0.5 * rate_mm_per_ms + 0.5 * measured)
-                    rec["rate_mm_per_ms"] = round(rate_mm_per_ms, 6)
+                ux = (x_t - prev_pos[0]) / prev_dist
+                uy = (y_t - prev_pos[1]) / prev_dist
+                along = ((pos[0] - prev_pos[0]) * ux
+                         + (pos[1] - prev_pos[1]) * uy)
+                rec["along_mm"] = round(along, 1)
+                went_back = along <= -STUCK_STEP_MM
+                if went_back or gained <= -STUCK_STEP_MM:
+                    # R74 的两条判据，见 `REASON_WRONG_WAY` 的常量注释：
+                    #   ② 单步位移反向（投影 ≤ −2 mm）⇒ 当场收手；
+                    #   ① 只有"标量连续两步变大"才升级成反向 —— 单步过冲（穿过
+                    #     目标继续走、投影为正）在下面只记 away_run=1，**不收手**。
+                    away_run += 1
+                    rec["away_run"] = away_run
+                    if went_back or away_run >= 2:
+                        reason = REASON_WRONG_WAY
+                        rec["wrong_way"] = True
+                        why = ("单步位移与误差方向夹角 >90°" if went_back
+                               else f"连续 {away_run} 步标量误差都变大")
+                        warnings.warn(
+                            f"drive_to: 第 {iters} 个脉冲让车**朝反方向走** "
+                            f"（{why}：along={along:+.1f} mm，gained={gained:+.1f} mm，"
+                            f"脉冲 {use_ms} ms，误差 {prev_dist:.1f} → {new_dist:.1f} mm）"
+                            "—— 已收手，不再发更大的脉冲。",
+                            RuntimeWarning, stacklevel=2)
+                        break
+                    # 单步增大（未达"连续两步"）：不判反向、也**不许**触发脉冲升级，
+                    # 下一发继续按模型反解、最多再观察一步。
                     stuck_run = 0
                 else:
-                    stuck_run += 1
-                    rec["stuck_run"] = stuck_run
+                    away_run = 0
+                    if gained >= STUCK_STEP_MM:
+                        stuck_run = 0
+                    else:
+                        stuck_run += 1
+                        rec["stuck_run"] = stuck_run
                 continue
             if outcome == "error":
                 rec["errors"] = list(stats.get("errors", []))

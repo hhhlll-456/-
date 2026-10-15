@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from car_link import CarLink                                   # noqa: E402
 from vgt.camera import CameraSession                           # noqa: E402
-from vgt.harness import Harness                                # noqa: E402
+from vgt.harness import REASON_FLOOR, Harness                  # noqa: E402
 from vision_core import load_calib                             # noqa: E402
 
 LOG = Path(__file__).resolve().parent / "recenter.jsonl"
@@ -115,6 +115,16 @@ def main(argv=None):
                   f"{'?' if start is None else format(float(start), '.1f')} mm ≤ 容差 "
                   f"{TOL_MM:g} mm，本次归位没执行过任何动作（车确实在位，但不计为"
                   "「归位真的动过」）")
+        # R74 的第三档「分辨率地板」：误差 ≤ tol + 最小单步（本脚本 tol=6，
+        # 直行最小步 7.4 mm），闭环按设计收工、**不是失败**。本脚本的用途是"把车
+        # 摆到一个已知安全的位置"—— 车就在中心旁一个最小步内、位置由 locate()
+        # 实测，判成失败会让补跑卡死（与 zero_pulse 同理，见上面那段坑）。
+        out["home"]["floor"] = bool(str(home.get("reason") or "") == REASON_FLOOR)
+        if out["home"]["floor"]:
+            out["home"]["ok"] = True
+            print(f"  ⚠ 分辨率地板归位（homing_floor，R74）：末段误差 ≤ 容差 + "
+                  f"最小单步，闭环按设计收工 —— 不是失败（车就在目标旁一个最小步内，"
+                  f"位置已实测；本脚本以此位置为准）")
         car.stop()
     print(json.dumps(out, ensure_ascii=False, indent=2))
     LOG.open("a").write(json.dumps(out, ensure_ascii=False) + "\n")

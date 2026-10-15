@@ -315,6 +315,7 @@ def test_batch_loop_homes_runs_writes_prints_and_stops_per_trial(tmp_path, build
     assert h.car_link.stops == 3                          # 每条结束 car.stop()
     assert stats == {"n_trials": 3, "n_ok": 3, "n_failed": 0,
                      "n_homing_failed": 0, "n_homing_zero_pulse": 0,
+                     "n_homing_floor": 0,
                      "n_yaw_failed": 0, "n_yaw_corrected": 0,
                      "archive_path": None}
     assert len(lines) == 3 and all("OK" in ln for ln in lines)
@@ -465,6 +466,52 @@ def test_homing_stuck_gets_its_own_reason_in_the_table(tmp_path, builder, xlsx):
     row = _summary_rows(openpyxl.load_workbook(xlsx)["data"])[0]
     assert stats["n_failed"] == 1 and stats["n_homing_failed"] == 1
     assert row["trial_reason"] == "homing_stuck"
+
+
+# ------------------------------------------- 分辨率地板（R74：#12 rep2 的 stuck 误判）
+
+def test_classify_homing_floor_is_not_a_failure():
+    """R74：`homing_floor`（车停在分辨率地板内）= 非失败——照跑实验，单独留痕。
+
+    `tol=4 < 最小单步 7.4 mm`：`d ≤ tol + 最小单步` 这一段闭环本来就走不细，
+    记成 `failed` 会把"车其实就在目标旁一个最小步内"误报成"没归位"。
+    """
+    assert RA.classify_homing({"reached": False, "reason": "homing_floor",
+                               "at_target": False, "moved": True, "iters": 6}) \
+        == ("floor", "homing_floor")
+    # 已经有脉冲、车也动过：不是 zero_pulse，不许混进那一档
+    assert RA.classify_homing({"reached": False, "reason": "homing_floor",
+                               "at_target": False, "moved": True, "iters": 6})[0] \
+        != "zero_pulse"
+
+
+def test_floor_homing_runs_the_trial_with_a_note(tmp_path, builder, xlsx):
+    """地板归位：实验**照跑**（起点误差 ≤ tol+最小单步），但不是"归位成功"。
+
+    与零脉冲同款的三件事：打印行标记、单独计数、汇总行 notes 留痕（表里筛得出来）。
+    """
+    exp1 = _probe(1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0)],
+                    home_results=[{"reached": False, "reason": "homing_floor",
+                                   "at_target": False, "moved": True, "iters": 4,
+                                   "start_dist_mm": 43.7,
+                                   "final": (0.0, 9.0, 0.0),
+                                   "trace": [{"dist_mm": 44.0, "cmd": (0, 0, 204)},
+                                             {"dist_mm": 8.0, "cmd": (0, 0, 120),
+                                              "floor_pulse": True}]}])
+    lines = []
+
+    stats = RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx,
+                         printer=lines.append, archive=False)
+
+    assert h.trial_ids == [1]                    # 实验照跑（车就在目标旁一个最小步内）
+    assert stats["n_homing_floor"] == 1
+    assert stats["n_homing_failed"] == 0         # 不是"归位失败"
+    assert stats["n_ok"] == 1                    # trial 数据本身有效
+    assert "地板" in lines[0] and "homing_floor" in lines[0]
+    rows = _summary_rows(openpyxl.load_workbook(xlsx)["data"])
+    assert rows[0]["trial_ok"] is True
+    assert "homing_floor" in str(rows[0]["notes"])          # 留痕，不静默
 
 
 # ------------------------------------------- 归位脉冲宽度（真机：400 ms 必振荡）

@@ -13,7 +13,7 @@
 `homing_*` 失败 → `harness.run_trial(exp)` → `compare.write_trial` 入表（失败也写）
 → 打印一行"视觉 vs 里程计"对比 → 收尾 `car.stop()`。
 
-## Important 3（R67）：归位结果必须分三类，不能只读 `reached`
+## Important 3（R67）+ R74：归位结果必须分档，不能只读 `reached`
 
 真机现场：`drive_to(0,0)` 连跑三次全 `reached=True, iters=0` —— **车根本没动**。
 本文件原来只看 `reached`，于是把"没动过"记成"归位成功"（静默假数据）。
@@ -25,6 +25,10 @@
   是真的），但打印行带 `⚠零脉冲` 标记、计入 `n_homing_zero_pulse`、并往 trial 的
   `warnings` 里塞一条 `homing_zero_pulse`（`write_trial` 会写进汇总行的 `notes` 列 ——
   表里筛得出来，不留无声痕迹）；
+- `"floor"`（R74）—— `homing_floor`：误差落进**分辨率地板**（`tol + 本方向最小单步`，
+  真机 `tol=4 < 7.4 mm`）后按设计收工。同上处理：实验**照跑**、计入
+  `n_homing_floor`、notes 留 `homing_floor` 痕迹 —— 它**不是失败**（车就在目标旁一个
+  最小步内、位置由 `locate()` 实测；#12 rep2 的两次误判就出在这一段的处置上）；
 - `"failed"` —— 真没归位：不跑实验（车在哪不知道，开电机等于盲开），只写一行
   `trial_reason="homing_*"` 的失败记录，继续下一条。
 
@@ -60,7 +64,8 @@ from pathlib import Path
 from vgt import compare, matrix
 from vgt.harness import (DEFAULT_MAX_ITER, DEFAULT_PULSE_MS, DEFAULT_TOL_MM,
                          DEFAULT_YAW_TOL_DEG,
-                         REASON_ALREADY_AT_TARGET, body_delta_to_field,
+                         REASON_ALREADY_AT_TARGET, REASON_FLOOR,
+                         body_delta_to_field,
                          compress_trace as harness_compress_trace)
 
 # 规划起点假定的车头朝向（度）：`matrix` 的几何前提是"归位后车头已对齐"（R15），
@@ -69,14 +74,19 @@ PLANNED_START_YAW_DEG = 0.0
 
 
 def classify_homing(home: dict) -> tuple[str, str | None]:
-    """`drive_to` 的结果 → `("ok" | "zero_pulse" | "failed", reason)`（R67）。
+    """`drive_to` 的结果 → `("ok" | "zero_pulse" | "floor" | "failed", reason)`（R67/R74）。
 
-    一个布尔值说不清这件事，必须分三类（词表见模块 docstring）：
+    一个布尔值说不清这件事，必须分档（词表见模块 docstring）：
 
     - `"ok"`：闭环**真的动过**并且收敛（`reached and moved`）；
     - `"zero_pulse"`：车**实测**在容差内，但这次一条 RUN 都没发（`iters == 0`）——
       `harness` 报 `reached=False, reason="already_at_target", at_target=True`；
       这是"起点本来就达标"的合法情形，但**绝不是归位成功**（R67 的静默假成功）；
+    - `"floor"`（R74）：`homing_floor` —— 误差落进**分辨率地板**
+      （`d ≤ tol + 本方向最小单步`；真机 `tol=4 < 120 ms` 的 7.4 mm）后按设计收工。
+      车就在目标旁一个最小步内、位置由 `locate()` 实测、实验只关心**相对位移**
+      ⇒ **不是失败**：照常跑实验 + 留痕（与 `zero_pulse` 同一档的处置，但不叫
+      零脉冲 —— 它通常已经发过至少一发最小脉冲）；
     - `"failed"`：真没归到位（`locate_failed` / `max_iter` / `run_rejected` …）。
 
     兜底（老结果字典、手造字典）：`moved` 缺失时用 `iters` 判；`reached=True` 且明确
@@ -94,6 +104,9 @@ def classify_homing(home: dict) -> tuple[str, str | None]:
 
     if reached and moved is True:
         return "ok", None
+    if reason == REASON_FLOOR:
+        # R74：分辨率地板收工 = 非失败（照跑实验 + 留痕）；绝不落进下面的 failed。
+        return "floor", REASON_FLOOR
     if reason == REASON_ALREADY_AT_TARGET or (reached and moved is False):
         # 零脉冲：只有"车确实在容差内"才允许照常跑实验，否则按没归位处理。
         return ("zero_pulse", REASON_ALREADY_AT_TARGET) if at_target \
@@ -110,6 +123,19 @@ def _zero_pulse_note(home: dict) -> str:
     return (f"homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代"
             f"（drive_to reason={REASON_ALREADY_AT_TARGET}{start_txt}）—— "
             "车确实在位，但本次归位没有执行过任何动作，不计为归位成功")
+
+
+def _floor_note(home: dict) -> str:
+    """分辨率地板归位的留痕文字（R74；进打印行与 xlsx 的 `notes` 列）。"""
+    start = home.get("start_dist_mm")
+    start_txt = "" if start is None else f"，起点实测距目标 {float(start):.1f} mm"
+    cols = [f"d={float(t['dist_mm']):.0f}" for t in (home.get("trace") or [])
+            if "dist_mm" in t]
+    tail_txt = f"；trace d={','.join(cols[-6:])}" if cols else ""
+    return (f"homing_floor（分辨率地板归位）：末段误差 ≤ tol + 最小单步（120 ms 的 "
+            f"7.4 mm 量级），最多发一发最小脉冲后按设计收工"
+            f"（drive_to reason={REASON_FLOOR}，iters={home.get('iters', '?')}"
+            f"{start_txt}{tail_txt}）—— **不是失败**，trial 只关心相对位移")
 
 
 def plan_start_xy(exp) -> tuple[float, float]:
@@ -294,7 +320,8 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
     """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
 
     返回统计：`n_trials / n_ok / n_failed / n_homing_failed / n_homing_zero_pulse /
-    archive_path`。安全异常（`StopFailed`/`BoundaryMarkersMoved`）原样冒泡中止整批。
+    n_homing_floor / archive_path`。安全异常（`StopFailed`/`BoundaryMarkersMoved`）
+    原样冒泡中止整批。
 
     `pulse_ms`：传给 `drive_to` 的**归位脉冲宽度**（默认 = `harness` 默认 400 ms）。
     ⚠ 真机实测（Task 10 清单 5.3 / SDD 台账）：400 ms 单脉冲步长 131.8–148.2 mm
@@ -321,7 +348,7 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
     """
     trials = list(iterate_trials(experiments, only=only, trial_filter=trial_filter))
     stats = {"n_trials": len(trials), "n_ok": 0, "n_failed": 0,
-             "n_homing_failed": 0, "n_homing_zero_pulse": 0,
+             "n_homing_failed": 0, "n_homing_zero_pulse": 0, "n_homing_floor": 0,
              "n_yaw_failed": 0, "n_yaw_corrected": 0, "archive_path": None}
 
     for index, (exp, rep) in enumerate(trials, start=1):
@@ -342,6 +369,10 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
                     # R67：车在位但归位没动过 —— 照跑实验，但绝不当成功，且留痕。
                     stats["n_homing_zero_pulse"] += 1
                     homing_note = _zero_pulse_note(home)
+                elif kind == "floor":
+                    # R74：停在分辨率地板（tol+最小单步）—— 不是失败，照跑 + 留痕。
+                    stats["n_homing_floor"] += 1
+                    homing_note = _floor_note(home)
                 # R71：平移类实验前把车头摆正（`drive_to` 只平移）。
                 yaw = _yaw_gate(harness, exp, stats, yaw_tol_deg)
                 if not yaw["ok"]:
@@ -506,6 +537,10 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
         printer(f"⚠ 另有 {stats['n_homing_zero_pulse']} 条的归位是**零脉冲**"
                 f"（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，"
                 "但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。")
+    if stats["n_homing_floor"]:
+        printer(f"⚠ 另有 {stats['n_homing_floor']} 条的归位停在**分辨率地板**"
+                f"（homing_floor，R74：误差 ≤ tol + 最小单步、最多发一发最小脉冲）："
+                "实验照跑，数据有效（只关心相对位移），汇总行 notes 里有 homing_floor 留痕。")
     printer(f"车头（R71）：摆头 {stats['n_yaw_corrected']} 条、失败 "
             f"{stats['n_yaw_failed']} 条。")
     return 0 if stats["n_failed"] == 0 else 1
