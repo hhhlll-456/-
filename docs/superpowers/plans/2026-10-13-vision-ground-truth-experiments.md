@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> ⚠️ **历史派单书（原文不改）**：本文件写于 2026-10-13，其中的「车载码在左甲板、FL 与 RL 之间」是当时的**既定前提（旧说法）**。**R46**（2026-10-14 现场指认 + A1 卷尺/实拍复核）已更正为**车尾横向中线**（后轴前方约 5 mm、左偏 1.5 mm）——以 `小车档案.md` §4 为准。本文件其余内容按历史原样保留，仅作追溯用。
+
 **Goal:** 建立一条零手工的实验管线——PC 经 Wi-Fi 下发一条走/转指令，自动拍摄起/中/终三点、用 `solvePnP` 解算场地系下的位移 mm 与转角 deg，并与编码器/IMU 解算并排入表。
 
 **Architecture:** 分三层。**视觉真值核心**（纯 numpy/cv2，无硬件依赖，可离线单测）：检测 5 个 ArUco → `solvePnP` 单码位姿 → 4 边界码构建场地系 → 车体偏置修正 → 输出 `(x_mm, y_mm, yaw_deg)`。**固件**（ESP32）：流式遥测（修掉"全缓冲到 DONE"）、掉电缓解、wheel_map 双表重建。**PC 调度器**：视觉闭环归位 → 三点拍照 → 收遥测 → 对比入表。
