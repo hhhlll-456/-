@@ -171,6 +171,17 @@ CAR_HALF_WIDTH_MM = 74.5
 X_LIMIT_MM = FIELD_HALF_LENGTH_MM - CAR_HALF_LENGTH_MM     # ±117.5
 Y_LIMIT_MM = FIELD_HALF_WIDTH_MM - CAR_HALF_WIDTH_MM       # ±51.4
 
+# --------------------------------------------------------------------------
+# 4b) 横移标定只覆盖到 4 cm —— 超出即外推，方向不可控（2026-10-15 现场否证）
+# --------------------------------------------------------------------------
+# 横移两组真机行的时长档位：左移 150–285 ms、右移 130–300 ms。
+# 对应行程上限 42.4 mm（右移 300 ms 档）。50 cm 横移 = 标定上限的 7.9 倍，
+# 同一指令跑三次净转 −9.52° / +16.00° / −11.61°（符号随机）：
+# 前 0.5 s 三次都是 +3.6~+3.9°（就是 YAW_BIAS_DEG 那个常数偏置），
+# 再往后由麦轮辊子侧向打滑主导，方向随机。见 小车修正公式.md §4.1。
+# 直行没有这个问题（150 cm 样本外只歪 −0.38°），所以**长距离用直行**。
+STRAFE_CAL_MAX_MM = 42.4
+
 
 # --------------------------------------------------------------------------
 # 5) 修正公式本体
@@ -245,6 +256,10 @@ def plan(dx_mm: float = 0.0, dy_mm: float = 0.0, dpsi_deg: float = 0.0) -> dict:
                 f"{s['yaw_bias_deg']:+.2f}°（组内散布 ±{s['yaw_spread_deg']:.2f}°）"
                 f" —— 开环补不掉，见 YAW_BIAS_DEG。")
     y_step = [s for s in steps if s["channel"] == "横向"]
+    if y_step and abs(y_step[0]["requested"]) > STRAFE_CAL_MAX_MM:
+        warn.append(f"横移 {y_step[0]['requested']} mm 超出**标定区间**（上限 "
+                    f"{STRAFE_CAL_MAX_MM:.1f} mm）—— 时长是外推，只能保证把车送出去，"
+                    f"**不能保证走直**（方向随机）。长距离请改用直行，或拆成多段短的。")
     if y_step and abs(y_step[0]["requested"]) > Y_LIMIT_MM:
         warn.append(f"横移 {y_step[0]['requested']} mm 超过车中心可用半宽 ±{Y_LIMIT_MM:.1f} mm"
                     f"（y 方向全场只有 {2*Y_LIMIT_MM:.0f} mm 可用）—— 一趟做不到，得分几步。")
