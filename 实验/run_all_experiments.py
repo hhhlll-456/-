@@ -195,7 +195,7 @@ def _final_stop(harness, printer) -> None:
 
 def run_batch(harness, *, experiments, only=None, xlsx_path,
               printer=print, write=compare.write_trial, archive=True,
-              pulse_ms=DEFAULT_PULSE_MS) -> dict:
+              pulse_ms=DEFAULT_PULSE_MS, coarse_pulse_ms=None) -> dict:
     """核心批量循环（硬件只从 `harness` 进来 —— 测试注入假对象即可离线跑通）。
 
     返回统计：`n_trials / n_ok / n_failed / n_homing_failed / n_homing_zero_pulse /
@@ -205,7 +205,15 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
     ⚠ 真机实测（Task 10 清单 5.3 / SDD 台账）：400 ms 单脉冲步长 131.8–148.2 mm
     ≫ `tol_mm=12`，12 次迭代走成周期 2 极限环、**不收敛**，"有时收敛"比稳定不收敛更
     危险；而 >400 ms 的脉冲会把车开出场地（实测出界 1 次）。只有 **150–175 ms** 窗口
-    收敛（3 轮 6.7/11.0/11.4 mm）。所以真机跑全量必须显式 `--pulse-ms 150`。
+    收敛（3 轮 6.7/11.0/11.4 mm）。
+
+    `coarse_pulse_ms`（R70，可选）：**两段式步长** —— 误差 > `coarse_switch_mm`
+    用这个粗脉冲，否则用 `pulse_ms`。单步与误差无关（`harness.expected_step_mm` 的
+    离算结论），所以 `max_iter × 单步` 就是可达集：120/130 ms 只有 ~101 mm，真机上
+    从 118.5 mm 起跑烧掉 12 个脉冲只走到 37.5 mm，还把车一步步顶到场地边上（今天
+    那次视觉死锁）。给了粗脉冲可达集拉到 ~732 mm，且 `drive_to` 会把超界的起点
+    **起跑前**判成 `homing_too_far`（一条 RUN 都不发）。
+    真机全量建议：`--pulse-ms 130 --coarse-ms 240`。
     """
     trials = list(iterate_trials(experiments, only=only))
     stats = {"n_trials": len(trials), "n_ok": 0, "n_failed": 0,
@@ -216,7 +224,8 @@ def run_batch(harness, *, experiments, only=None, xlsx_path,
         check_experiment_feasible(exp, start_xy)          # 缺起点/越界：当场报错
         homing_note = ""
         try:
-            home = harness.drive_to(start_xy[0], start_xy[1], pulse_ms=float(pulse_ms))
+            home = harness.drive_to(start_xy[0], start_xy[1], pulse_ms=float(pulse_ms),
+                                        coarse_pulse_ms=coarse_pulse_ms)
             kind, homing_reason = classify_homing(home)
             if kind == "failed":
                 stats["n_homing_failed"] += 1
@@ -300,7 +309,10 @@ def parse_args(argv=None):
                         help="不开相机/不连车：只做场地校验并打印执行计划")
     parser.add_argument("--pulse-ms", type=float, default=DEFAULT_PULSE_MS, metavar="MS",
                         help=f"归位脉冲宽度 ms（默认 {DEFAULT_PULSE_MS:g} = harness 默认；"
-                             "真机实测 400 ms 不收敛，必须显式给 150）")
+                             "真机实测 400 ms 不收敛，要显式给 130~150）")
+    parser.add_argument("--coarse-ms", type=float, default=None, metavar="MS",
+                        help="R70 两段式步长的粗脉冲（误差大时用）；不给 = 单段。"
+                             "真机全量建议 240（步长 ~60 mm，粗段过冲上限 15 mm）")
     return parser.parse_args(argv)
 
 
@@ -324,10 +336,13 @@ def main(argv=None, *, session_factory=None, printer=print, xlsx_path=None) -> i
     n_trials = sum(1 for _ in iterate_trials(matrix.EXPERIMENTS, only=args.only))
     printer(f"=== Task 12 批量：{n_trials} 次（{len(matrix.EXPERIMENTS)} 条矩阵 × repeats"
             f"{'，--only ' + str(args.only) if args.only is not None else ''}"
-            f"，归位脉冲 {args.pulse_ms:g} ms）→ {xlsx} ===")
+            f"，归位脉冲 {args.pulse_ms:g} ms"
+            f"{' / 粗 ' + format(args.coarse_ms, 'g') + ' ms' if args.coarse_ms else ''}"
+            f"）→ {xlsx} ===")
     with factory() as harness:
         stats = run_batch(harness, experiments=matrix.EXPERIMENTS, only=args.only,
-                          xlsx_path=xlsx, printer=printer, pulse_ms=args.pulse_ms)
+                          xlsx_path=xlsx, printer=printer, pulse_ms=args.pulse_ms,
+                          coarse_pulse_ms=args.coarse_ms)
     if stats["archive_path"]:
         printer(f"已归档：{stats['archive_path']}")
     printer(f"完成：{stats['n_ok']}/{stats['n_trials']} 通过；{stats['n_failed']} 条失败"

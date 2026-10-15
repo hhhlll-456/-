@@ -315,7 +315,37 @@ def test_batch_passes_the_homing_pulse_width_through_to_drive_to(tmp_path, build
     RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx, pulse_ms=150,
                  printer=lambda _s: None, archive=False)
 
-    assert h.drive_kwargs == [{"pulse_ms": 150.0}] * 2
+    assert h.drive_kwargs == [{"pulse_ms": 150.0, "coarse_pulse_ms": None}] * 2
+
+
+def test_batch_passes_the_coarse_pulse_through_to_drive_to(tmp_path, builder, xlsx):
+    """R70 两段式：`coarse_pulse_ms` 必须一路传到 `drive_to`（不给 = None = 单段）。"""
+    exp1 = _probe(1)
+    h = FakeHarness(trial_results=[_ok_trial(200.0)])
+
+    RA.run_batch(h, experiments=[exp1], xlsx_path=xlsx, pulse_ms=130,
+                 coarse_pulse_ms=240, printer=lambda _s: None, archive=False)
+    assert h.drive_kwargs == [{"pulse_ms": 130.0, "coarse_pulse_ms": 240.0}]
+
+    h2 = FakeHarness(trial_results=[_ok_trial(200.0)])
+    RA.run_batch(h2, experiments=[exp1], xlsx_path=xlsx, printer=lambda _s: None,
+                 archive=False)
+    assert h2.drive_kwargs[0]["coarse_pulse_ms"] is None
+
+
+def test_cli_coarse_ms_is_optional_and_parsed(xlsx):
+    assert RA.parse_args([]).coarse_ms is None
+    assert RA.parse_args(["--coarse-ms", "240"]).coarse_ms == 240.0
+    h = FakeHarness(trial_results=[_ok_trial(200.0)] * 3)
+
+    @contextmanager
+    def factory():
+        yield h
+
+    rc = RA.main(["--only", "1", "--pulse-ms", "130", "--coarse-ms", "240"],
+                 session_factory=factory, printer=lambda _s: None, xlsx_path=xlsx)
+    assert rc == 0
+    assert h.drive_kwargs == [{"pulse_ms": 130.0, "coarse_pulse_ms": 240.0}] * 3
 
 
 def test_batch_default_pulse_matches_the_harness_default(tmp_path, builder, xlsx):
@@ -327,7 +357,7 @@ def test_batch_default_pulse_matches_the_harness_default(tmp_path, builder, xlsx
                  printer=lambda _s: None, archive=False)
 
     from vgt import harness as H
-    assert h.drive_kwargs == [{"pulse_ms": H.DEFAULT_PULSE_MS}]
+    assert h.drive_kwargs[0]["pulse_ms"] == H.DEFAULT_PULSE_MS
 
 
 def test_cli_pulse_ms_is_optional_and_parsed(xlsx):
@@ -343,7 +373,7 @@ def test_cli_pulse_ms_is_optional_and_parsed(xlsx):
                  printer=lambda _s: None, xlsx_path=xlsx)
 
     assert rc == 0
-    assert h.drive_kwargs == [{"pulse_ms": 150.0}] * 3
+    assert h.drive_kwargs == [{"pulse_ms": 150.0, "coarse_pulse_ms": None}] * 3
     with pytest.raises(SystemExit):
         RA.parse_args(["--pulse-ms", "abc"])
 

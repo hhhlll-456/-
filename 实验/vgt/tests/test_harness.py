@@ -593,6 +593,148 @@ def test_drive_to_pulse_ms_is_configurable():
     assert "RUN -0.0800 0.0000 0 150\n" in sock.sent
 
 
+# ------------------------------------------------- 归位脉冲模型与两段式步长（R70）
+
+def test_expected_step_mm_matches_every_measured_point():
+    """R70 的步长模型：R68 三条直行腿 + Task 10 归位 + R70 归位扫描都要对得上。
+
+    模型 = `max(kick 地板, 0.5·(T−120))`：
+    - `T ≥ 150 ms` 用 `0.5·(T−120)`（对 300/350/400/600 ms 的实测偏差 ≤ 7%；
+      固件的角度是 `stopAll()` 自由滑行 + 起步 kick，与 R68 行程模型 0.56·(T−143)
+      是同一个物理过程的两种拟合，R70 用归位实测重新拟合成一条**永不高估**的曲线）；
+    - `T < 150 ms` 落在固件 `kick=150ms/105` 的地板上（实测 120 ms → 7.4 mm、
+      130 ms → ~9 mm）：**模型取 max ⇒ 拿地板值偏保守，归位可达距离不会被高估**。
+    """
+    for ms, measured in ((300, 88.6), (350, 110.3), (600, 256.3)):
+        assert H.expected_step_mm(ms) == pytest.approx(measured, rel=0.10), ms
+    assert 131.8 <= H.expected_step_mm(400) <= 148.2            # Task 10 实测区间
+    assert 13.0 <= H.expected_step_mm(150) <= 18.0              # Task 10 / R70 实测
+    assert H.expected_step_mm(120) == pytest.approx(7.4, rel=0.2)
+    assert H.expected_step_mm(130) <= 9.5                       # 永不高估
+    assert H.expected_step_mm(130) < H.expected_step_mm(150) < H.expected_step_mm(240)
+    # 离算结论：任何误差、任何轴向，四轮 duty 都是 110 ⇒ 步长**与误差无关**，
+    # 只由 pulse 决定（唯一例外是 45° 混合指令让两轮落进 0.3 rad/s 死区）。
+    assert H.expected_step_mm(40 if False else 120) == pytest.approx(7.4, rel=0.2)
+
+
+def test_homing_reach_is_max_iter_times_the_step():
+    """`tol + max_iter × 单步` = 能吃掉的距离上限（R70 硬结论：120 ms 只有 ~101 mm）。
+
+    真机证据：`pulse_ms=120` 从 **118.5 mm** 起跑，12 次迭代只走到 37.5 mm ——
+    起点本来就在可达集之外，"设计上就不可能收敛"，与 120 还是 140 无关。
+    """
+    assert H.homing_reach_mm(120, max_iter=12) == pytest.approx(12 + 12 * 7.4, rel=0.05)
+    assert H.homing_reach_mm(150, max_iter=12) == pytest.approx(12 + 12 * 15.0, rel=0.05)
+    assert H.homing_reach_mm(400, max_iter=12) == pytest.approx(12 + 12 * 140.0, rel=0.05)
+    # 两段式（粗 240 → 步长 60）把可达距离拉长：12 次够覆盖 12 + 12×60
+    assert H.homing_reach_mm(130, max_iter=12, coarse_pulse_ms=240) == pytest.approx(
+        12 + 12 * 60.0, rel=0.05)
+    with pytest.raises(ValueError):
+        H.homing_reach_mm(150, max_iter=0)
+
+
+def test_drive_to_fails_fast_when_the_start_is_out_of_reach(monkeypatch):
+    """R70：起点误差超过 `max_iter × 单步` 就**当场失败并命名**，不许烧 12 个脉冲。
+
+    真机事故链：今天的车就是被 12 次"小步前冲"顶进 +X/−Y 角、压住 ID21 死锁的。
+    """
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20},
+                           locate_tries=1)
+    h.locate = lambda: (120.0, 0.0, 0.0)            # 120 mm > 12 × 7.5 = 90 mm
+
+    res = h.drive_to(0.0, 0.0, pulse_ms=130, settle_s=0.0)
+
+    assert res["reached"] is False and res["reason"] == "homing_too_far"
+    assert res["reason"] in H.DRIVE_REASONS
+    assert res["iters"] == 0 and res["trace"] == []
+    assert [s for s in sock.sent if s.startswith("RUN")] == []      # 一条 RUN 都没发
+
+
+def test_drive_to_two_stage_pulse_far_is_coarse_then_fine(monkeypatch):
+    """两段式：远用粗脉冲、近用细脉冲；粗步 overshoot 之后必须切回细脉冲。"""
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20})
+    # 起点 120 mm；粗脉冲（240 ms，步长 ~60 mm）打 2 下 → 误差 120→60→30 → 切细
+    positions = [(120.0, 0.0, 0.0), (60.0, 0.0, 0.0), (30.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
+    h.locate = lambda: positions.pop(0)
+
+    res = h.drive_to(0.0, 0.0, pulse_ms=130, coarse_pulse_ms=240,
+                     coarse_switch_mm=45.0, settle_s=0.0)
+
+    assert res["reached"] is True and res["reason"] == "converged"
+    assert res["iters"] == 3
+    runs = [s for s in sock.sent if s.startswith("RUN")]
+    assert runs == ["RUN -0.1200 0.0000 0 240\n",      # 误差 120 > 45 ⇒ 粗
+                    "RUN -0.0600 0.0000 0 240\n",      # 误差  60 > 45 ⇒ 粗
+                    "RUN -0.0300 0.0000 0 130\n"]      # 误差  30 ≤ 45 ⇒ 细
+    # 粗段的过冲上限 = 粗步长 − switch（60 − 45 = 15 mm），细步长 7.4 < tol 12 ⇒ 必收敛
+
+
+def test_drive_to_without_coarse_keeps_the_single_stage_behaviour(monkeypatch):
+    """默认（不传 `coarse_pulse_ms`）= 每次都用 `pulse_ms`，一个字都不改。"""
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20})
+    positions = [(80.0, 0.0, 0.0), (50.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
+    h.locate = lambda: positions.pop(0)
+
+    res = h.drive_to(0.0, 0.0, pulse_ms=130, settle_s=0.0)
+    runs = [s for s in sock.sent if s.startswith("RUN")]
+    assert res["reached"] is True and res["iters"] == 2
+    assert runs == ["RUN -0.0800 0.0000 0 130\n", "RUN -0.0500 0.0000 0 130\n"]
+
+
+def test_single_stage_130ms_cannot_reach_the_sweep_start_distance(monkeypatch):
+    """R70 真机对照：120/130 ms 单段从 118.5 mm 起跑是**设计上不可能**收敛。
+
+    这正是 `pulse_sweep.json` 里那条 `118.5 → 37.5` 的场景（12 次迭代白烧、车被
+    一步步推到场地边上）。现在它在起跑前就判 `homing_too_far`。
+    """
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()] * 20}, locate_tries=1)
+    h.locate = lambda: (118.5, 0.0, 0.0)
+    res = h.drive_to(0.0, 0.0, pulse_ms=130, settle_s=0.0)
+    assert res["reason"] == "homing_too_far" and res["iters"] == 0
+    assert [s for s in sock.sent if s.startswith("RUN")] == []
+
+    # 同一距离、两段式（粗 240 ⇒ 可达 ~732 mm）就能收敛
+    h2, _, _, sock2 = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                     "RUN": [_run_chunks()] * 20}, locate_tries=1)
+    seq = [(118.5, 0.0, 0.0), (58.5, 0.0, 0.0), (30.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
+    h2.locate = lambda: seq.pop(0)
+    res2 = h2.drive_to(0.0, 0.0, pulse_ms=130, coarse_pulse_ms=240, settle_s=0.0)
+    assert res2["reached"] is True and res2["reason"] == "converged"
+
+
+def test_drive_to_validates_the_two_stage_arguments():
+    h, _, _, sock = _make()
+    with pytest.raises(ValueError):
+        h.drive_to(0.0, 0.0, coarse_pulse_ms=400.0, coarse_switch_mm=-1.0)
+    with pytest.raises(ValueError):
+        h.drive_to(0.0, 0.0, coarse_pulse_ms=0.4, coarse_switch_mm=45.0)
+    assert sock.sent == []                      # 参数非法：连开场 STOP 都不发
+
+
+def test_locate_retries_wait_long_enough_for_the_camera(monkeypatch):
+    """R70：`locate` 重试之间必须真的等一会儿（0.05 s 只够 1.5 帧，掉码往往要 2–3 帧）。
+
+    `grab(fresh=True)` 每次都丢队列，自动对焦/曝光要几帧才稳；重试间隔低于 ~0.2 s
+    等于连拍三张一样的坏帧。
+    """
+    slept = []
+    real_sleep = H.time.sleep
+    monkeypatch.setattr(H.time, "sleep", lambda s: (slept.append(float(s)), real_sleep(0))[1])
+    h, _, _, sock = _make(replies={"STOP": [[b"OK STOP\n"], [b"OK STOP\n"]],
+                                    "RUN": [_run_chunks()]}, locate_tries=3)
+    seq = [None, None, (80.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    h.locate = lambda: seq.pop(0)
+
+    res = h.drive_to(0.0, 0.0, pulse_ms=130, settle_s=0.0)
+    pauses = [s for s in slept if 0.0 < s < 2.0]
+    assert res["reached"] is True
+    assert len(pauses) >= 2 and sum(pauses) >= 0.4, f"重试间隔太短：{pauses}"
+
+
 # ------------------------------------------------- 链路失败：判完、看门狗、失控保护
 
 

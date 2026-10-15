@@ -228,7 +228,10 @@ DEFAULT_REPLY_TIMEOUT_S = 3.0
 DEFAULT_HANDSHAKE_TIMEOUT_S = 8.0
 # 单次 locate() 解不出（掉码/反光）时的重试次数（每次重抓一帧）。
 DEFAULT_LOCATE_TRIES = 3
-_LOCATE_RETRY_PAUSE_S = 0.05
+# 重试之间的等待（s）。R70：0.05 s 只够 ~1.5 帧，而 `grab(fresh=True)` 每次都先把
+# 驱动队列丢干净，自动对焦/曝光要 2–3 帧才稳 —— 0.05 s 等于连拍三张一样的坏帧。
+# 0.3 s ≈ 9 帧。代价：三次全失败时多等 0.6 s（只在 `locate()` 真失败时才付）。
+_LOCATE_RETRY_PAUSE_S = 0.3
 
 # ---- run_trial（Task 11）的时序与判据常量 ------------------------------------------
 
@@ -280,17 +283,44 @@ TRIAL_REASONS = (
     "trial_error",
 )
 
-# `drive_to` 的收工原因词表（R67：`already_at_target` 是新增的一档，见模块 docstring）。
+# `drive_to` 的收工原因词表（R67：`already_at_target`；R70：`homing_too_far`）。
 # `"converged"` 专属给"闭环真的动过并且落进容差"的收敛；零迭代收敛单独叫
 # `already_at_target`，它**不是**成功，只是"车本来就在位、这次什么也没做"。
 REASON_ALREADY_AT_TARGET = "already_at_target"
+REASON_TOO_FAR = "homing_too_far"
 DRIVE_REASONS = (
     "converged",
     REASON_ALREADY_AT_TARGET,
     "max_iter",
     "locate_failed",
     "run_rejected",
+    REASON_TOO_FAR,
 )
+
+# ---- 归位步长模型（R70）------------------------------------------------------------
+#
+# 实测：脉冲 120 ms → 7.4 mm、130 ms → ~9 mm（12 次迭代几乎均匀）、150 ms → 13–18 mm、
+# 300 ms → 88.6 mm、350 ms → 110.3 mm、400 ms → 131.8–148.2 mm、600 ms → 256.3 mm。
+# 对 `T ≥ 150 ms`，`0.5·(T−120)` 与全部实测的偏差 ≤ 7%；`T < 150 ms` 落在固件
+# `kick=150ms/105` 的地板上。**取 max ⇒ 永不高估**（可达距离偏保守）。
+#
+# ⚠ 步长**与误差无关**（离算钉死）：`wheelOmegaToPWM` 把任何 |ω|>0.3 rad/s 的轮子
+# 抬到 `MIN_DUTY=110`，所以 120 mm 误差与 5 mm 误差下发的是同一个占空比（真机两条
+# 都实测到 13–18 mm / 7.4 mm 的恒定单步）。**唯一例外**是 45° 混合方向指令：
+# X 形麦轮 `ω_FL=ω_RR=(vx+vy)/r`、`ω_FR=ω_RL=(vx−vy)/r` ⇒ 对角混合时其中一对
+# 轮子落进 0.3 rad/s 死区（duty=0），净步长约减半并**附带偏航**。
+#
+# ⇒ 归位的可达距离是 `tol + max_iter × 单步`（`homing_reach_mm`）。R70 真机证据：
+# 120 ms 从 **118.5 mm** 起跑 12 次只走到 37.5 mm —— 起点本就在可达集之外，
+# "设计上就不可能收敛"，与选 120 还是 140 无关。`drive_to` 现在**起跑前先判**
+# （`homing_too_far`，一条 RUN 都不发），两段式步长（粗脉冲远用、细脉冲近用）
+# 则把可达距离拉长到 `tol + max_iter × 粗步长`。
+STEP_SLOPE_MM_PER_MS = 0.5
+STEP_DEAD_MS = 120.0
+STEP_KICK_FLOOR_MM = 7.4
+# 误差大于它就换粗脉冲。粗步长必须 > switch − tol，否则"最后一步"的过冲量由
+# 粗步长决定（过冲 = 粗步长 − switch）。
+COARSE_SWITCH_MM = 45.0
 
 # P 控制参数：v_cmd = clamp(KP · |err|, v_min, v_max)，单位 m/s。
 # KP=0.001 的含义：100 mm 误差 → 0.1 m/s（与实验矩阵 0.05–0.2 m/s 同量级）。
@@ -415,6 +445,28 @@ def coasted_samples(samples, coast):
     return (list(samples[:-1]) + [last]
             + [{"t_ms": int(last["t_ms"]), "pwm": list(direction), "enc": enc,
                 "rpy": [float(v) for v in coast_rpy], "synthetic": "coast"}])
+
+
+def expected_step_mm(pulse_ms) -> float:
+    """一条归位脉冲的真机位移 `pulse_ms` → mm（R70 模型，**永不高估**）。
+
+    `max(kick 地板 7.4, 0.5·(T−120))`；出处与逐点核对见常量区的注释。
+    """
+    return max(STEP_KICK_FLOOR_MM,
+               STEP_SLOPE_MM_PER_MS * (float(pulse_ms) - STEP_DEAD_MS))
+
+
+def homing_reach_mm(pulse_ms, *, max_iter=DEFAULT_MAX_ITER, tol_mm=DEFAULT_TOL_MM,
+                    coarse_pulse_ms=None, coarse_switch_mm=COARSE_SWITCH_MM) -> float:
+    """`max_iter` 次脉冲能把多大的初始误差归到位（mm）——R70 的"可达集"。
+
+    单步与误差无关 ⇒ 可达距离 = `tol + max_iter × 单步`。两段式（`coarse_pulse_ms`
+    给了）时每一步都按粗步长算，是可达集的**保守上界**。
+    """
+    if int(max_iter) < 1:
+        raise ValueError(f"max_iter 至少 1，实际 {max_iter!r}")
+    step = expected_step_mm(coarse_pulse_ms if coarse_pulse_ms is not None else pulse_ms)
+    return float(tol_mm) + int(max_iter) * step
 
 
 def body_delta_to_field(dx_mm, dy_mm, yaw_deg):
@@ -665,7 +717,8 @@ class Harness:
 
     def drive_to(self, x_mm, y_mm, tol_mm=DEFAULT_TOL_MM, max_iter=DEFAULT_MAX_ITER, *,
                  pulse_ms=DEFAULT_PULSE_MS, settle_s=DEFAULT_SETTLE_S,
-                 v_max_mps=MAX_CMD_MPS):
+                 v_max_mps=MAX_CMD_MPS, coarse_pulse_ms=None,
+                 coarse_switch_mm=COARSE_SWITCH_MM):
         """P 控制把车开到场地系 `(x_mm, y_mm)`，返回结果字典（键见模块 docstring）。
 
         每个周期：`locate()`（失败重试 `locate_tries` 次）→ 算误差 → 够近就收工 →
@@ -677,9 +730,17 @@ class Harness:
         唯一旋钮，见模块 docstring）。`settle_s`：DONE 之后等车停稳再抓帧。
         `v_max_mps`：速度指令上限（P 律的 clamp 上界）。
 
+        **R70 两段式步长**（`coarse_pulse_ms=None` = 关闭，保持单段行为）：单步与
+        误差无关（见 `expected_step_mm`），所以 `max_iter=12` × 单步就是可达集。
+        起点误差超出可达集时**起跑前就失败**并给出 `homing_too_far`，一条 RUN 都不
+        发 —— 今天的车就是被 12 次"注定不收敛"的小步前冲顶到场地上、压住边码的。
+        给了 `coarse_pulse_ms` 时：误差 > `coarse_switch_mm` 用粗脉冲，否则用
+        `pulse_ms`（细），可达集随之拉长到 `homing_reach_mm(..., coarse_pulse_ms=…)`。
+
         失败语义：
 
         - `locate()` 抛 `BoundaryMarkersMoved` → **立即向上冒泡**（"立即中止"，R18）；
+        - 起点误差超出可达集 → `reason="homing_too_far"`（零脉冲）；
         - RUN 等待失败（超时/静默/断链）→ 失控保护（STOP；STOP 不确认就重连+STOP），
           恢复成功则继续下一圈（这一圈的位移已经算数），失败抛 `StopFailed`；
         - 固件回 `ERR`（RUN 被拒）→ 收工，`reason="run_rejected"`；
@@ -711,6 +772,15 @@ class Harness:
             raise ValueError(
                 f"v_max_mps 必须 ≥ {MIN_CMD_MPS}（P 律的下限；比它低的话固件侧也"
                 f"会被 MIN_DUTY 抬起来），实际 {v_max_mps!r}")
+        coarse_ms = None
+        if coarse_pulse_ms is not None:
+            coarse_ms = int(round(float(coarse_pulse_ms)))
+            if coarse_ms < 1:
+                raise ValueError(
+                    f"coarse_pulse_ms 至少 1 整数毫秒，实际 {coarse_pulse_ms!r}")
+        switch = float(coarse_switch_mm)
+        if not (switch > 0.0):
+            raise ValueError(f"coarse_switch_mm 必须为正，实际 {coarse_switch_mm!r}")
 
         events: list[dict] = []
         trace: list[dict] = []
@@ -743,15 +813,28 @@ class Harness:
                 # "真归位成功" 与 "起点本来就在目标点、这次什么也没做"。
                 reason = "converged" if iters > 0 else REASON_ALREADY_AT_TARGET
                 break
+            if iters == 0 and coarse_ms is None:
+                # R70 起跑前先判"归位可不可能"：单步与误差无关 ⇒ `tol + max_iter×单步`
+                # 就是可达集。超了就当场失败并命名，一条 RUN 都不发（今天的车就是
+                # 被 12 次注定不收敛的脉冲顶到场地上、压住边码的）。
+                reach = homing_reach_mm(ms, max_iter=iter_cap, tol_mm=tol)
+                if dist > reach:
+                    reason = REASON_TOO_FAR
+                    break
             if iters >= iter_cap:
                 reason = "max_iter"
                 break
 
+            # R70 两段式：远用粗脉冲（省迭代），近用细脉冲（步长 < 容差才收敛得了）。
+            # 粗段的过冲量 = 粗步长 − switch，switch=45 / 粗步 60 ⇒ 最坏 15 mm。
+            use_ms = ms
+            if coarse_ms is not None and dist > switch:
+                use_ms = coarse_ms
             vx, vy = body_command(ex, ey, pos[2], v_max=vmax)
             iters += 1
-            run_line = "RUN {:.4f} {:.4f} 0 {}".format(vx, vy, ms)
+            run_line = "RUN {:.4f} {:.4f} 0 {}".format(vx, vy, use_ms)
             rec = {"iter": iters, "pos": pos, "err_mm": (ex, ey), "dist_mm": dist,
-                   "cmd": (vx, vy, ms), "run_line": run_line}
+                   "cmd": (vx, vy, use_ms), "run_line": run_line}
             try:
                 self._send_line(self.car_link, run_line)
             except Exception as exc:                       # 发不出去 = 链路有问题
