@@ -1,0 +1,905 @@
+
+================ 补跑 #07 rep3/3 横移左移 50 mm ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r07_2 0 0
+        7.78514159502121
+      ],
+      "dist_mm": 7.785382604460349,
+      "cmd": [
+        -0.0007611501127484801,
+        -0.02999034262068146,
+        144
+      ],
+      "gained_mm": 5.5,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 run_all_experiments.py --only 7 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 7:3
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 7，--trials 7:3，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #07 rep3/3 横移左移 50 mm: vision 25.6mm / odo 28.6mm / Δ +11.6% / yawΔ +0.17°  OK
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_201937.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r07_2 9
+    "29": 9
+  },
+  "body_x_mm": 4.47,
+  "body_y_mm": -14.15,
+  "body_yaw_deg": -0.64,
+  "body_spread_mm": [
+    0.52,
+    1.14
+  ],
+  "yaw_spread_deg": 0.13,
+  "margin_point_mm": 111.8,
+  "margin_envelope_mm": 35.7,
+  "verdict": "OK"
+}
+  巡检：verdict=OK body_yaw=-0.64° margin_point=111.8 mm margin_env=35.7 mm
+
+#07 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 0 次。
+
+================ 补跑 #12 rep2/3 斜行后右 45° 120 mm ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r12_1 0 0
+        13.182254669516137
+      ],
+      "dist_mm": 13.916183610832869,
+      "cmd": [
+        -0.009322976542723401,
+        -0.02851459465578687,
+        160
+      ],
+      "gained_mm": 9.2,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 run_all_experiments.py --only 12 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 12:2
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 12，--trials 12:2，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #12 rep2/3 斜行后右 45° 120 mm: vision -mm / odo -mm / Δ -% / yawΔ -°  FAIL homing_wrong_way
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202000.xlsx
+完成：0/1 通过；1 条失败（其中归位失败 1 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 0 条、失败 0 条。
+  [stderr] /home/hanli/麦轮小车pid/实验/run_all_experiments.py:332: RuntimeWarning: drive_to: 第 4 个脉冲让车**离目标更远** （gained=-5.9 mm，脉冲 180 ms，误差 6.1 → 12.0 mm）—— 已收手，不再发更大的脉冲。命令方向与实际轮向不一致的根因仍未查明。
+  home = harness.drive_to(start_xy[0], start_xy[1], pulse_ms=float(pulse_ms),
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r12_1 9
+    "29": 9
+  },
+  "body_x_mm": 43.21,
+  "body_y_mm": -53.79,
+  "body_yaw_deg": 0.3,
+  "body_spread_mm": [
+    5.53,
+    4.66
+  ],
+  "yaw_spread_deg": 0.16,
+  "margin_point_mm": 72.1,
+  "margin_envelope_mm": -3.1,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=0.3° margin_point=72.1 mm margin_env=-3.1 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #12 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r12_1 0 0
+        19.920014767687135
+      ],
+      "dist_mm": 43.51093027044129,
+      "cmd": [
+        -0.03679115127848769,
+        -0.023229555325116266,
+        320
+      ],
+      "gained_mm": -32.6,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+  [stderr] /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py:86: RuntimeWarning: drive_to: 第 2 个脉冲让车**离目标更远** （gained=-32.6 mm，脉冲 320 ms，误差 43.5 → 76.1 mm）—— 已收手，不再发更大的脉冲。命令方向与实际轮向不一致的根因仍未查明。
+  home = h.drive_to(x, y, pulse_ms=PULSE_MS, coarse_pulse_ms=COARSE_MS,
+⚠ 归位失败（rc=1）—— 车已定位不了，请人工搬回场地中央。
+⚠ 复检 RECOVER_FAILED —— 不许再跑，请人工把车搬回场地中央。
+⚠ #12 中止：recover_RECOVER_FAILED
+{
+  "tag": "rec2_r12_1",
+  "target": [
+    0.0,
+    0.0
+  ],
+  "yaw": {
+    "converged": true,
+    "steps": 0,
+    "reason": "converged",
+    "final_yaw": -2.1379460212255026,
+    "stop_confirmed": true,
+    "ok": true
+  },
+  "yaw_trace": [],
+  "home": {
+    "reached": true,
+    "at_target": true,
+    "moved": true,
+    "iters": 6,
+    "reason": "converged",
+    "start_dist_mm": 76.48792380758161,
+    "final": [
+      2.7151089103746173,
+      0.2726152711236569,
+      -10.84308780289922
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": false
+  },
+  "home_trace": [
+    {
+      "iter": 1,
+      "pos": [
+        -69.21945360596884,
+        -32.54335156196326,
+        -2.043703032388578
+      ],
+      "err_mm": [
+        69.21945360596884,
+        32.54335156196326
+      ],
+      "dist_mm": 76.48792380758161,
+      "cmd": [
+        0.07033597820133379,
+        -0.030054162088734168,
+        231
+      ],
+      "gained_mm": 45.5,
+      "outcome": "done",
+      "stuck_run": null
+    },
+    {
+      "iter": 2,
+      "pos": [
+        -15.636664359156264,
+        -26.739636267064736,
+        -3.0172507257860275
+      ],
+      "err_mm": [
+        15.636664359156264,
+        26.739636267064736
+      ],
+      "dist_mm": 30.9760136230573,
+      "cmd": [
+        0.017022471911856036,
+        -0.025879506757005698,
+        142
+      ],
+      "gained_mm": 7.6,
+      "outcome": "done",
+      "stuck_run": null
+    },
+    {
+      "iter": 3,
+      "pos": [
+        -9.899621206534734,
+        -21.224275781209045,
+        -3.956009312864637
+      ],
+      "err_mm": [
+        9.899621206534734,
+        21.224275781209045
+      ],
+      "dist_mm": 23.419487237548328,
+      "cmd": [
+        0.014526758432869694,
+        -0.02624830069610315,
+        163
+      ],
+      "gained_mm": 7.8,
+      "outcome": "done",
+      "stuck_run": null
+    },
+    {
+      "iter": 4,
+      "pos": [
+        -11.374595815496146,
+        -10.683104569494681,
+        -7.429321756584727
+      ],
+      "err_mm": [
+        11.374595815496146,
+        10.683104569494681
+      ],
+      "dist_mm": 15.604811860726183,
+      "cmd": [
+        0.02433954193694372,
+        -0.017538149796935763,
+        146
+      ],
+      "gained_mm": 4.3,
+      "outcome": "done",
+      "stuck_run": null
+    },
+    {
+      "iter": 5,
+      "pos": [
+        -9.0890443979792,
+        -6.734241530168726,
+        -7.890277782381986
+      ],
+      "err_mm": [
+        9.0890443979792,
+        6.734241530168726
+      ],
+      "dist_mm": 11.311973172487914,
+      "cmd": [
+        0.026328163321021496,
+        -0.01438150952235607,
+        143
+      ],
+      "gained_mm": 5.3,
+      "outcome": "done",
+      "stuck_run": null
+    },
+    {
+      "iter": 6,
+      "pos": [
+        3.5069199206406605,
+        -4.934269358697374,
+        -8.303173312807587
+      ],
+      "err_mm": [
+        -3.5069199206406605,
+        4.934269358697374
+      ],
+      "dist_mm": 6.0535527943486285,
+      "cmd": [
+        -0.013666008801520425,
+        -0.026706557311581103,
+        120
+      ],
+      "gained_mm": 3.3,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+
+================ 补跑 #13 rep1/3 原地逆时针 30° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r13_0 0 0
+        6.653739683332018
+      ],
+      "dist_mm": 6.683386007078978,
+      "cmd": [
+        -0.002016435892367697,
+        -0.029932156392281046,
+        136
+      ],
+      "gained_mm": 5.2,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 run_all_experiments.py --only 13 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 13:1
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 13，--trials 13:1，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #13 rep1/3 原地逆时针 30°: vision 12.2mm / odo 11.0mm / Δ -9.9% / yawΔ +0.51°  OK  ⚠homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代（drive_to reason=already_at_target，起点实测距目标 2.4 mm）—— 车确实在位，但本次归位没有执行过任何动作，不计为归位成功
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202354.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+⚠ 另有 1 条的归位是**零脉冲**（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r13_0 9
+    "29": 9
+  },
+  "body_x_mm": -8.14,
+  "body_y_mm": -9.12,
+  "body_yaw_deg": 23.77,
+  "body_spread_mm": [
+    0.63,
+    0.97
+  ],
+  "yaw_spread_deg": 0.1,
+  "margin_point_mm": 116.8,
+  "margin_envelope_mm": -5.8,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=23.77° margin_point=116.8 mm margin_env=-5.8 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #13 剩余 1 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r13_0 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 2.216399532616856,
+    "final": [
+      -0.770218615661999,
+      -2.078266145678154,
+      -1.5408225066422006
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r13_0 9
+    "29": 9
+  },
+  "body_x_mm": -0.52,
+  "body_y_mm": -2.34,
+  "body_yaw_deg": -1.47,
+  "body_spread_mm": [
+    0.81,
+    0.77
+  ],
+  "yaw_spread_deg": 0.17,
+  "margin_point_mm": 123.6,
+  "margin_envelope_mm": 45.6,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=-1.47° margin_point=123.6 mm margin_env=45.6 mm
+
+#013 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #13 rep3/3 原地逆时针 30° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r13_2 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 1.7187631776970522,
+    "final": [
+      -0.1841253889281103,
+      -1.7088723481171262,
+      -1.3679726030038637
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 run_all_experiments.py --only 13 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 13:3
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 13，--trials 13:3，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #13 rep3/3 原地逆时针 30°: vision 12.9mm / odo 11.6mm / Δ -10.1% / yawΔ -0.15°  OK  ⚠homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代（drive_to reason=already_at_target，起点实测距目标 2.0 mm）—— 车确实在位，但本次归位没有执行过任何动作，不计为归位成功
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202440.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+⚠ 另有 1 条的归位是**零脉冲**（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r13_2 9
+    "29": 9
+  },
+  "body_x_mm": -10.61,
+  "body_y_mm": -12.25,
+  "body_yaw_deg": 26.82,
+  "body_spread_mm": [
+    0.85,
+    0.99
+  ],
+  "yaw_spread_deg": 0.1,
+  "margin_point_mm": 113.6,
+  "margin_envelope_mm": -13.7,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=26.82° margin_point=113.6 mm margin_env=-13.7 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #13 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r13_2 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 5.8777027696350395,
+    "final": [
+      -3.3833198151185506,
+      -4.806301787944822,
+      -4.508725966111854
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r13_2 9
+    "29": 9
+  },
+  "body_x_mm": -2.69,
+  "body_y_mm": -4.44,
+  "body_yaw_deg": -4.47,
+  "body_spread_mm": [
+    0.81,
+    1.34
+  ],
+  "yaw_spread_deg": 0.1,
+  "margin_point_mm": 121.5,
+  "margin_envelope_mm": 36.7,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=-4.47° margin_point=121.5 mm margin_env=36.7 mm
+
+#013 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #15 rep1/3 原地逆时针 45° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r15_0 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 5.38844001054975,
+    "final": [
+      -2.745311191130649,
+      -4.636653126032419,
+      -4.544767240349131
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 run_all_experiments.py --only 15 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 15:1
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 15，--trials 15:1，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #15 rep1/3 原地逆时针 45°: vision 17.9mm / odo 13.9mm / Δ -22.2% / yawΔ -0.02°  OK
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202521.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r15_0 9
+    "29": 9
+  },
+  "body_x_mm": -11.31,
+  "body_y_mm": -16.04,
+  "body_yaw_deg": 36.56,
+  "body_spread_mm": [
+    0.86,
+    0.99
+  ],
+  "yaw_spread_deg": 0.1,
+  "margin_point_mm": 109.9,
+  "margin_envelope_mm": -30.4,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=36.56° margin_point=109.9 mm margin_env=-30.4 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #15 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r15_0 0 0
+        11.6572126080087
+      ],
+      "dist_mm": 11.669792115398243,
+      "cmd": [
+        0.0005511674426838808,
+        -0.02999493648018154,
+        161
+      ],
+      "gained_mm": 9.0,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r15_0 9
+    "29": 9
+  },
+  "body_x_mm": -2.25,
+  "body_y_mm": -1.71,
+  "body_yaw_deg": -6.41,
+  "body_spread_mm": [
+    0.68,
+    0.78
+  ],
+  "yaw_spread_deg": 0.12,
+  "margin_point_mm": 124.2,
+  "margin_envelope_mm": 35.1,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=-6.41° margin_point=124.2 mm margin_env=35.1 mm
+
+#015 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #15 rep2/3 原地逆时针 45° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r15_1 0 0
+        7.82488729390986
+      ],
+      "dist_mm": 8.698979813163842,
+      "cmd": [
+        0.012947098976547337,
+        -0.02706238400606064,
+        139
+      ],
+      "gained_mm": 4.9,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 run_all_experiments.py --only 15 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 15:2
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 15，--trials 15:2，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #15 rep2/3 原地逆时针 45°: vision 16.1mm / odo 12.1mm / Δ -24.6% / yawΔ +0.41°  OK  ⚠homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代（drive_to reason=already_at_target，起点实测距目标 3.2 mm）—— 车确实在位，但本次归位没有执行过任何动作，不计为归位成功
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202608.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+⚠ 另有 1 条的归位是**零脉冲**（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r15_1 9
+    "29": 9
+  },
+  "body_x_mm": -12.17,
+  "body_y_mm": -12.7,
+  "body_yaw_deg": 35.76,
+  "body_spread_mm": [
+    0.88,
+    0.92
+  ],
+  "yaw_spread_deg": 0.09,
+  "margin_point_mm": 113.2,
+  "margin_envelope_mm": -26.2,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=35.76° margin_point=113.2 mm margin_env=-26.2 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #15 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r15_1 0 0
+        8.468657658103972
+      ],
+      "dist_mm": 8.890645715186524,
+      "cmd": [
+        0.011034498971040448,
+        -0.02789695023578935,
+        142
+      ],
+      "gained_mm": 3.9,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r15_1 9
+    "29": 9
+  },
+  "body_x_mm": -4.35,
+  "body_y_mm": -1.86,
+  "body_yaw_deg": -6.05,
+  "body_spread_mm": [
+    0.8,
+    1.02
+  ],
+  "yaw_spread_deg": 0.19,
+  "margin_point_mm": 124.0,
+  "margin_envelope_mm": 35.7,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=-6.05° margin_point=124.0 mm margin_env=35.7 mm
+
+#015 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #15 rep3/3 原地逆时针 45° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r15_2 0 0
+        9.171263633546378
+      ],
+      "dist_mm": 10.50118051005102,
+      "cmd": [
+        0.014124982613552717,
+        -0.026466674633713123,
+        144
+      ],
+      "gained_mm": 5.9,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 run_all_experiments.py --only 15 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 15:3
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 15，--trials 15:3，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #15 rep3/3 原地逆时针 45°: vision 4.1mm / odo 0.7mm / Δ -82.0% / yawΔ -0.35°  OK
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202647.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r15_2 9
+    "29": 9
+  },
+  "body_x_mm": -0.92,
+  "body_y_mm": -4.77,
+  "body_yaw_deg": 33.15,
+  "body_spread_mm": [
+    0.7,
+    0.99
+  ],
+  "yaw_spread_deg": 0.08,
+  "margin_point_mm": 121.1,
+  "margin_envelope_mm": -15.1,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=33.15° margin_point=121.1 mm margin_env=-15.1 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #15 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r15_2 0 0
+        2.1391364543693796
+      ],
+      "dist_mm": 9.005836053851457,
+      "cmd": [
+        -0.02840867532203352,
+        -0.009640911079731184,
+        134
+      ],
+      "gained_mm": 7.3,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r15_2 9
+    "29": 9
+  },
+  "body_x_mm": 0.95,
+  "body_y_mm": -1.89,
+  "body_yaw_deg": -4.13,
+  "body_spread_mm": [
+    1.47,
+    1.17
+  ],
+  "yaw_spread_deg": 0.22,
+  "margin_point_mm": 124.0,
+  "margin_envelope_mm": 40.0,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=-4.13° margin_point=124.0 mm margin_env=40.0 mm
+
+#015 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #16 rep1/3 原地顺时针 45° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r16_0 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 1.80071569256104,
+    "final": [
+      0.7643282059168293,
+      -1.6304537402439687,
+      -4.185386311599984
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 run_all_experiments.py --only 16 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 16:1
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 16，--trials 16:1，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #16 rep1/3 原地顺时针 45°: vision 3.1mm / odo 2.6mm / Δ -16.2% / yawΔ +0.48°  OK  ⚠homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代（drive_to reason=already_at_target，起点实测距目标 2.1 mm）—— 车确实在位，但本次归位没有执行过任何动作，不计为归位成功
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202723.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+⚠ 另有 1 条的归位是**零脉冲**（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r16_0 9
+    "29": 9
+  },
+  "body_x_mm": -0.36,
+  "body_y_mm": 1.5,
+  "body_yaw_deg": -38.71,
+  "body_spread_mm": [
+    0.97,
+    0.92
+  ],
+  "yaw_spread_deg": 0.21,
+  "margin_point_mm": 124.4,
+  "margin_envelope_mm": -18.2,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=-38.71° margin_point=124.4 mm margin_env=-18.2 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #16 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r16_0 0 0
+        9.221971190203682
+      ],
+      "dist_mm": 9.409368507751605,
+      "cmd": [
+        0.0052453838847029265,
+        -0.029537873110670965,
+        146
+      ],
+      "gained_mm": 5.8,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r16_0 9
+    "29": 9
+  },
+  "body_x_mm": -3.65,
+  "body_y_mm": -1.4,
+  "body_yaw_deg": -2.62,
+  "body_spread_mm": [
+    0.94,
+    0.85
+  ],
+  "yaw_spread_deg": 0.27,
+  "margin_point_mm": 124.5,
+  "margin_envelope_mm": 43.9,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=-2.62° margin_point=124.5 mm margin_env=43.9 mm
+
+#016 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #16 rep2/3 原地顺时针 45° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r16_1 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 4.004683493859302,
+    "final": [
+      -3.5486734616570623,
+      -1.8559112447851667,
+      -2.5577494133383993
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 run_all_experiments.py --only 16 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 16:2
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 16，--trials 16:2，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #16 rep2/3 原地顺时针 45°: vision 1.9mm / odo 2.0mm / Δ +3.8% / yawΔ +0.56°  OK  ⚠homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代（drive_to reason=already_at_target，起点实测距目标 4.0 mm）—— 车确实在位，但本次归位没有执行过任何动作，不计为归位成功
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202755.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+⚠ 另有 1 条的归位是**零脉冲**（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r16_1 9
+    "29": 9
+  },
+  "body_x_mm": -4.32,
+  "body_y_mm": 0.74,
+  "body_yaw_deg": -34.46,
+  "body_spread_mm": [
+    1.06,
+    1.09
+  ],
+  "yaw_spread_deg": 0.31,
+  "margin_point_mm": 125.2,
+  "margin_envelope_mm": -12.6,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=-34.46° margin_point=125.2 mm margin_env=-12.6 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #16 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r16_1 0 0
+        1.123530161404974
+      ],
+      "dist_mm": 6.8119958305126165,
+      "cmd": [
+        0.029475322534731146,
+        -0.005586175925762654,
+        120
+      ],
+      "gained_mm": 3.6,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r16_1 9
+    "29": 9
+  },
+  "body_x_mm": -1.01,
+  "body_y_mm": -3.86,
+  "body_yaw_deg": 1.2,
+  "body_spread_mm": [
+    2.0,
+    1.63
+  ],
+  "yaw_spread_deg": 1.22,
+  "margin_point_mm": 122.0,
+  "margin_envelope_mm": 44.7,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=1.2° margin_point=122.0 mm margin_env=44.7 mm
+
+#016 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #16 rep3/3 原地顺时针 45° ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r16_2 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 2.986471591834682,
+    "final": [
+      -0.42634828602162367,
+      -2.9558822215781877,
+      0.36144724099250425
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 run_all_experiments.py --only 16 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 16:3
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 16，--trials 16:3，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #16 rep3/3 原地顺时针 45°: vision 8.0mm / odo 4.6mm / Δ -42.4% / yawΔ +0.19°  OK  ⚠homing_zero_pulse（零脉冲归位）：起点已在容差内、零次迭代（drive_to reason=already_at_target，起点实测距目标 3.2 mm）—— 车确实在位，但本次归位没有执行过任何动作，不计为归位成功
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202829.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+⚠ 另有 1 条的归位是**零脉冲**（起点已在容差内、没执行过任何动作，R67）：实验照跑，数据有效，但这些条目的起点只由单次测量担保，汇总行 notes 里有 homing_zero_pulse 留痕。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r16_2 9
+    "29": 9
+  },
+  "body_x_mm": -2.7,
+  "body_y_mm": 3.75,
+  "body_yaw_deg": -38.33,
+  "body_spread_mm": [
+    0.77,
+    1.24
+  ],
+  "yaw_spread_deg": 0.15,
+  "margin_point_mm": 122.2,
+  "margin_envelope_mm": -20.0,
+  "verdict": "OUT_OF_FIELD"
+}
+  巡检：verdict=OUT_OF_FIELD body_yaw=-38.33° margin_point=122.2 mm margin_env=-20.0 mm
+⚠ 巡检 OUT_OF_FIELD —— 中止 #16 剩余 0 条，先归位复检。
+—— 恢复：归位到 (0,0) ——
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py rec_r16_2 0 0
+        8.234744217102024
+      ],
+      "dist_mm": 8.918376330465545,
+      "cmd": [
+        0.010608722691893035,
+        -0.02806162865634341,
+        141
+      ],
+      "gained_mm": 6.0,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py recpost_r16_2 9
+    "29": 9
+  },
+  "body_x_mm": -3.42,
+  "body_y_mm": -0.8,
+  "body_yaw_deg": -1.21,
+  "body_spread_mm": [
+    0.51,
+    1.33
+  ],
+  "yaw_spread_deg": 0.11,
+  "margin_point_mm": 125.1,
+  "margin_envelope_mm": 47.8,
+  "verdict": "OK"
+}
+  复检：verdict=OK body_yaw=-1.21° margin_point=125.1 mm margin_env=47.8 mm
+
+#016 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 1 次。
+
+================ 补跑 #12 rep2/3 斜行后右 45° 120 mm ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r12_1 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 2.757358002397164,
+    "final": [
+      -2.3395414088885804,
+      -1.4593043375113073,
+      -1.0533834414471244
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 run_all_experiments.py --only 12 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 12:2
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 12，--trials 12:2，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #12 rep2/3 斜行后右 45° 120 mm: vision -mm / odo -mm / Δ -% / yawΔ -°  FAIL homing_wrong_way
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_202924.xlsx
+完成：0/1 通过；1 条失败（其中归位失败 1 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 0 条、失败 0 条。
+  [stderr] /home/hanli/麦轮小车pid/实验/run_all_experiments.py:332: RuntimeWarning: drive_to: 第 5 个脉冲让车**离目标更远** （gained=-25.5 mm，脉冲 270 ms，误差 4.1 → 29.7 mm）—— 已收手，不再发更大的脉冲。命令方向与实际轮向不一致的根因仍未查明。
+  home = harness.drive_to(start_xy[0], start_xy[1], pulse_ms=float(pulse_ms),
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r12_1 9
+    "29": 9
+  },
+  "body_x_mm": 36.13,
+  "body_y_mm": -12.99,
+  "body_yaw_deg": -5.03,
+  "body_spread_mm": [
+    0.67,
+    0.95
+  ],
+  "yaw_spread_deg": 0.19,
+  "margin_point_mm": 112.9,
+  "margin_envelope_mm": 26.9,
+  "verdict": "OK"
+}
+  巡检：verdict=OK body_yaw=-5.03° margin_point=112.9 mm margin_env=26.9 mm
+
+#012 补跑结束：跑 1 条、跳过 0 条（归位未收敛）、包络越线 0 次。

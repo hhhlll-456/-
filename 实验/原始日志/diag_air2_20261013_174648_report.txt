@@ -1,0 +1,23 @@
+[0] 串口监听中（/dev/ttyACM0）
+[1] TCP 192.168.1.115:8266
+    PING -> PONG
+    ID -> MECANUM-ESP32 192.168.1.115
+    SNIFF -> None
+    STREAM 1 已开（全程在线）
+[A] 静置 374 样本
+    roll -0.16..-0.13  pitch +1.76..+1.78  yaw +4.94..+4.95
+    yaw 漂移 -0.062 deg/min (RMS 0.004)
+    IMU 更新率 ~6 Hz
+    静置编码器增量 [0, 0, 0, 0]
+[B] 逐轮 PWM=[-120, 120, -120, 120]
+    FL: Δenc= 4514/1.49s -> 14.96 rad/s
+    FR: Δenc= 4966/1.48s -> 16.57 rad/s
+    RL: Δenc= 4762/1.47s -> 15.91 rad/s
+    RR: Δenc= 5107/1.47s -> 17.13 rad/s
+    离散度 13.5%  (mean 16.14)
+[C] RUN 0.10 0 0 1200
+[!] TCP 断连: [Errno 104] Connection reset by peer —— 尝试重连
+    重连成功
+[!] 串口异常 2 条:
+    Brownout detector was triggered
+    rst:0xc (SW_CPU_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)

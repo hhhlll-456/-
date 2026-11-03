@@ -1,0 +1,93 @@
+C51 COMPILER V9.53.0.0   MAIN                                                              11/14/2020 17:48:34 PAGE 1   
+
+
+C51 COMPILER V9.53.0.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN ..\output\main.obj
+COMPILER INVOKED BY: D:\Program Files\Keil_c5\C51\BIN\C51.EXE main.c LARGE OPTIMIZE(8,SPEED) BROWSE INCDIR(..\Peripheral
+                    -s\inc\) DEBUG OBJECTEXTEND PRINT(..\lis\main.lst) TABS(2) OBJECT(..\output\main.obj)
+
+line level    source
+
+   1          #include <reg52.h>
+   2          #include "usart.h"
+   3          #include "iic.h"  
+   4          #include "stdio.h"
+   5          /*
+   6          Keil: MDK5.10.0.2
+   7          MCU:stm32f103c8
+   8          硬件接法：
+   9          GY-614---STM32
+  10          1、GY-614_RX---STM32_TX
+  11          2、STM32_TX---FT232,STM32将数据上传给上位机
+  12          3、GY-614_TX---STM32_RX，接收模块数据
+  13          软件说明:
+  14          该程序采用串口方式获取模块数据，波特率9600行以上操作：
+  15          注：中断函数位于stc_it.c
+  16          联系方式：
+  17          http://shop62474960.taobao.com/?spm=a230r.7195193.1997079397.2.9qa3Ky&v=1
+  18          */
+  19          char putchar (char c)   
+  20          {        
+  21   1          ES=0;        
+  22   1          SBUF = c;        
+  23   1          while(TI==0);        
+  24   1          TI=0;        
+  25   1          ES=1;        
+  26   1          return 0;
+  27   1      }
+  28          typedef struct
+  29          {
+  30              int16_t temp;
+  31              int16_t roll;
+  32              int16_t pitch;
+  33              int16_t yaw;
+  34          } gy;
+  35          int main(void)
+  36          {
+  37   1      
+  38   1          u8 sum=0,i=0;
+  39   1        gy my_25t;
+  40   1        Usart_Int(9600);
+  41   1        while(1)
+  42   1        {
+  43   2          if(Receive_ok)//串口接收完毕
+  44   2          {
+  45   3             for(sum=0,i=0; i<(usart_rx_data[3]+4); i++) //rgb_data[3]=3
+  46   3                      sum+=usart_rx_data[i];
+  47   3                  if(sum==usart_rx_data[i])//校验和判断
+  48   3                  {
+  49   4                      my_25t.roll=(usart_rx_data[4]<<8)|usart_rx_data[5];
+  50   4                      my_25t.pitch=(usart_rx_data[6]<<8)|usart_rx_data[7];
+  51   4                      my_25t.yaw=(usart_rx_data[8]<<8)|usart_rx_data[9];
+  52   4                      my_25t.temp=(usart_rx_data[10]<<8)|usart_rx_data[12];
+  53   4                      printf("roll:%.2f,",(float)my_25t.roll/100.0f);
+  54   4                      printf("pitch:%.2f,",(float)my_25t.pitch/100.0f);
+C51 COMPILER V9.53.0.0   MAIN                                                              11/14/2020 17:48:34 PAGE 2   
+
+  55   4                      printf("yaw:%.2f,",(float)my_25t.yaw/100);
+  56   4                      printf("temp:%.2f\r\n ",(float)my_25t.temp/100.0f);
+  57   4                  }
+  58   3                  else
+  59   3                  {
+  60   4                    printf(" sum %d\r\n ",sum);
+  61   4                    printf(" count %d\r\n ",usart_rx_data[3]+4);
+  62   4                  }
+  63   3                  Receive_ok=0;//处理数据完毕标志
+  64   3            
+  65   3          } 
+  66   2        }
+  67   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =    381    ----
+   CONSTANT SIZE    =     70    ----
+   XDATA SIZE       =   ----      10
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----    ----
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

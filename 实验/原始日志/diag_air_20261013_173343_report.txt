@@ -1,0 +1,23 @@
+[0] 串口监听 /dev/ttyACM0（打开会复位板子，等 Wi-Fi 重连）
+[1] TCP 连接 192.168.1.115:8266
+    PING  -> PONG
+    ID    -> MECANUM-ESP32 192.168.1.115
+    CHIP  -> None
+    HELP  -> None
+    SNIFF -> None
+[2] 静置 346 样本 (5149 ms)
+    roll  -0.17..-0.14 deg   (均值 -0.15)
+    pitch 1.75..1.77 deg   (均值 +1.76)
+    yaw   5.12..5.12 deg
+    yaw 漂移率 +0.00 deg/min (拟合残差 RMS 0.000 deg)
+    IMU 实际更新率约 9 Hz (遥测 100Hz)
+    静置编码器增量 [0, 0, 0, 0] （应全为 0，非 0 = 电气噪声假计数）
+[3] 逐轮测试 PWM=[-130, 130, -130, 130] (正向)
+    FL: 样本太少 (0) —— 检查
+    FR: 样本太少 (0) —— 检查
+    RL: 样本太少 (0) —— 检查
+    RR: 样本太少 (0) —— 检查
+[4] RUN 0.15 0 0 1500 (直行指令，架空)
+[!] 串口异常事件 2 条:
+    Brownout detector was triggered
+    rst:0xc (SW_CPU_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)

@@ -1,0 +1,119 @@
+
+================ 补跑 #07 rep1/3 横移左移 50 mm ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r07_0 0 0
+    "iters": 0,
+    "reason": "already_at_target",
+    "start_dist_mm": 2.2587156253730325,
+    "final": [
+      1.1993703806092606,
+      1.9139767413480988,
+      -5.720935874331701
+    ],
+    "stop_confirmed": true,
+    "ok": true,
+    "zero_pulse": true
+  },
+  "home_trace": []
+}
+$ /usr/bin/python3 run_all_experiments.py --only 7 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 7:1
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 7，--trials 7:1，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #07 rep1/3 横移左移 50 mm: vision 25.0mm / odo 26.9mm / Δ +7.6% / yawΔ +0.48°  OK  ⚠yaw_corrected：摆头 1 步（-10.09° → -0.45°）
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_195710.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 1 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r07_0 9
+    "29": 9
+  },
+  "body_x_mm": -3.59,
+  "body_y_mm": -20.42,
+  "body_yaw_deg": 5.51,
+  "body_spread_mm": [
+    0.94,
+    0.87
+  ],
+  "yaw_spread_deg": 0.09,
+  "margin_point_mm": 105.5,
+  "margin_envelope_mm": 18.4,
+  "verdict": "OK"
+}
+  巡检：verdict=OK body_yaw=5.51° margin_point=105.5 mm margin_env=18.4 mm
+
+================ 补跑 #07 rep2/3 横移左移 50 mm ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r07_1 0 0
+        20.204520339138263
+      ],
+      "dist_mm": 20.49839682695126,
+      "cmd": [
+        0.0021948721692750506,
+        -0.029919601203233673,
+        192
+      ],
+      "gained_mm": 16.2,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 run_all_experiments.py --only 7 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 7:2
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 7，--trials 7:2，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #07 rep2/3 横移左移 50 mm: vision 29.0mm / odo 29.4mm / Δ +1.6% / yawΔ +1.03°  OK
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_195729.xlsx
+完成：1/1 通过；0 条失败（其中归位失败 0 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r07_1 9
+    "29": 9
+  },
+  "body_x_mm": -1.74,
+  "body_y_mm": -18.81,
+  "body_yaw_deg": 1.73,
+  "body_spread_mm": [
+    0.77,
+    0.5
+  ],
+  "yaw_spread_deg": 0.14,
+  "margin_point_mm": 107.1,
+  "margin_envelope_mm": 28.6,
+  "verdict": "OK"
+}
+  巡检：verdict=OK body_yaw=1.73° margin_point=107.1 mm margin_env=28.6 mm
+
+================ 补跑 #07 rep3/3 横移左移 50 mm ================
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/recenter.py pre_r07_2 0 0
+        18.411268987721154
+      ],
+      "dist_mm": 18.478294589628756,
+      "cmd": [
+        0.0016608476611654022,
+        -0.02995399113718239,
+        189
+      ],
+      "gained_mm": 12.8,
+      "outcome": "done",
+      "stuck_run": null
+    }
+  ]
+}
+$ /usr/bin/python3 run_all_experiments.py --only 7 --pulse-ms 120 --coarse-ms 320 --yaw-tol-deg 6 --tol-mm 4 --max-iter 24 --trials 7:3
+=== Task 12 批量：1 次（16 条矩阵 × repeats，--only 7，--trials 7:3，归位脉冲 120 ms / 粗 320 ms，车头容差 6°，归位容差 4 mm/24 次）→ /home/hanli/麦轮小车pid/实验/实验数据记录.xlsx ===
+[ 1/1] #07 rep3/3 横移左移 50 mm: vision -mm / odo -mm / Δ -% / yawΔ -°  FAIL homing_locate_failed
+已归档：/home/hanli/麦轮小车pid/实验/实验数据记录_20261015_195748.xlsx
+完成：0/1 通过；1 条失败（其中归位失败 1 条） —— 失败条目已入表并标注 trial_reason，可筛除后重跑。
+车头（R71）：摆头 0 条、失败 0 条。
+$ /usr/bin/python3 /home/hanli/麦轮小车pid/实验/t12_tools/carpos.py post_r07_2 9
+  [post_r07_2] #8 缺边界码 [20]（该帧作废）
+{
+  "tag": "post_r07_2",
+  "n_frames": 9,
+  "n_id29": 0,
+  "hits": {
+    "20": 0,
+    "21": 9,
+    "22": 9,
+    "23": 9,
+    "29": 9
+  },
+  "verdict": "ID29_DEADLOCK"
+}
+  巡检：verdict=RUN_FAILED body_yaw=None° margin_point=None mm margin_env=None mm
+⚠ 巡检 RUN_FAILED —— 中止 #07 剩余 0 条，视觉死锁没有自救手段，请人工把车搬回场地中央。
+⚠ #07 中止：RUN_FAILED

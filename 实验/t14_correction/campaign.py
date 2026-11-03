@@ -129,6 +129,10 @@ def main() -> int:
     ap.add_argument("--tag", required=True)
     ap.add_argument("--trial", action="append", required=True,
                     metavar="VX VY OM MS", help='例：--trial "0.2 0 0 320"')
+    ap.add_argument("--ip", default=BOARD_IP,
+                    help=f"板子 IP（缺省 {BOARD_IP} = A 车；B 车是 192.168.1.111）")
+    ap.add_argument("--out", default=None,
+                    help="落盘文件名（相对 data/；缺省 campaign.jsonl = A 车那份）")
     ap.add_argument("--margin", type=float, default=MARGIN_MM)
     ap.add_argument("--max-seconds", type=float, default=600.0)
     ap.add_argument("--yes", action="store_true", help="跳过回车确认")
@@ -159,7 +163,7 @@ def main() -> int:
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with CameraSession() as cam, open_link() as car:
+        with CameraSession() as cam, open_link(ip=args.ip) as car:
             h = Harness(car, cam, calib, home_xy=(0.0, 0.0))
 
             pose = h.locate()
